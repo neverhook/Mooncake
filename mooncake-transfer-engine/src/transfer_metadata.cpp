@@ -57,6 +57,26 @@ static bool isSupportedMultiProtocolPair(
     }
     return (has_cxl && (has_tcp || has_rdma)) || (has_nvlink && has_rdma);
 }
+
+static bool containsProtocol(const std::vector<std::string> &protocols,
+                             const std::string &protocol) {
+    return std::find(protocols.begin(), protocols.end(), protocol) !=
+           protocols.end();
+}
+
+static bool isSupportedMultiProtocolBufferProtocol(
+    const std::string &protocol) {
+    return protocol == "cxl" || protocol == "tcp" || protocol == "rdma" ||
+           protocol == "nvlink";
+}
+
+static bool isValidMultiProtocolBufferProtocol(
+    const std::vector<std::string> &protocols,
+    const std::string &buffer_protocol) {
+    return !buffer_protocol.empty() &&
+           isSupportedMultiProtocolBufferProtocol(buffer_protocol) &&
+           containsProtocol(protocols, buffer_protocol);
+}
 #endif
 
 static inline std::string extractProtocolFromConnString(
@@ -265,6 +285,15 @@ static int encodeMultiProtocolSegmentDesc(
 
     Json::Value buffersJSON(Json::arrayValue);
     for (const auto &buffer : desc.buffers) {
+        if (!isValidMultiProtocolBufferProtocol(protocols, buffer.protocol)) {
+            LOG(ERROR)
+                << "Invalid multi-protocol buffer descriptor, segment "
+                << desc.name << " segment_protocol " << desc.protocol
+                << " buffer " << buffer.name << " buffer_protocol "
+                << (buffer.protocol.empty() ? "<empty>" : buffer.protocol);
+            return ERR_INVALID_ARGUMENT;
+        }
+
         Json::Value bufferJSON;
         bufferJSON["name"] = buffer.name;
         bufferJSON["length"] = static_cast<Json::UInt64>(buffer.length);
@@ -538,8 +567,10 @@ decodeMultiProtocolSegmentDesc(Json::Value &segmentJSON,
     if (segmentJSON.isMember("rdma_server_name"))
         desc->rdma_server_name = segmentJSON["rdma_server_name"].asString();
 
+    std::vector<std::string> protocols;
     for (const auto &protocolStr : segmentJSON["protocol"]) {
         std::string proto = protocolStr.asString();
+        protocols.push_back(proto);
         if (!desc->protocol.empty()) desc->protocol += ",";
         desc->protocol += proto;
 
@@ -573,6 +604,14 @@ decodeMultiProtocolSegmentDesc(Json::Value &segmentJSON,
 
     for (const auto &bufferJSON : segmentJSON["buffers"]) {
         std::string buffer_protocol = bufferJSON["protocol"].asString();
+        if (!isValidMultiProtocolBufferProtocol(protocols, buffer_protocol)) {
+            LOG(WARNING)
+                << "Corrupted segment descriptor, name " << segment_name
+                << " segment_protocol " << desc->protocol
+                << " buffer_protocol "
+                << (buffer_protocol.empty() ? "<empty>" : buffer_protocol);
+            return nullptr;
+        }
 
         if (buffer_protocol == "cxl") {
             TransferMetadata::BufferDesc buffer;
@@ -648,6 +687,12 @@ decodeMultiProtocolSegmentDesc(Json::Value &segmentJSON,
                 return nullptr;
             }
             desc->buffers.push_back(buffer);
+        } else {
+            LOG(WARNING)
+                << "Corrupted segment descriptor, name " << segment_name
+                << " segment_protocol " << desc->protocol
+                << " unknown buffer_protocol " << buffer_protocol;
+            return nullptr;
         }
     }
 

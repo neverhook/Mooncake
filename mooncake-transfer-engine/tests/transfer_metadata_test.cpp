@@ -129,6 +129,65 @@ TEST_F(TransferMetadataTest, RejectsUnsupportedMultiProtocolTriple) {
 #endif
 }
 
+TEST_F(TransferMetadataTest, RejectsMultiProtocolBufferMissingProtocol) {
+#ifndef ENABLE_MULTI_PROTOCOL
+    GTEST_SKIP() << "ENABLE_MULTI_PROTOCOL is not compiled in";
+#else
+    TransferMetadata::SegmentDesc desc;
+    desc.name = "bad-buffer-segment";
+    desc.protocol = "nvlink,rdma";
+
+    TransferMetadata::BufferDesc buffer;
+    buffer.name = "host_numa:0";
+    buffer.addr = 0x100000;
+    buffer.length = 4096;
+    desc.buffers.push_back(buffer);
+
+    Json::Value encoded;
+    EXPECT_EQ(metadata_client->encodeSegmentDesc(desc, encoded),
+              ERR_INVALID_ARGUMENT);
+#endif
+}
+
+TEST_F(TransferMetadataTest, RejectsMultiProtocolDecodeBufferOutsidePair) {
+#ifndef ENABLE_MULTI_PROTOCOL
+    GTEST_SKIP() << "ENABLE_MULTI_PROTOCOL is not compiled in";
+#else
+    TransferMetadata::SegmentDesc desc;
+    desc.name = "dual-segment";
+    desc.protocol = "nvlink,rdma";
+    desc.tcp_data_port = 0;
+
+    TransferMetadata::DeviceDesc device;
+    device.name = "mlx5_0";
+    device.lid = 1;
+    device.gid = "0000:0000:0000:0000:0000:ffff:0a00:0001";
+    desc.devices.push_back(device);
+
+    TransferMetadata::BufferDesc rdma_buffer;
+    rdma_buffer.name = "host_numa:0";
+    rdma_buffer.addr = 0x100000;
+    rdma_buffer.length = 4096;
+    rdma_buffer.protocol = "rdma";
+    rdma_buffer.lkey.push_back(11);
+    rdma_buffer.rkey.push_back(22);
+    desc.buffers.push_back(rdma_buffer);
+
+    Json::Value encoded;
+    ASSERT_EQ(metadata_client->encodeSegmentDesc(desc, encoded), 0);
+
+    Json::Value tcp_buffer = encoded;
+    tcp_buffer["buffers"][0]["protocol"] = "tcp";
+    EXPECT_EQ(metadata_client->decodeSegmentDesc(tcp_buffer, "dual-segment"),
+              nullptr);
+
+    Json::Value typo_buffer = encoded;
+    typo_buffer["buffers"][0]["protocol"] = "typo";
+    EXPECT_EQ(metadata_client->decodeSegmentDesc(typo_buffer, "dual-segment"),
+              nullptr);
+#endif
+}
+
 // add and search LocalSegmentMeta
 TEST_F(TransferMetadataTest, LocalSegmentTest) {
     auto segment_des = std::make_shared<TransferMetadata::SegmentDesc>();

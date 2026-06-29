@@ -118,6 +118,7 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
                        << ", error=failed_to_create_allocator";
             return ErrorCode::INVALID_PARAMS;
         }
+        allocator->setProtocol(segment.protocol);
         allocator->setMemoryAttributes(segment.memory_kind,
                                        segment.scale_up_domain_id);
     } catch (...) {
@@ -766,6 +767,8 @@ tl::expected<void, SerializationError> SegmentSerializer::Deserialize(
             }
             auto mounted_segment = std::move(result.value());
             if (mounted_segment.buf_allocator) {
+                mounted_segment.buf_allocator->setProtocol(
+                    mounted_segment.segment.protocol);
                 mounted_segment.buf_allocator->setMemoryAttributes(
                     mounted_segment.segment.memory_kind,
                     mounted_segment.segment.scale_up_domain_id);

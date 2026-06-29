@@ -1886,12 +1886,14 @@ TEST_F(ClientIntegrationTest, AllocatedBufferDescriptorCarriesMemoryMetadata) {
 TEST_F(ClientIntegrationTest, AllocatorPropagatesMemoryMetadataToDescriptor) {
     auto allocator = std::make_shared<OffsetBufferAllocator>(
         "test-segment", 0x100000000ULL, 4096, "test-endpoint");
+    allocator->setProtocol("nvlink,rdma");
     allocator->setMemoryAttributes("HOST_NUMA", "domain-a");
 
     auto buffer = allocator->allocate(64);
     ASSERT_NE(buffer, nullptr);
 
     auto descriptor = buffer->get_descriptor();
+    EXPECT_EQ(descriptor.protocol_, "nvlink,rdma");
     EXPECT_EQ(descriptor.memory_kind_, "HOST_NUMA");
     EXPECT_EQ(descriptor.scale_up_domain_id_, "domain-a");
     EXPECT_TRUE(descriptor.selected_protocol_.empty());

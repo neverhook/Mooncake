@@ -158,6 +158,7 @@ std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::allocate(
     }
     auto allocated_buffer =
         std::make_unique<AllocatedBuffer>(shared_from_this(), buffer, size);
+    allocated_buffer->setProtocol(protocol_);
     allocated_buffer->setMemoryAttributes(memory_kind_, scale_up_domain_id_);
     return allocated_buffer;
 }
@@ -284,6 +285,7 @@ std::unique_ptr<AllocatedBuffer> OffsetBufferAllocator::allocate(size_t size) {
         MasterMetricManager::instance().inc_allocated_nof_size(segment_name_,
                                                                size);
     }
+    allocated_buffer->setProtocol(protocol_);
     allocated_buffer->setMemoryAttributes(memory_kind_, scale_up_domain_id_);
     return allocated_buffer;
 }

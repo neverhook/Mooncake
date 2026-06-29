@@ -643,6 +643,9 @@ auto Serializer<AllocatedBuffer>::deserialize(const msgpack::object &obj,
     // Create AllocatedBuffer object
     auto buffer = std::make_unique<AllocatedBuffer>(allocator, buffer_ptr, size,
                                                     std::move(offsetHandle));
+    buffer->setProtocol(mountedSegment.segment.protocol);
+    buffer->setMemoryAttributes(mountedSegment.segment.memory_kind,
+                                mountedSegment.segment.scale_up_domain_id);
     // buffer->status = status;
 
     return buffer;
@@ -935,6 +938,8 @@ Serializer<MountedSegment>::deserialize(const msgpack::object &obj) {
                 array[10].as<std::string>();
         }
         if (mounted_segment.buf_allocator) {
+            mounted_segment.buf_allocator->setProtocol(
+                mounted_segment.segment.protocol);
             mounted_segment.buf_allocator->setMemoryAttributes(
                 mounted_segment.segment.memory_kind,
                 mounted_segment.segment.scale_up_domain_id);

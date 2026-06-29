@@ -76,6 +76,10 @@ class AllocatedBuffer {
         scale_up_domain_id_ = std::move(scale_up_domain_id);
     }
 
+    void setProtocol(std::string protocol) {
+        this->protocol = protocol.empty() ? "tcp" : std::move(protocol);
+    }
+
     // Friend declaration for operator<<
     friend std::ostream& operator<<(std::ostream& os,
                                     const AllocatedBuffer& buffer);
@@ -126,6 +130,10 @@ class BufferAllocatorBase {
         scale_up_domain_id_ = std::move(scale_up_domain_id);
     }
 
+    void setProtocol(std::string protocol) {
+        protocol_ = protocol.empty() ? "tcp" : std::move(protocol);
+    }
+
     virtual std::unique_ptr<AllocatedBuffer> allocate(size_t size) = 0;
     virtual void deallocate(AllocatedBuffer* handle) = 0;
     virtual size_t capacity() const = 0;
@@ -145,6 +153,7 @@ class BufferAllocatorBase {
     virtual size_t getLargestFreeRegion() const = 0;
 
    protected:
+    std::string protocol_{"tcp"};
     std::string memory_kind_;
     std::string scale_up_domain_id_;
 };

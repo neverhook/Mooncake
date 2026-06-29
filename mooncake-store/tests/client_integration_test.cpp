@@ -1845,6 +1845,21 @@ TEST_F(ClientIntegrationTest, MountSegmentAndGetIdAndUnmountSegmentById) {
     free(test_buffer);
 }
 
+TEST_F(ClientIntegrationTest, AllocatedBufferDescriptorCarriesMemoryMetadata) {
+    AllocatedBuffer::Descriptor descriptor{};
+    descriptor.protocol_ = "nvlink,rdma";
+    descriptor.memory_kind_ = "HOST_NUMA";
+    descriptor.scale_up_domain_id_ = "domain-a";
+    descriptor.selected_protocol_ = "nvlink";
+
+    AllocatedBuffer::Descriptor round_trip = descriptor;
+
+    EXPECT_EQ(round_trip.protocol_, "nvlink,rdma");
+    EXPECT_EQ(round_trip.memory_kind_, "HOST_NUMA");
+    EXPECT_EQ(round_trip.scale_up_domain_id_, "domain-a");
+    EXPECT_EQ(round_trip.selected_protocol_, "nvlink");
+}
+
 }  // namespace testing
 
 }  // namespace mooncake

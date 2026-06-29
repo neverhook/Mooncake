@@ -652,6 +652,8 @@ ErrorCode Client::InitTransferEngine(
     // if Mooncake was built without USE_TENT, the env var has no effect on
     // the TransferEngine, so the store must still install transports.
     bool use_tent = transfer_engine_->isUsingTent();
+    const bool is_dual_protocol =
+        protocol == "nvlink,rdma" || protocol == "rdma,nvlink";
 
     bool auto_discover = false;
     if (!use_tent) {
@@ -662,7 +664,8 @@ ErrorCode Client::InitTransferEngine(
             auto_discover = env_auto_discover.value();
         } else {
             // Enable auto-discover for RDMA if no devices are specified
-            if ((protocol == "rdma" || protocol == "efa") &&
+            if ((protocol == "rdma" || protocol == "efa" ||
+                 is_dual_protocol) &&
                 !device_names.has_value()) {
                 LOG(INFO)
                     << "Set auto discovery ON by default for RDMA protocol, "
@@ -719,13 +722,9 @@ ErrorCode Client::InitTransferEngine(
         return ErrorCode::OK;
     }
 
-    if (!auto_discover) {
-        LOG(INFO) << "Transfer engine auto discovery is disabled for protocol: "
-                  << protocol;
-
-        Transport* transport = nullptr;
-
-        if (protocol == "rdma" || protocol == "efa") {
+    auto install_rdma_transport =
+        [&](const std::string& rdma_protocol) -> ErrorCode {
+        if (!auto_discover) {
             if (!device_names.has_value() || device_names->empty()) {
                 LOG(ERROR) << "RDMA protocol requires device names when auto "
                               "discovery is disabled";
@@ -746,13 +745,37 @@ ErrorCode Client::InitTransferEngine(
                              "devices. Found "
                           << topology->getHcaList().size() << " HCAs";
             }
+        }
 
-            transport = transfer_engine_->installTransport(protocol, nullptr);
-            if (!transport) {
-                LOG(ERROR) << "Failed to install RDMA transport with specified "
-                              "devices";
-                return ErrorCode::INTERNAL_ERROR;
-            }
+        Transport* transport =
+            transfer_engine_->installTransport(rdma_protocol, nullptr);
+        if (!transport) {
+            LOG(ERROR) << "Failed to install RDMA transport with specified "
+                          "devices";
+            return ErrorCode::INTERNAL_ERROR;
+        }
+        return ErrorCode::OK;
+    };
+
+    if (is_dual_protocol) {
+        Transport* nvlink_transport =
+            transfer_engine_->installTransport("nvlink", nullptr);
+        if (!nvlink_transport) {
+            LOG(ERROR) << "Failed to install NVLink transport";
+            return ErrorCode::INTERNAL_ERROR;
+        }
+        return install_rdma_transport("rdma");
+    }
+
+    if (!auto_discover) {
+        LOG(INFO) << "Transfer engine auto discovery is disabled for protocol: "
+                  << protocol;
+
+        Transport* transport = nullptr;
+
+        if (protocol == "rdma" || protocol == "efa") {
+            auto result = install_rdma_transport(protocol);
+            if (result != ErrorCode::OK) return result;
         } else if (protocol == "tcp") {
             if (device_names.has_value()) {
                 LOG(WARNING)
@@ -2746,6 +2769,32 @@ tl::expected<void, ErrorCode> Client::UnmountSegment(const void* buffer,
     return UnmountSegmentImpl(segment);
 }
 
+tl::expected<UUID, ErrorCode> Client::MountSegmentAfterRegistrationLocked(
+    const void* buffer, size_t size, const std::string& protocol) {
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = local_hostname_;
+    segment.base = reinterpret_cast<uintptr_t>(buffer);
+    segment.size = size;
+    segment.protocol = protocol;
+    if (metadata_connstring_ == P2PHANDSHAKE) {
+        segment.te_endpoint = transfer_engine_->getLocalIpAndPort();
+    } else {
+        segment.te_endpoint = local_hostname_;
+    }
+
+    auto mount_result = master_client_.MountSegment(segment);
+    if (!mount_result) {
+        ErrorCode err = mount_result.error();
+        LOG(ERROR) << "mount_segment_to_master_failed base=" << buffer
+                   << " size=" << size << ", error=" << err;
+        return tl::unexpected(err);
+    }
+
+    mounted_segments_[segment.id] = segment;
+    return segment.id;
+}
+
 tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
     const void* buffer, size_t size, const std::string& protocol,
     const std::string& location) {
@@ -2781,32 +2830,109 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
 
-        Segment segment;
-        segment.id = generate_uuid();
-        segment.name = local_hostname_;
-        segment.base = reinterpret_cast<uintptr_t>(buffer);
-        segment.size = size;
-        segment.protocol = protocol;
-        if (metadata_connstring_ == P2PHANDSHAKE) {
-            segment.te_endpoint = transfer_engine_->getLocalIpAndPort();
-        } else {
-            segment.te_endpoint = local_hostname_;
+        auto mounted =
+            MountSegmentAfterRegistrationLocked(buffer, size, protocol);
+        if (!mounted) {
+            return tl::unexpected(mounted.error());
         }
-
-        auto mount_result = master_client_.MountSegment(segment);
-        if (!mount_result) {
-            ErrorCode err = mount_result.error();
-            LOG(ERROR) << "mount_segment_to_master_failed base=" << buffer
-                       << " size=" << size << ", error=" << err;
-            return tl::unexpected(err);
-        }
-
-        segment_id = segment.id;
-        mounted_segments_[segment_id] = segment;
+        segment_id = mounted.value();
     }
 
     EnsureStorageControlPlaneStarted();
     return segment_id;
+}
+
+tl::expected<UUID, ErrorCode> Client::MountDualProtocolSegmentAndGetId(
+    const void* buffer, size_t size, const std::string& location) {
+#ifndef ENABLE_MULTI_PROTOCOL
+    (void)buffer;
+    (void)size;
+    (void)location;
+    LOG(ERROR) << "dual-protocol segment requires ENABLE_MULTI_PROTOCOL";
+    return tl::unexpected(ErrorCode::INVALID_PARAMS);
+#else
+    auto check_result = CheckRegisterMemoryParams(buffer, size);
+    if (!check_result) {
+        return tl::unexpected(check_result.error());
+    }
+
+    UUID segment_id;
+    {
+        std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+
+        // Check if the segment overlaps with any existing segment
+        for (auto& it : mounted_segments_) {
+            auto& mtseg = it.second;
+            uintptr_t l1 = reinterpret_cast<uintptr_t>(mtseg.base);
+            uintptr_t r1 = reinterpret_cast<uintptr_t>(mtseg.size) + l1;
+            uintptr_t l2 = reinterpret_cast<uintptr_t>(buffer);
+            uintptr_t r2 = reinterpret_cast<uintptr_t>(size) + l2;
+            if (std::max(l1, l2) < std::min(r1, r2)) {
+                LOG(ERROR) << "segment_overlaps base1=" << mtseg.base
+                           << " size1=" << mtseg.size << " base2=" << buffer
+                           << " size2=" << size;
+                return tl::unexpected(ErrorCode::INVALID_PARAMS);
+            }
+        }
+
+        std::unordered_map<std::string,
+                           std::vector<TransferEngine::RegisteredBuffer>>
+            buffer_map;
+        buffer_map["nvlink"].emplace_back((void*)buffer, size, location, true,
+                                          false);
+        buffer_map["rdma"].emplace_back((void*)buffer, size, location, true,
+                                        false);
+
+        int rc = transfer_engine_->mp_registerLocalMemory(buffer_map);
+        if (rc != 0) {
+            LOG(ERROR) << "dual_protocol_register_local_memory_failed base="
+                       << buffer << " size=" << size << ", error=" << rc;
+            if (globalConfig().nvlink_host_numa_strict) {
+                return tl::unexpected(ErrorCode::INVALID_PARAMS);
+            }
+
+            LOG(WARNING) << "falling_back_to_rdma_only_registration base="
+                         << buffer << " size=" << size;
+            rc = transfer_engine_->registerLocalMemory((void*)buffer, size,
+                                                       location, true, true);
+            if (rc != 0) {
+                LOG(ERROR) << "register_local_memory_failed base=" << buffer
+                           << " size=" << size << ", error=" << rc;
+                return tl::unexpected(ErrorCode::INVALID_PARAMS);
+            }
+
+            auto mounted =
+                MountSegmentAfterRegistrationLocked(buffer, size, "rdma");
+            if (!mounted) {
+                return tl::unexpected(mounted.error());
+            }
+            segment_id = mounted.value();
+        } else {
+            auto mounted = MountSegmentAfterRegistrationLocked(
+                buffer, size, "nvlink,rdma");
+            if (!mounted) {
+                return tl::unexpected(mounted.error());
+            }
+            segment_id = mounted.value();
+
+            auto metadata = transfer_engine_->getMetadata();
+            if (!metadata) {
+                LOG(ERROR) << "metadata_unavailable_for_dual_protocol_segment";
+                return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+
+            int rc_update = metadata->updateLocalSegmentDesc();
+            if (rc_update != 0) {
+                LOG(ERROR) << "update_dual_protocol_segment_metadata_failed rc="
+                           << rc_update;
+                return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+        }
+    }
+
+    EnsureStorageControlPlaneStarted();
+    return segment_id;
+#endif
 }
 
 tl::expected<void, ErrorCode> Client::UnmountSegmentById(

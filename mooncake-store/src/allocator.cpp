@@ -43,7 +43,12 @@ AllocatedBuffer::Descriptor AllocatedBuffer::get_descriptor() const {
     }
 
     return {static_cast<uint64_t>(size()),
-            reinterpret_cast<uintptr_t>(buffer_ptr_), this->protocol, endpoint};
+            reinterpret_cast<uintptr_t>(buffer_ptr_),
+            this->protocol,
+            endpoint,
+            memory_kind_,
+            scale_up_domain_id_,
+            ""};
 }
 
 void AllocatedBuffer::change_to_cxl(std::string client_segment_name) {

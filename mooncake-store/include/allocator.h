@@ -5,6 +5,7 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <utility>
 
 #include "cachelib_memory_allocator/MemoryAllocator.h"
 #include "offset_allocator/offset_allocator.hpp"
@@ -69,6 +70,12 @@ class AllocatedBuffer {
 
     [[nodiscard]] std::string getSegmentName() const noexcept;
 
+    void setMemoryAttributes(std::string memory_kind,
+                             std::string scale_up_domain_id) {
+        memory_kind_ = std::move(memory_kind);
+        scale_up_domain_id_ = std::move(scale_up_domain_id);
+    }
+
     // Friend declaration for operator<<
     friend std::ostream& operator<<(std::ostream& os,
                                     const AllocatedBuffer& buffer);
@@ -79,8 +86,12 @@ class AllocatedBuffer {
         uintptr_t buffer_address_;
         std::string protocol_;
         std::string transport_endpoint_;
+        std::string memory_kind_;
+        std::string scale_up_domain_id_;
+        std::string selected_protocol_;
         YLT_REFL(Descriptor, size_, buffer_address_, protocol_,
-                 transport_endpoint_);
+                 transport_endpoint_, memory_kind_, scale_up_domain_id_,
+                 selected_protocol_);
     };
 
     void change_to_cxl(std::string client_segment_name);
@@ -92,6 +103,8 @@ class AllocatedBuffer {
     void* buffer_ptr_{nullptr};
     std::size_t size_{0};
     std::string protocol{"tcp"};
+    std::string memory_kind_;
+    std::string scale_up_domain_id_;
     // RAII handle for buffer allocated by offset allocator
     std::optional<offset_allocator::OffsetAllocationHandle> offset_handle_{
         std::nullopt};

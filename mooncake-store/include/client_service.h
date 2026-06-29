@@ -316,6 +316,10 @@ class Client {
         const void* buffer, size_t size, const std::string& protocol = "tcp",
         const std::string& location = kWildcardLocation);
 
+    tl::expected<UUID, ErrorCode> MountDualProtocolSegmentAndGetId(
+        const void* buffer, size_t size,
+        const std::string& location = kWildcardLocation);
+
     /**
      * @brief Unmounts a segment by its UUID.
      *        Logic is identical to UnmountSegment, but looks up by id.
@@ -806,6 +810,13 @@ class Client {
      */
     tl::expected<void, ErrorCode> UnmountSegmentImpl(
         std::unordered_map<UUID, Segment, boost::hash<UUID>>::iterator it);
+
+    /**
+     * @brief Mounts an already-registered memory segment in Master.
+     *        Caller must hold mounted_segments_mutex_.
+     */
+    tl::expected<UUID, ErrorCode> MountSegmentAfterRegistrationLocked(
+        const void* buffer, size_t size, const std::string& protocol);
 
     void StartGracefulUnmountTimer(const UUID& segment_id,
                                    uint64_t grace_period_ms);

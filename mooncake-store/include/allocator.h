@@ -120,6 +120,12 @@ class BufferAllocatorBase {
    public:
     virtual ~BufferAllocatorBase() = default;
 
+    void setMemoryAttributes(std::string memory_kind,
+                             std::string scale_up_domain_id) {
+        memory_kind_ = std::move(memory_kind);
+        scale_up_domain_id_ = std::move(scale_up_domain_id);
+    }
+
     virtual std::unique_ptr<AllocatedBuffer> allocate(size_t size) = 0;
     virtual void deallocate(AllocatedBuffer* handle) = 0;
     virtual size_t capacity() const = 0;
@@ -137,6 +143,10 @@ class BufferAllocatorBase {
      * allocation may still fail due to race conditions or fragmentation.
      */
     virtual size_t getLargestFreeRegion() const = 0;
+
+   protected:
+    std::string memory_kind_;
+    std::string scale_up_domain_id_;
 };
 
 /**

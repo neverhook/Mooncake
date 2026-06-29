@@ -47,6 +47,15 @@ using gpu_staging::SetDevice;
 
 namespace {
 
+#ifdef ENABLE_MULTI_PROTOCOL
+std::vector<std::string> GetProtocolSpecificRegistrationProtocols(
+    const std::string& protocol);
+int UnregisterMemoryForProtocols(TransferEngine* transfer_engine,
+                                 const std::vector<std::string>& protocols,
+                                 const void* buffer, size_t size,
+                                 bool update_metadata);
+#endif
+
 #ifdef USE_NOF
 std::optional<int> GetConfiguredNumaSocketId() {
     const char* raw_value = std::getenv("MC_STORE_NUMA_SOCKET_ID");
@@ -363,8 +372,23 @@ Client::~Client() {
 
     // Unregister gracefully unmounting segments: master already has timer
     for (auto& segment : gracefully_unmounting_segments_copy) {
+#ifdef ENABLE_MULTI_PROTOCOL
+        auto protocols =
+            GetProtocolSpecificRegistrationProtocols(segment.protocol);
+        int rc = 0;
+        if (!protocols.empty()) {
+            rc = UnregisterMemoryForProtocols(
+                transfer_engine_.get(), protocols,
+                reinterpret_cast<void*>(segment.base), segment.size,
+                /*update_metadata=*/true);
+        } else {
+            rc = transfer_engine_->unregisterLocalMemory(
+                reinterpret_cast<void*>(segment.base));
+        }
+#else
         int rc = transfer_engine_->unregisterLocalMemory(
             reinterpret_cast<void*>(segment.base));
+#endif
         if (rc != 0 && rc != ERR_ADDRESS_NOT_REGISTERED) {
             LOG(ERROR) << "Failed to unregister transfer buffer in destructor: "
                        << rc;
@@ -2833,13 +2857,16 @@ tl::expected<void, ErrorCode> Client::UnmountSegment(const void* buffer,
 }
 
 tl::expected<UUID, ErrorCode> Client::MountSegmentAfterRegistrationLocked(
-    const void* buffer, size_t size, const std::string& protocol) {
+    const void* buffer, size_t size, const std::string& protocol,
+    const std::string& memory_kind, const std::string& scale_up_domain_id) {
     Segment segment;
     segment.id = generate_uuid();
     segment.name = local_hostname_;
     segment.base = reinterpret_cast<uintptr_t>(buffer);
     segment.size = size;
     segment.protocol = protocol;
+    segment.memory_kind = memory_kind;
+    segment.scale_up_domain_id = scale_up_domain_id;
     if (metadata_connstring_ == P2PHANDSHAKE) {
         segment.te_endpoint = transfer_engine_->getLocalIpAndPort();
     } else {
@@ -2868,6 +2895,10 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAfterRegistrationLocked(
 tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
     const void* buffer, size_t size, const std::string& protocol,
     const std::string& location) {
+    if (protocol == "nvlink,rdma" || protocol == "rdma,nvlink") {
+        return MountDualProtocolSegmentAndGetId(buffer, size, location);
+    }
+
     auto check_result = CheckRegisterMemoryParams(buffer, size);
     if (!check_result) {
         return tl::unexpected(check_result.error());
@@ -2985,7 +3016,8 @@ tl::expected<UUID, ErrorCode> Client::MountDualProtocolSegmentAndGetId(
             segment_id = mounted.value();
         } else {
             auto mounted = MountSegmentAfterRegistrationLocked(
-                buffer, size, "nvlink,rdma");
+                buffer, size, "nvlink,rdma", "HOST_NUMA",
+                globalConfig().nvlink_scale_up_domain_id);
             if (!mounted) {
                 int unregister_rc = UnregisterMemoryForProtocols(
                     transfer_engine_.get(), dual_protocols, buffer, size,

@@ -830,9 +830,10 @@ tl::expected<void, SerializationError> Serializer<MountedSegment>::serialize(
     const MountedSegment &mounted_segment, MsgpackPacker &packer) {
     // Use array structure for packing, more efficient
     // Format: [segment_id, segment_name, segment_base, segment_size,
-    // te_endpoint, status, has_buffer_allocator, buffer_allocator_data...]
+    // te_endpoint, status, has_buffer_allocator, buffer_allocator_data,
+    // protocol, memory_kind, scale_up_domain_id]
 
-    packer.pack_array(8);
+    packer.pack_array(11);
 
     // Serialize Segment info
     packer.pack(UuidToString(mounted_segment.segment.id));
@@ -855,12 +856,18 @@ tl::expected<void, SerializationError> Serializer<MountedSegment>::serialize(
             if (!result) {
                 return tl::unexpected(result.error());
             }
+            packer.pack(mounted_segment.segment.protocol);
+            packer.pack(mounted_segment.segment.memory_kind);
+            packer.pack(mounted_segment.segment.scale_up_domain_id);
             return {};
         }
     }
 
     packer.pack(false);  // Mark no valid buffer allocator exists
     packer.pack_nil();
+    packer.pack(mounted_segment.segment.protocol);
+    packer.pack(mounted_segment.segment.memory_kind);
+    packer.pack(mounted_segment.segment.scale_up_domain_id);
     return {};
 }
 
@@ -916,6 +923,21 @@ Serializer<MountedSegment>::deserialize(const msgpack::object &obj) {
             } else {
                 return tl::unexpected(allocatorResult.error());
             }
+        }
+        if (obj.via.array.size > 8) {
+            mounted_segment.segment.protocol = array[8].as<std::string>();
+        }
+        if (obj.via.array.size > 9) {
+            mounted_segment.segment.memory_kind = array[9].as<std::string>();
+        }
+        if (obj.via.array.size > 10) {
+            mounted_segment.segment.scale_up_domain_id =
+                array[10].as<std::string>();
+        }
+        if (mounted_segment.buf_allocator) {
+            mounted_segment.buf_allocator->setMemoryAttributes(
+                mounted_segment.segment.memory_kind,
+                mounted_segment.segment.scale_up_domain_id);
         }
     } catch (const std::exception &e) {
         return tl::unexpected(SerializationError(

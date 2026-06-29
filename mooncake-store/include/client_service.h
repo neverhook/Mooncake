@@ -816,7 +816,9 @@ class Client {
      *        Caller must hold mounted_segments_mutex_.
      */
     tl::expected<UUID, ErrorCode> MountSegmentAfterRegistrationLocked(
-        const void* buffer, size_t size, const std::string& protocol);
+        const void* buffer, size_t size, const std::string& protocol,
+        const std::string& memory_kind = "",
+        const std::string& scale_up_domain_id = "");
 
     void StartGracefulUnmountTimer(const UUID& segment_id,
                                    uint64_t grace_period_ms);

@@ -156,7 +156,10 @@ std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::allocate(
         MasterMetricManager::instance().inc_allocated_nof_size(segment_name_,
                                                                size);
     }
-    return std::make_unique<AllocatedBuffer>(shared_from_this(), buffer, size);
+    auto allocated_buffer =
+        std::make_unique<AllocatedBuffer>(shared_from_this(), buffer, size);
+    allocated_buffer->setMemoryAttributes(memory_kind_, scale_up_domain_id_);
+    return allocated_buffer;
 }
 
 void CachelibBufferAllocator::deallocate(AllocatedBuffer* handle) {
@@ -281,6 +284,7 @@ std::unique_ptr<AllocatedBuffer> OffsetBufferAllocator::allocate(size_t size) {
         MasterMetricManager::instance().inc_allocated_nof_size(segment_name_,
                                                                size);
     }
+    allocated_buffer->setMemoryAttributes(memory_kind_, scale_up_domain_id_);
     return allocated_buffer;
 }
 

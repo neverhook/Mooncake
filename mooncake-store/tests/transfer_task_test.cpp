@@ -175,6 +175,27 @@ TEST_F(TransferTaskTest, IsSameProcessEndpoint) {
     EXPECT_FALSE(TransferSubmitter::isSameProcessEndpoint("host-a", "host-b"));
 }
 
+TEST_F(TransferTaskTest, BuildTransferRequestsPreservesSliceVectorShape) {
+    std::vector<char> first(16);
+    std::vector<char> second(32);
+    std::vector<Slice> slices = {{first.data(), first.size()},
+                                 {second.data(), second.size()}};
+
+    auto requests = TransferSubmitter::BuildTransferRequestsForTest(
+        42, 0x100000, slices, TransferRequest::READ, 128);
+
+    ASSERT_EQ(requests.size(), 2);
+    EXPECT_EQ(requests[0].opcode, TransferRequest::READ);
+    EXPECT_EQ(requests[0].source, first.data());
+    EXPECT_EQ(requests[0].target_id, 42);
+    EXPECT_EQ(requests[0].target_offset, 0x100000 + 128);
+    EXPECT_EQ(requests[0].length, first.size());
+    EXPECT_EQ(requests[1].source, second.data());
+    EXPECT_EQ(requests[1].target_id, 42);
+    EXPECT_EQ(requests[1].target_offset, 0x100000 + 128 + first.size());
+    EXPECT_EQ(requests[1].length, second.size());
+}
+
 // Test TransferStrategy enum and stream operator
 TEST_F(TransferTaskTest, TransferStrategyEnum) {
     // Test enum values

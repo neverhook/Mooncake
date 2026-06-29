@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include "gpu_staging_utils.h"
 #include "transfer_engine.h"
@@ -149,6 +150,60 @@ static void nvmf_io_complete(void* ctx, const struct spdk_nvme_cpl* cpl) {
 }
 #endif
 namespace mooncake {
+
+namespace {
+class AggregateTransferOperationState : public OperationState {
+   public:
+    explicit AggregateTransferOperationState(std::vector<TransferFuture> futures)
+        : futures_(std::move(futures)) {}
+
+    bool is_completed() override {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (result_.has_value()) {
+                return true;
+            }
+        }
+        for (const auto& future : futures_) {
+            if (!future.isReady()) {
+                return false;
+            }
+        }
+        const ErrorCode result = CollectResult();
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!result_.has_value()) {
+            result_ = result;
+        }
+        return true;
+    }
+
+    void wait_for_completion() override {
+        const ErrorCode result = CollectResult();
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!result_.has_value()) {
+            result_ = result;
+        }
+    }
+
+    TransferStrategy get_strategy() const override {
+        return TransferStrategy::TRANSFER_ENGINE;
+    }
+
+   private:
+    ErrorCode CollectResult() {
+        ErrorCode result = ErrorCode::OK;
+        for (auto& future : futures_) {
+            const ErrorCode child_result = future.get();
+            if (child_result != ErrorCode::OK && result == ErrorCode::OK) {
+                result = child_result;
+            }
+        }
+        return result;
+    }
+
+    std::vector<TransferFuture> futures_;
+};
+}  // namespace
 
 #ifdef USE_NOF
 SpdkNofQos::SpdkNofQos(uint32_t block_size) {
@@ -1009,7 +1064,10 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
     std::vector<std::vector<Slice>>& all_slices,
     TransferRequest::OpCode op_code) {
     std::optional<TransferFuture> future;
-    std::vector<TransferRequest> requests;
+    struct RequestGroup {
+        std::vector<TransferRequest> requests;
+    };
+    std::unordered_map<std::string, RequestGroup> request_groups;
     for (size_t i = 0; i < replicas.size(); ++i) {
         auto& replica = replicas[i];
         auto& slices = all_slices[i];
@@ -1032,11 +1090,33 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
             request.target_id = seg;
             request.target_offset = handle.buffer_address_ + offset;
             request.length = slice.size;
-            requests.emplace_back(request);
+            request_groups[handle.selected_protocol_].requests.emplace_back(
+                request);
             offset += slice.size;
         }
     }
-    future = submitTransfer(requests);
+    std::vector<TransferFuture> futures;
+    futures.reserve(request_groups.size());
+    for (auto& [selected_protocol, group] : request_groups) {
+        if (group.requests.empty()) {
+            continue;
+        }
+        auto group_future = submitTransfer(group.requests, selected_protocol);
+        if (!group_future) {
+            return std::nullopt;
+        }
+        futures.emplace_back(std::move(*group_future));
+    }
+    if (futures.empty()) {
+        return std::nullopt;
+    }
+    if (futures.size() == 1) {
+        future = std::move(futures.front());
+    } else {
+        future = TransferFuture(
+            std::make_shared<AggregateTransferOperationState>(
+                std::move(futures)));
+    }
     // Update metrics on successful submission
     if (future.has_value()) {
         for (auto& slices : all_slices) {
@@ -1130,7 +1210,8 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitTransfer(
-    std::vector<TransferRequest>& requests) {
+    std::vector<TransferRequest>& requests,
+    const std::string& selected_protocol) {
     // Allocate batch ID
     const size_t batch_size = requests.size();
     BatchID batch_id = engine_.allocateBatchID(batch_size);
@@ -1139,8 +1220,16 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
         return std::nullopt;
     }
 
-    // Submit transfer
-    Status s = engine_.submitTransfer(batch_id, requests);
+    Status s = Status::OK();
+#ifdef ENABLE_MULTI_PROTOCOL
+    if (!selected_protocol.empty()) {
+        std::string protocol = selected_protocol;
+        s = engine_.mp_submitTransfer(batch_id, requests, protocol);
+    } else
+#endif
+    {
+        s = engine_.submitTransfer(batch_id, requests);
+    }
     if (!s.ok()) {
         LOG(ERROR) << "Failed to submit all transfers, error code is "
                    << s.code();
@@ -1164,6 +1253,31 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
     return TransferFuture(state);
 }
 
+std::vector<TransferRequest> TransferSubmitter::BuildTransferRequestsForTest(
+    SegmentHandle segment, uint64_t base_address,
+    const std::vector<Slice>& slices, TransferRequest::OpCode op_code,
+    uint64_t src_offset) {
+    std::vector<TransferRequest> requests;
+    requests.reserve(slices.size());
+    uint64_t offset = src_offset;
+    for (const auto& slice : slices) {
+        if (slice.ptr == nullptr) {
+            continue;
+        }
+
+        TransferRequest request;
+        request.opcode = op_code;
+        request.source = static_cast<char*>(slice.ptr);
+        request.target_id = segment;
+        request.target_offset = base_address + offset;
+        request.length = slice.size;
+
+        offset += slice.size;
+        requests.emplace_back(request);
+    }
+    return requests;
+}
+
 std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
     const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
     const TransferRequest::OpCode op_code, uint64_t src_offset) {
@@ -1180,27 +1294,10 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
         return std::nullopt;
     }
 
-    // Create transfer requests
-    std::vector<TransferRequest> requests;
-    requests.reserve(slices.size());
     uint64_t base_address = static_cast<uint64_t>(handle.buffer_address_);
-    uint64_t offset = src_offset;
-
-    for (size_t i = 0; i < slices.size(); ++i) {
-        const auto& slice = slices[i];
-        if (slice.ptr == nullptr) continue;
-
-        TransferRequest request;
-        request.opcode = op_code;
-        request.source = static_cast<char*>(slice.ptr);
-        request.target_id = seg;
-        request.target_offset = base_address + offset;
-        request.length = slice.size;
-
-        offset += slice.size;
-        requests.emplace_back(request);
-    }
-    return submitTransfer(requests);
+    auto requests = BuildTransferRequestsForTest(seg, base_address, slices,
+                                                 op_code, src_offset);
+    return submitTransfer(requests, handle.selected_protocol_);
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitMemoryReadOperation(

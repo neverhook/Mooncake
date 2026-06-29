@@ -584,6 +584,11 @@ class TransferSubmitter {
     static bool isSameProcessEndpoint(const std::string& handle_endpoint,
                                       const std::string& local_endpoint);
 
+    static std::vector<TransferRequest> BuildTransferRequestsForTest(
+        SegmentHandle segment, uint64_t base_address,
+        const std::vector<Slice>& slices, TransferRequest::OpCode op_code,
+        uint64_t src_offset = 0);
+
    private:
     TransferEngine& engine_;
     // Cached at construction: the local transport endpoint never changes for
@@ -657,7 +662,8 @@ class TransferSubmitter {
                                TransferRequest::OpCode op);
 
     std::optional<TransferFuture> submitTransfer(
-        std::vector<TransferRequest>& requests);
+        std::vector<TransferRequest>& requests,
+        const std::string& selected_protocol = "");
 };
 
 }  // namespace mooncake

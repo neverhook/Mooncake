@@ -18,6 +18,7 @@
 #include <functional>
 #include <limits>
 #include <optional>
+#include <unordered_set>
 #include <vector>
 
 #include "real_client.h"
@@ -33,6 +34,7 @@
 #include "default_config.h"
 #include "shm_helper.h"
 #include "memory_location.h"
+#include "transfer_candidate_selector.h"
 #ifdef USE_NOF
 #include "spdk/spdk_wrapper.h"
 #endif
@@ -284,45 +286,57 @@ inline tl::expected<void, ErrorCode> scatter_host_to_maybe_device(
     return {};
 }
 
-// Select the best replica from a list: prefer local MEMORY, then any
-// MEMORY, then LOCAL_DISK, then DISK.  Master may return replicas in any
-// order, so we always scan.
-inline const Replica::Descriptor *SelectBestReplica(
-    const std::vector<Replica::Descriptor> &replicas,
-    const std::unordered_set<std::string> &local_endpoints) {
-    const Replica::Descriptor *first_memory = nullptr;
-    const Replica::Descriptor *first_nof = nullptr;
-    for (const auto &r : replicas) {
-        if (r.status != ReplicaStatus::COMPLETE) continue;
-        if (r.is_memory_replica()) {
-            if (local_endpoints.count(
-                    r.get_memory_descriptor()
-                        .buffer_descriptor.transport_endpoint_)) {
-                return &r;  // local MEMORY — best case
-            }
-            if (!first_memory) first_memory = &r;
-        } else if (r.is_nof_replica()) {
-            if (local_endpoints.count(
-                    r.get_nof_descriptor()
-                        .buffer_descriptor.transport_endpoint_)) {
-                return &r;  // local NOF_SSD — also good
-            }
-            if (!first_nof) first_nof = &r;
-        }
-    }
-    if (first_memory) return first_memory;
-    if (first_nof) return first_nof;
+inline bool is_device_destination(const void *dst) {
+    return gpu_staging::IsDevicePointer(dst, nullptr);
+}
 
-    const Replica::Descriptor *best = nullptr;
-    for (const auto &r : replicas) {
-        if (r.status != ReplicaStatus::COMPLETE) continue;
-        if (r.is_local_disk_replica()) {
-            best = &r;  // LOCAL_DISK always overrides DISK
-        } else if (r.is_disk_replica() && !best) {
-            best = &r;
+inline bool all_destinations_are_device(const std::vector<void *> &buffers,
+                                        const std::vector<size_t> &sizes) {
+    bool saw_non_empty_buffer = false;
+    for (size_t i = 0; i < buffers.size(); ++i) {
+        if (i < sizes.size() && sizes[i] == 0) {
+            continue;
+        }
+        if (buffers[i] == nullptr) {
+            continue;
+        }
+        saw_non_empty_buffer = true;
+        if (!is_device_destination(buffers[i])) {
+            return false;
         }
     }
-    return best;
+    return saw_non_empty_buffer;
+}
+
+inline TransferCandidateContext make_transfer_candidate_context(
+    const std::unordered_set<std::string> &local_endpoints,
+    bool destination_is_device) {
+    TransferCandidateContext context;
+    context.local_endpoints = local_endpoints;
+    context.enable_nvlink_host_numa =
+        globalConfig().enable_nvlink_host_numa;
+    context.local_scale_up_domain_id =
+        globalConfig().nvlink_scale_up_domain_id;
+    context.destination_is_device = destination_is_device;
+    return context;
+}
+
+inline std::optional<Replica::Descriptor> select_replica_for_read(
+    const std::vector<Replica::Descriptor> &replicas,
+    const std::unordered_set<std::string> &local_endpoints,
+    bool destination_is_device) {
+    auto candidate = SelectTransferCandidate(
+        replicas, make_transfer_candidate_context(local_endpoints,
+                                                  destination_is_device));
+    if (!candidate) {
+        return std::nullopt;
+    }
+    auto replica = candidate->replica;
+    if (!candidate->selected_protocol.empty() && replica.is_memory_replica()) {
+        replica.get_memory_descriptor().buffer_descriptor.selected_protocol_ =
+            candidate->selected_protocol;
+    }
+    return replica;
 }
 
 // Build a QueryResult containing only the chosen replica so that
@@ -2561,14 +2575,14 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     // LOCAL_DISK data is on a remote node's SSD — must use offload RPC.
     // MEMORY / DISK are handled via client_->Get below.
     auto local_endpoints = client_->GetLocalEndpoints();
-    const auto *best_replica = SelectBestReplica(replica_list, local_endpoints);
-    if (!best_replica) {
+    auto sizing_replica =
+        select_replica_for_read(replica_list, local_endpoints, false);
+    if (!sizing_replica) {
         LOG(ERROR) << "No usable replica for key: " << key;
         return nullptr;
     }
 
-    const auto &replica = *best_replica;
-    uint64_t total_length = calculate_total_size(replica);
+    uint64_t total_length = calculate_total_size(*sizing_replica);
 
     if (total_length == 0) {
         return nullptr;
@@ -2584,10 +2598,19 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     auto buffer_handle =
         std::make_shared<BufferHandle>(std::move(*alloc_result));
 
-    if (best_replica->is_local_disk_replica()) {
+    auto selected_replica =
+        select_replica_for_read(replica_list, local_endpoints,
+                                is_device_destination(buffer_handle->ptr()));
+    if (!selected_replica) {
+        LOG(ERROR) << "No usable replica for key: " << key;
+        return nullptr;
+    }
+    const auto &replica = *selected_replica;
+
+    if (replica.is_local_disk_replica()) {
         // LOCAL_DISK: data is on remote node's SSD. Use offload RPC.
         const auto &endpoint =
-            best_replica->get_local_disk_descriptor().transport_endpoint;
+            replica.get_local_disk_descriptor().transport_endpoint;
         std::unordered_map<std::string, std::vector<Slice>> objects;
         objects.emplace(
             key, std::vector<Slice>{{buffer_handle->ptr(), total_length}});
@@ -2870,14 +2893,13 @@ RealClient::batch_get_buffer_internal(
 
         // Select best replica: prefer local MEMORY, then any MEMORY,
         // then LOCAL_DISK, then DISK.
-        const auto *best_replica =
-            SelectBestReplica(query_result_values.replicas, local_endpoints);
-        if (!best_replica) {
+        auto sizing_replica = select_replica_for_read(
+            query_result_values.replicas, local_endpoints, false);
+        if (!sizing_replica) {
             LOG(ERROR) << "No usable replica for key: " << key;
             continue;
         }
-        const auto replica = *best_replica;
-        uint64_t total_size = calculate_total_size(replica);
+        uint64_t total_size = calculate_total_size(*sizing_replica);
         if (total_size == 0) {
             continue;
         }
@@ -2892,6 +2914,14 @@ RealClient::batch_get_buffer_internal(
 
         auto buffer_handle =
             std::make_unique<BufferHandle>(std::move(*alloc_result));
+        auto selected_replica = select_replica_for_read(
+            query_result_values.replicas, local_endpoints,
+            is_device_destination(buffer_handle->ptr()));
+        if (!selected_replica) {
+            LOG(ERROR) << "No usable replica for key: " << key;
+            continue;
+        }
+        const auto replica = *selected_replica;
         std::vector<Slice> slices;
         allocateSlices(slices, replica, buffer_handle->ptr());
 
@@ -3123,7 +3153,7 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
     size_t size, const RangedReadMetadata &metadata,
     bool size_is_buffer_capacity) {
     const auto &query_result = metadata.query_result;
-    const auto &replica = metadata.replica;
+    auto replica = metadata.replica;
     const uint64_t total_size = metadata.total_size;
 
     if (size_is_buffer_capacity) {
@@ -3137,6 +3167,17 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
         LOG(ERROR) << "Range overflow: src_offset=" << src_offset
                    << " + size=" << size << " > total=" << total_size;
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    const bool destination_is_device =
+        is_device_destination(static_cast<char *>(buffer) + dst_offset);
+    if (replica.is_memory_replica()) {
+        auto selected_replica = select_replica_for_read(
+            query_result.replicas, client_->GetLocalEndpoints(),
+            destination_is_device);
+        if (selected_replica && selected_replica->is_memory_replica()) {
+            replica = std::move(*selected_replica);
+        }
     }
 
     if (src_offset == 0 && size == total_size) {
@@ -3274,7 +3315,8 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
     std::vector<Slice> slices;
     slices.emplace_back(Slice{static_cast<char *>(buffer) + dst_offset, size});
 
-    auto get_result = client_->Get(key, query_result, slices, src_offset);
+    auto filtered_qr = FilterQueryResult(query_result, replica);
+    auto get_result = client_->Get(key, filtered_qr, slices, src_offset);
     if (!get_result) {
         return tl::unexpected(get_result.error());
     }
@@ -3514,14 +3556,15 @@ RealClient::build_ranged_read_metadata_from_query_result(
     }
 
     auto local_endpoints = client_->GetLocalEndpoints();
-    const auto *best_replica = SelectBestReplica(replica_list, local_endpoints);
-    if (!best_replica) {
+    auto selected_replica =
+        select_replica_for_read(replica_list, local_endpoints, false);
+    if (!selected_replica) {
         LOG(ERROR) << "No usable replica for key: " << key;
         return tl::unexpected(ErrorCode::INVALID_REPLICA);
     }
 
     auto query_value = std::move(query_result.value());
-    auto replica = *best_replica;
+    auto replica = std::move(*selected_replica);
     return RangedReadMetadata{.query_result = std::move(query_value),
                               .replica = std::move(replica),
                               .total_size = calculate_total_size(replica)};
@@ -4441,16 +4484,17 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
 
         // Select best replica: prefer local MEMORY, then any MEMORY,
         // then LOCAL_DISK, then DISK.
-        const auto *best_replica =
-            SelectBestReplica(query_result_values.replicas, local_endpoints);
-        if (!best_replica) {
+        auto selected_replica = select_replica_for_read(
+            query_result_values.replicas, local_endpoints,
+            is_device_destination(buffers[i]));
+        if (!selected_replica) {
             LOG(ERROR) << "No usable replica for key: " << key;
             results[i] = tl::unexpected(ErrorCode::INVALID_REPLICA);
             continue;
         }
 
         // Calculate required buffer size
-        const auto replica = *best_replica;
+        const auto replica = *selected_replica;
         uint64_t total_size = calculate_total_size(replica);
 
         // Validate buffer capacity
@@ -4918,14 +4962,15 @@ RealClient::batch_get_into_multi_buffers_internal(
         // Select best replica: prefer MEMORY (direct RDMA to GPU), then
         // LOCAL_DISK, then DISK. Master may return multiple replicas in any
         // order, so always scan rather than blindly taking replicas[0].
-        const auto *best_replica =
-            SelectBestReplica(query_result_values.replicas, local_endpoints);
-        if (!best_replica) {
+        auto selected_replica = select_replica_for_read(
+            query_result_values.replicas, local_endpoints,
+            all_destinations_are_device(all_buffers[i], all_sizes[i]));
+        if (!selected_replica) {
             LOG(ERROR) << "No usable replica for key: " << key;
             results.emplace_back(tl::unexpected(ErrorCode::INVALID_REPLICA));
             continue;
         }
-        const auto replica = *best_replica;
+        const auto replica = *selected_replica;
         uint64_t total_size = calculate_total_size(replica);
         const auto &sizes = all_sizes[i];
         uint64_t dst_total_size = 0;

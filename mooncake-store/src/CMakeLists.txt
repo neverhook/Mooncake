@@ -16,6 +16,7 @@ set(MOONCAKE_STORE_SOURCES
     etcd_helper.cpp
     segment.cpp
     transfer_task.cpp
+    transfer_candidate_selector.cpp
     tenant_quota.cpp
     rpc_service.cpp
     master_admin_service.cpp

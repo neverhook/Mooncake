@@ -236,6 +236,62 @@ TEST_F(TransferMetadataTest, LocalMemoryBufferTest) {
     ASSERT_EQ(re, 0);
 }
 
+TEST_F(TransferMetadataTest, RemoveLocalMemoryBufferHonorsProtocolFilter) {
+#ifndef ENABLE_MULTI_PROTOCOL
+    GTEST_SKIP() << "ENABLE_MULTI_PROTOCOL is not compiled in";
+#else
+    auto segment_des = std::make_shared<TransferMetadata::SegmentDesc>();
+    segment_des->name = "test_protocol_filtered_localMemory";
+    segment_des->protocol = "nvlink,rdma";
+    int re = metadata_client->addLocalSegment(
+        LOCAL_SEGMENT_ID, "test_protocol_filtered_local_segment",
+        std::move(segment_des));
+    ASSERT_EQ(re, 0);
+
+    constexpr uint64_t addr = 0x100000;
+    TransferMetadata::BufferDesc rdma_buffer;
+    rdma_buffer.addr = addr;
+    rdma_buffer.length = 4096;
+    rdma_buffer.protocol = "rdma";
+    ASSERT_EQ(metadata_client->addLocalMemoryBuffer(rdma_buffer, false), 0);
+
+    TransferMetadata::BufferDesc nvlink_buffer;
+    nvlink_buffer.addr = addr;
+    nvlink_buffer.length = 4096;
+    nvlink_buffer.protocol = "nvlink";
+    nvlink_buffer.memory_kind = "HOST_NUMA";
+    nvlink_buffer.scale_up_domain_id = "domain-a";
+    ASSERT_EQ(metadata_client->addLocalMemoryBuffer(nvlink_buffer, false), 0);
+
+    ASSERT_EQ(metadata_client->removeLocalMemoryBuffer((void*)addr, false,
+                                                       "nvlink"),
+              0);
+    auto desc = metadata_client->getSegmentDescByID(LOCAL_SEGMENT_ID, false);
+    ASSERT_NE(desc, nullptr);
+    ASSERT_EQ(desc->buffers.size(), 1u);
+    EXPECT_EQ(desc->buffers[0].protocol, "rdma");
+
+    ASSERT_EQ(metadata_client->removeLocalMemoryBuffer((void*)addr, false,
+                                                       "nvlink"),
+              ERR_ADDRESS_NOT_REGISTERED);
+    desc = metadata_client->getSegmentDescByID(LOCAL_SEGMENT_ID, false);
+    ASSERT_NE(desc, nullptr);
+    ASSERT_EQ(desc->buffers.size(), 1u);
+    EXPECT_EQ(desc->buffers[0].protocol, "rdma");
+
+    ASSERT_EQ(metadata_client->removeLocalMemoryBuffer((void*)addr, false,
+                                                       "rdma"),
+              0);
+    desc = metadata_client->getSegmentDescByID(LOCAL_SEGMENT_ID, false);
+    ASSERT_NE(desc, nullptr);
+    EXPECT_TRUE(desc->buffers.empty());
+
+    re = metadata_client->removeLocalSegment(
+        "test_protocol_filtered_local_segment");
+    ASSERT_EQ(re, 0);
+#endif
+}
+
 // add, get and remove RPCMetaEntryMeta
 TEST_F(TransferMetadataTest, RpcMetaEntryTest) {
     auto hostname_port = parseHostNameWithPort(local_server_name);

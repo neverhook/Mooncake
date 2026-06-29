@@ -326,7 +326,11 @@ int RdmaTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
 int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
                                                  bool update_metadata,
                                                  bool force_sequential) {
+#ifdef ENABLE_MULTI_PROTOCOL
+    int rc = metadata_->removeLocalMemoryBuffer(addr, update_metadata, "rdma");
+#else
     int rc = metadata_->removeLocalMemoryBuffer(addr, update_metadata);
+#endif
     if (rc) return rc;
 
     // force_sequential is used by batch operations to avoid nested parallelism

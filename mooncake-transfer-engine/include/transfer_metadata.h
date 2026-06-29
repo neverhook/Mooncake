@@ -190,7 +190,8 @@ class TransferMetadata {
     int addLocalMemoryBuffer(const BufferDesc &buffer_desc,
                              bool update_metadata);
 
-    int removeLocalMemoryBuffer(void *addr, bool update_metadata);
+    int removeLocalMemoryBuffer(void *addr, bool update_metadata,
+                                const std::string &protocol = "");
 
     int addLocalSegment(SegmentID segment_id, const std::string &segment_name,
                         std::shared_ptr<SegmentDesc> &&desc);

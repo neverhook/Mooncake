@@ -1208,6 +1208,7 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     port_binder_.reset();
     hugepage_segment_ptrs_.clear();
     ub_segment_ptrs_.clear();
+    host_numa_fabric_segment_ptrs_.clear();
     segment_ptrs_.clear();
     local_hostname = "";
     device_name = "";

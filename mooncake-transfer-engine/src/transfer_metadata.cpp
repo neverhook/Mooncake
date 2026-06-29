@@ -1193,8 +1193,8 @@ int TransferMetadata::addLocalMemoryBuffer(const BufferDesc &buffer_desc,
     return 0;
 }
 
-int TransferMetadata::removeLocalMemoryBuffer(void *addr,
-                                              bool update_metadata) {
+int TransferMetadata::removeLocalMemoryBuffer(void *addr, bool update_metadata,
+                                              const std::string &protocol) {
     bool addr_exist = false;
     {
         RWSpinlock::WriteGuard guard(segment_lock_);
@@ -1210,6 +1210,13 @@ int TransferMetadata::removeLocalMemoryBuffer(void *addr,
                 (iter->offset + segment_desc->cxl_base_addr) == (uint64_t)addr
 #endif
             ) {
+#ifdef ENABLE_MULTI_PROTOCOL
+                if (!protocol.empty() && iter->protocol != protocol) {
+                    continue;
+                }
+#else
+                (void)protocol;
+#endif
                 segment_desc->buffers.erase(iter);
                 addr_exist = true;
                 break;

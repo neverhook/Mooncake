@@ -733,7 +733,11 @@ int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
 }
 
 int NvlinkTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
+#ifdef ENABLE_MULTI_PROTOCOL
+    return metadata_->removeLocalMemoryBuffer(addr, update_metadata, "nvlink");
+#else
     return metadata_->removeLocalMemoryBuffer(addr, update_metadata);
+#endif
 }
 
 int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,

@@ -75,6 +75,8 @@ bool IsNvlinkHostNumaCandidate(const Replica::Descriptor& replica,
         replica.get_memory_descriptor().buffer_descriptor;
     return AdvertisesProtocol(buffer, "nvlink") &&
            buffer.memory_kind_ == "HOST_NUMA" &&
+           !buffer.scale_up_domain_id_.empty() &&
+           !context.local_scale_up_domain_id.empty() &&
            buffer.scale_up_domain_id_ == context.local_scale_up_domain_id;
 }
 

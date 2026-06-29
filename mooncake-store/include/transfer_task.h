@@ -313,6 +313,11 @@ struct MemcpyTask {
         : operations(std::move(ops)), state(std::move(s)) {}
 };
 
+struct TransferRequestGroup {
+    std::string selected_protocol;
+    std::vector<TransferRequest> requests;
+};
+
 /**
  * @brief Thread pool for asynchronous memcpy operations
  *
@@ -588,6 +593,15 @@ class TransferSubmitter {
         SegmentHandle segment, uint64_t base_address,
         const std::vector<Slice>& slices, TransferRequest::OpCode op_code,
         uint64_t src_offset = 0);
+
+    static std::vector<TransferRequestGroup> BuildBatchTransferGroupsForTest(
+        const std::vector<Replica::Descriptor>& replicas,
+        const std::vector<std::vector<Slice>>& all_slices,
+        const std::vector<SegmentHandle>& segments,
+        TransferRequest::OpCode op_code);
+
+    static TransferFuture AggregateTransferFuturesForTest(
+        std::vector<TransferFuture> futures);
 
    private:
     TransferEngine& engine_;

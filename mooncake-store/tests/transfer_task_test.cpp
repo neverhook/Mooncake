@@ -8,11 +8,49 @@
 #include <cstring>
 #include <memory>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "types.h"
 
 namespace mooncake {
+namespace {
+
+class CountingOperationState : public OperationState {
+   public:
+    CountingOperationState(ErrorCode result, int* wait_count)
+        : configured_result_(result), wait_count_(wait_count) {}
+
+    bool is_completed() override { return false; }
+
+    void wait_for_completion() override {
+        ++(*wait_count_);
+        std::lock_guard<std::mutex> lock(mutex_);
+        result_ = configured_result_;
+    }
+
+    TransferStrategy get_strategy() const override {
+        return TransferStrategy::TRANSFER_ENGINE;
+    }
+
+   private:
+    ErrorCode configured_result_;
+    int* wait_count_;
+};
+
+Replica::Descriptor MemoryReplicaForTransferTaskTest(
+    const std::string& selected_protocol, uint64_t remote_address,
+    uint64_t size) {
+    AllocatedBuffer::Descriptor buffer;
+    buffer.size_ = size;
+    buffer.buffer_address_ = remote_address;
+    buffer.transport_endpoint_ = "endpoint";
+    buffer.selected_protocol_ = selected_protocol;
+    return Replica::Descriptor{1, MemoryDescriptor{buffer},
+                               ReplicaStatus::COMPLETE};
+}
+
+}  // namespace
 
 // Test fixture for TransferTask tests
 // TODO: Currently, this test does not cover TransferSubmitter and
@@ -194,6 +232,59 @@ TEST_F(TransferTaskTest, BuildTransferRequestsPreservesSliceVectorShape) {
     EXPECT_EQ(requests[1].target_id, 42);
     EXPECT_EQ(requests[1].target_offset, 0x100000 + 128 + first.size());
     EXPECT_EQ(requests[1].length, second.size());
+}
+
+TEST_F(TransferTaskTest, BuildBatchTransferGroupsSplitsBySelectedProtocol) {
+    std::vector<char> rdma_first(16);
+    std::vector<char> nvlink(32);
+    std::vector<char> rdma_second(8);
+    std::vector<Replica::Descriptor> replicas = {
+        MemoryReplicaForTransferTaskTest("rdma", 0x100000, rdma_first.size()),
+        MemoryReplicaForTransferTaskTest("nvlink", 0x200000, nvlink.size()),
+        MemoryReplicaForTransferTaskTest("rdma", 0x300000, rdma_second.size())};
+    std::vector<std::vector<Slice>> all_slices = {
+        {{rdma_first.data(), rdma_first.size()}},
+        {{nvlink.data(), nvlink.size()}},
+        {{rdma_second.data(), rdma_second.size()}}};
+    std::vector<SegmentHandle> segments = {11, 22, 33};
+
+    auto groups = TransferSubmitter::BuildBatchTransferGroupsForTest(
+        replicas, all_slices, segments, TransferRequest::READ);
+
+    ASSERT_EQ(groups.size(), 2);
+    std::unordered_map<std::string, const TransferRequestGroup*> by_protocol;
+    for (const auto& group : groups) {
+        by_protocol.emplace(group.selected_protocol, &group);
+    }
+    ASSERT_TRUE(by_protocol.count("rdma"));
+    ASSERT_TRUE(by_protocol.count("nvlink"));
+    const auto& rdma_group = *by_protocol.at("rdma");
+    const auto& nvlink_group = *by_protocol.at("nvlink");
+    ASSERT_EQ(rdma_group.requests.size(), 2);
+    ASSERT_EQ(nvlink_group.requests.size(), 1);
+    EXPECT_EQ(rdma_group.requests[0].target_id, 11);
+    EXPECT_EQ(rdma_group.requests[0].target_offset, 0x100000);
+    EXPECT_EQ(rdma_group.requests[1].target_id, 33);
+    EXPECT_EQ(rdma_group.requests[1].target_offset, 0x300000);
+    EXPECT_EQ(nvlink_group.requests[0].target_id, 22);
+    EXPECT_EQ(nvlink_group.requests[0].target_offset, 0x200000);
+}
+
+TEST_F(TransferTaskTest, AggregateTransferFutureWaitsForEveryChild) {
+    int ok_wait_count = 0;
+    int failed_wait_count = 0;
+    std::vector<TransferFuture> futures;
+    futures.emplace_back(std::make_shared<CountingOperationState>(
+        ErrorCode::OK, &ok_wait_count));
+    futures.emplace_back(std::make_shared<CountingOperationState>(
+        ErrorCode::TRANSFER_FAIL, &failed_wait_count));
+
+    auto aggregate =
+        TransferSubmitter::AggregateTransferFuturesForTest(std::move(futures));
+
+    EXPECT_EQ(aggregate.get(), ErrorCode::TRANSFER_FAIL);
+    EXPECT_EQ(ok_wait_count, 1);
+    EXPECT_EQ(failed_wait_count, 1);
 }
 
 // Test TransferStrategy enum and stream operator

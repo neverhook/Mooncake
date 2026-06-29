@@ -10,6 +10,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 #include "gpu_staging_utils.h"
 #include "transfer_engine.h"
@@ -1064,10 +1065,8 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
     std::vector<std::vector<Slice>>& all_slices,
     TransferRequest::OpCode op_code) {
     std::optional<TransferFuture> future;
-    struct RequestGroup {
-        std::vector<TransferRequest> requests;
-    };
-    std::unordered_map<std::string, RequestGroup> request_groups;
+    std::vector<SegmentHandle> segments;
+    segments.reserve(replicas.size());
     for (size_t i = 0; i < replicas.size(); ++i) {
         auto& replica = replicas[i];
         auto& slices = all_slices[i];
@@ -1076,32 +1075,24 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
             return std::nullopt;
         }
         auto& handle = mem_desc.buffer_descriptor;
-        uint64_t offset = 0;
         SegmentHandle seg = engine_.openSegment(handle.transport_endpoint_);
         if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
             LOG(ERROR) << "Failed to open segment "
                        << handle.transport_endpoint_;
             return std::nullopt;
         }
-        for (auto slice : slices) {
-            TransferRequest request;
-            request.opcode = op_code;
-            request.source = static_cast<char*>(slice.ptr);
-            request.target_id = seg;
-            request.target_offset = handle.buffer_address_ + offset;
-            request.length = slice.size;
-            request_groups[handle.selected_protocol_].requests.emplace_back(
-                request);
-            offset += slice.size;
-        }
+        segments.emplace_back(seg);
     }
+    auto request_groups =
+        BuildBatchTransferGroupsForTest(replicas, all_slices, segments, op_code);
     std::vector<TransferFuture> futures;
     futures.reserve(request_groups.size());
-    for (auto& [selected_protocol, group] : request_groups) {
+    for (auto& group : request_groups) {
         if (group.requests.empty()) {
             continue;
         }
-        auto group_future = submitTransfer(group.requests, selected_protocol);
+        auto group_future =
+            submitTransfer(group.requests, group.selected_protocol);
         if (!group_future) {
             return std::nullopt;
         }
@@ -1113,9 +1104,7 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
     if (futures.size() == 1) {
         future = std::move(futures.front());
     } else {
-        future = TransferFuture(
-            std::make_shared<AggregateTransferOperationState>(
-                std::move(futures)));
+        future = AggregateTransferFuturesForTest(std::move(futures));
     }
     // Update metrics on successful submission
     if (future.has_value()) {
@@ -1276,6 +1265,51 @@ std::vector<TransferRequest> TransferSubmitter::BuildTransferRequestsForTest(
         requests.emplace_back(request);
     }
     return requests;
+}
+
+std::vector<TransferRequestGroup>
+TransferSubmitter::BuildBatchTransferGroupsForTest(
+    const std::vector<Replica::Descriptor>& replicas,
+    const std::vector<std::vector<Slice>>& all_slices,
+    const std::vector<SegmentHandle>& segments,
+    TransferRequest::OpCode op_code) {
+    if (replicas.size() != all_slices.size() ||
+        replicas.size() != segments.size()) {
+        return {};
+    }
+
+    std::vector<TransferRequestGroup> groups;
+    std::unordered_map<std::string, size_t> group_indexes;
+    for (size_t i = 0; i < replicas.size(); ++i) {
+        const auto& replica = replicas[i];
+        const auto& handle =
+            replica.get_memory_descriptor().buffer_descriptor;
+        auto [it, inserted] =
+            group_indexes.emplace(handle.selected_protocol_, groups.size());
+        if (inserted) {
+            groups.push_back(TransferRequestGroup{handle.selected_protocol_, {}});
+        }
+
+        uint64_t offset = 0;
+        auto& requests = groups[it->second].requests;
+        for (const auto& slice : all_slices[i]) {
+            TransferRequest request;
+            request.opcode = op_code;
+            request.source = static_cast<char*>(slice.ptr);
+            request.target_id = segments[i];
+            request.target_offset = handle.buffer_address_ + offset;
+            request.length = slice.size;
+            requests.emplace_back(request);
+            offset += slice.size;
+        }
+    }
+    return groups;
+}
+
+TransferFuture TransferSubmitter::AggregateTransferFuturesForTest(
+    std::vector<TransferFuture> futures) {
+    return TransferFuture(std::make_shared<AggregateTransferOperationState>(
+        std::move(futures)));
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(

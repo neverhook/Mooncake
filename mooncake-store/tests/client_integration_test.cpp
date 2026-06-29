@@ -2,6 +2,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <cstdlib>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -1901,20 +1902,27 @@ TEST_F(ClientIntegrationTest, AllocatorPropagatesMemoryMetadataToDescriptor) {
 
 TEST_F(ClientIntegrationTest,
        CachelibAllocatorPropagatesMemoryMetadataToDescriptor) {
-    auto allocator = std::make_shared<CachelibBufferAllocator>(
-        "test-cachelib-segment", 0x200000000ULL, 16 * 1024 * 1024,
-        "test-cachelib-endpoint");
-    allocator->setProtocol("nvlink,rdma");
-    allocator->setMemoryAttributes("HOST_NUMA", "domain-a");
+    const size_t buffer_size = 16 * 1024 * 1024;
+    std::unique_ptr<void, decltype(&std::free)> backing(
+        allocate_buffer_allocator_memory(buffer_size), &std::free);
+    ASSERT_NE(backing.get(), nullptr);
 
-    auto buffer = allocator->allocate(64);
-    ASSERT_NE(buffer, nullptr);
+    {
+        auto allocator = std::make_shared<CachelibBufferAllocator>(
+            "test-cachelib-segment", reinterpret_cast<size_t>(backing.get()),
+            buffer_size, "test-cachelib-endpoint");
+        allocator->setProtocol("nvlink,rdma");
+        allocator->setMemoryAttributes("HOST_NUMA", "domain-a");
 
-    auto descriptor = buffer->get_descriptor();
-    EXPECT_EQ(descriptor.protocol_, "nvlink,rdma");
-    EXPECT_EQ(descriptor.memory_kind_, "HOST_NUMA");
-    EXPECT_EQ(descriptor.scale_up_domain_id_, "domain-a");
-    EXPECT_TRUE(descriptor.selected_protocol_.empty());
+        auto buffer = allocator->allocate(64);
+        ASSERT_NE(buffer, nullptr);
+
+        auto descriptor = buffer->get_descriptor();
+        EXPECT_EQ(descriptor.protocol_, "nvlink,rdma");
+        EXPECT_EQ(descriptor.memory_kind_, "HOST_NUMA");
+        EXPECT_EQ(descriptor.scale_up_domain_id_, "domain-a");
+        EXPECT_TRUE(descriptor.selected_protocol_.empty());
+    }
 }
 
 }  // namespace testing

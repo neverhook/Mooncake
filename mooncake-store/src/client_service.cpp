@@ -2923,8 +2923,21 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
             }
         }
 
+#ifdef ENABLE_MULTI_PROTOCOL
+        const bool protocol_specific_registration = protocol == "rdma";
+        int rc = 0;
+        if (protocol_specific_registration) {
+            rc = RegisterMemoryForProtocols(
+                transfer_engine_.get(), {"rdma"}, buffer, size, location,
+                /*update_metadata=*/true);
+        } else {
+            rc = transfer_engine_->registerLocalMemory(
+                (void*)buffer, size, location, true, true);
+        }
+#else
         int rc = transfer_engine_->registerLocalMemory((void*)buffer, size,
                                                        location, true, true);
+#endif
         if (rc != 0) {
             LOG(ERROR) << "register_local_memory_failed base=" << buffer
                        << " size=" << size << ", error=" << rc;
@@ -2934,6 +2947,19 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
         auto mounted =
             MountSegmentAfterRegistrationLocked(buffer, size, protocol);
         if (!mounted) {
+#ifdef ENABLE_MULTI_PROTOCOL
+            if (protocol_specific_registration) {
+                int unregister_rc = UnregisterMemoryForProtocols(
+                    transfer_engine_.get(), {"rdma"}, buffer, size,
+                    /*update_metadata=*/true);
+                if (unregister_rc != 0 &&
+                    unregister_rc != ERR_ADDRESS_NOT_REGISTERED) {
+                    LOG(ERROR) << "rollback_rdma_unregister_failed base="
+                               << buffer << " size=" << size
+                               << ", error=" << unregister_rc;
+                }
+            }
+#endif
             return tl::unexpected(mounted.error());
         }
         segment_id = mounted.value();

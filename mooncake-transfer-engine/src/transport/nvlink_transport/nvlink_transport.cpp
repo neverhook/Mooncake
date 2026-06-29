@@ -307,6 +307,24 @@ static void freeVmmMappedMemory(void *ptr) {
     cuMemRelease(handle);
 }
 
+static bool isHostNumaAllocation(CUmemGenericAllocationHandle handle) {
+#ifdef USE_CUDA
+    CUmemAllocationProp prop = {};
+    auto result = cuMemGetAllocationPropertiesFromHandle(&prop, handle);
+    if (result != CUDA_SUCCESS) {
+        LOG(WARNING)
+            << "NvlinkTransport: cuMemGetAllocationPropertiesFromHandle "
+               "failed: "
+            << result;
+        return false;
+    }
+    return prop.location.type == CU_MEM_LOCATION_TYPE_HOST_NUMA;
+#else
+    (void)handle;
+    return false;
+#endif
+}
+
 static bool enableP2PAccess(int src_device_id, int dst_device_id) {
     int canAccessPeer = 0;
     if (!checkCudaErrorReturn(cudaDeviceCanAccessPeer(
@@ -682,6 +700,7 @@ int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
             real_addr = addr;
             real_size = (length + granularity - 1) & ~(granularity - 1);
         }
+        const bool is_host_numa = isHostNumaAllocation(handle);
 
         CUmemFabricHandle export_handle;
         result = cuMemExportToShareableHandle(&export_handle, handle,
@@ -703,7 +722,7 @@ int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
 #ifdef ENABLE_MULTI_PROTOCOL
         desc.protocol = "nvlink";
 #endif
-        if (globalConfig().enable_nvlink_host_numa) {
+        if (globalConfig().enable_nvlink_host_numa && is_host_numa) {
             desc.memory_kind = "HOST_NUMA";
             desc.scale_up_domain_id = globalConfig().nvlink_scale_up_domain_id;
         }

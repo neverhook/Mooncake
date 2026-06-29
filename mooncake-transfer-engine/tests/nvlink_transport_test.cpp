@@ -46,6 +46,47 @@ static void freeCudaBuffer(void* addr) {
     checkCudaError(cudaFree(addr), "Failed to free device memory");
 }
 
+namespace {
+
+struct ConfigGuard {
+    GlobalConfig& config;
+    bool enable_nvlink_host_numa;
+    std::string scale_up_domain_id;
+    int host_numa_node;
+
+    explicit ConfigGuard(GlobalConfig& config)
+        : config(config),
+          enable_nvlink_host_numa(config.enable_nvlink_host_numa),
+          scale_up_domain_id(config.nvlink_scale_up_domain_id),
+          host_numa_node(config.nvlink_host_numa_node) {}
+
+    ~ConfigGuard() {
+        config.enable_nvlink_host_numa = enable_nvlink_host_numa;
+        config.nvlink_scale_up_domain_id = scale_up_domain_id;
+        config.nvlink_host_numa_node = host_numa_node;
+    }
+};
+
+class RegisteredMemoryGuard {
+   public:
+    RegisteredMemoryGuard(TransferEngine* engine, void* addr)
+        : engine_(engine), addr_(addr) {}
+
+    ~RegisteredMemoryGuard() {
+        if (active_) engine_->unregisterLocalMemory(addr_);
+    }
+
+    RegisteredMemoryGuard(const RegisteredMemoryGuard&) = delete;
+    RegisteredMemoryGuard& operator=(const RegisteredMemoryGuard&) = delete;
+
+   private:
+    TransferEngine* engine_;
+    void* addr_;
+    bool active_ = true;
+};
+
+}  // namespace
+
 TEST(NvlinkTransportTest, HostNumaFabricRegistrationMetadata) {
 #if !defined(USE_CUDA) || !defined(USE_MNNVL)
     GTEST_SKIP() << "CUDA MNNVL support is not compiled in";
@@ -53,25 +94,6 @@ TEST(NvlinkTransportTest, HostNumaFabricRegistrationMetadata) {
     if (!NvlinkTransport::supportHostNumaFabricMem()) {
         GTEST_SKIP() << "HOST_NUMA fabric memory is not supported";
     }
-
-    struct ConfigGuard {
-        GlobalConfig& config;
-        bool enable_nvlink_host_numa;
-        std::string scale_up_domain_id;
-        int host_numa_node;
-
-        explicit ConfigGuard(GlobalConfig& config)
-            : config(config),
-              enable_nvlink_host_numa(config.enable_nvlink_host_numa),
-              scale_up_domain_id(config.nvlink_scale_up_domain_id),
-              host_numa_node(config.nvlink_host_numa_node) {}
-
-        ~ConfigGuard() {
-            config.enable_nvlink_host_numa = enable_nvlink_host_numa;
-            config.nvlink_scale_up_domain_id = scale_up_domain_id;
-            config.nvlink_host_numa_node = host_numa_node;
-        }
-    };
 
     auto& config = globalConfig();
     ConfigGuard config_guard(config);
@@ -89,13 +111,16 @@ TEST(NvlinkTransportTest, HostNumaFabricRegistrationMetadata) {
                      &NvlinkTransport::freeHostNumaFabricMemory);
 
     auto engine = std::make_unique<TransferEngine>(false);
-    engine->init(FLAGS_metadata_server, "cuda_host_numa_server:12347");
+    ASSERT_EQ(engine->init(FLAGS_metadata_server,
+                           "cuda_host_numa_server:12347"),
+              0);
 
     Transport* transport = engine->installTransport(MNNVL_PROTOCOL, nullptr);
     ASSERT_NE(transport, nullptr);
 
     int rc = engine->registerLocalMemory(host_numa_buffer, 4096, "host_numa:0");
     ASSERT_EQ(rc, 0);
+    RegisteredMemoryGuard registration_guard(engine.get(), host_numa_buffer);
 
     auto segment_desc = engine->getMetadata()->getSegmentDescByID(
         LOCAL_SEGMENT_ID, false);
@@ -108,8 +133,57 @@ TEST(NvlinkTransportTest, HostNumaFabricRegistrationMetadata) {
 #ifdef ENABLE_MULTI_PROTOCOL
     EXPECT_EQ(buffer.protocol, "nvlink");
 #endif
+#endif
+}
 
-    EXPECT_EQ(engine->unregisterLocalMemory(host_numa_buffer), 0);
+TEST(NvlinkTransportTest, DeviceVmmRegistrationDoesNotAdvertiseHostNuma) {
+#if !defined(USE_CUDA) || !defined(USE_MNNVL)
+    GTEST_SKIP() << "CUDA MNNVL support is not compiled in";
+#else
+    if (!NvlinkTransport::supportHostNumaFabricMem()) {
+        GTEST_SKIP() << "fabric memory is not supported";
+    }
+
+    auto& config = globalConfig();
+    ConfigGuard config_guard(config);
+    config.enable_nvlink_host_numa = true;
+    config.nvlink_scale_up_domain_id = "test-domain";
+    config.nvlink_host_numa_node = 0;
+
+    checkCudaError(cudaSetDevice(FLAGS_gpu_id), "Failed to set device");
+    void* device_vmm_buffer = NvlinkTransport::allocatePinnedLocalMemory(4096);
+    if (!device_vmm_buffer) {
+        GTEST_SKIP() << "failed to allocate device VMM fabric memory";
+    }
+    std::unique_ptr<void, decltype(&NvlinkTransport::freePinnedLocalMemory)>
+        buffer_guard(device_vmm_buffer,
+                     &NvlinkTransport::freePinnedLocalMemory);
+
+    auto engine = std::make_unique<TransferEngine>(false);
+    ASSERT_EQ(engine->init(FLAGS_metadata_server,
+                           "cuda_device_vmm_server:12348"),
+              0);
+
+    Transport* transport = engine->installTransport(MNNVL_PROTOCOL, nullptr);
+    ASSERT_NE(transport, nullptr);
+
+    int rc =
+        engine->registerLocalMemory(device_vmm_buffer, 4096, "cuda_vmm:0");
+    ASSERT_EQ(rc, 0);
+    RegisteredMemoryGuard registration_guard(engine.get(), device_vmm_buffer);
+
+    auto segment_desc = engine->getMetadata()->getSegmentDescByID(
+        LOCAL_SEGMENT_ID, false);
+    ASSERT_NE(segment_desc, nullptr);
+    ASSERT_EQ(segment_desc->buffers.size(), 1u);
+    const auto& buffer = segment_desc->buffers[0];
+    EXPECT_FALSE(buffer.shm_name.empty());
+    EXPECT_TRUE(buffer.memory_kind.empty());
+    EXPECT_TRUE(buffer.scale_up_domain_id.empty());
+#ifdef ENABLE_MULTI_PROTOCOL
+    EXPECT_EQ(buffer.protocol, "nvlink");
+#endif
+
 #endif
 }
 

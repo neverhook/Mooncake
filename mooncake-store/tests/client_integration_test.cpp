@@ -1899,6 +1899,24 @@ TEST_F(ClientIntegrationTest, AllocatorPropagatesMemoryMetadataToDescriptor) {
     EXPECT_TRUE(descriptor.selected_protocol_.empty());
 }
 
+TEST_F(ClientIntegrationTest,
+       CachelibAllocatorPropagatesMemoryMetadataToDescriptor) {
+    auto allocator = std::make_shared<CachelibBufferAllocator>(
+        "test-cachelib-segment", 0x200000000ULL, 16 * 1024 * 1024,
+        "test-cachelib-endpoint");
+    allocator->setProtocol("nvlink,rdma");
+    allocator->setMemoryAttributes("HOST_NUMA", "domain-a");
+
+    auto buffer = allocator->allocate(64);
+    ASSERT_NE(buffer, nullptr);
+
+    auto descriptor = buffer->get_descriptor();
+    EXPECT_EQ(descriptor.protocol_, "nvlink,rdma");
+    EXPECT_EQ(descriptor.memory_kind_, "HOST_NUMA");
+    EXPECT_EQ(descriptor.scale_up_domain_id_, "domain-a");
+    EXPECT_TRUE(descriptor.selected_protocol_.empty());
+}
+
 }  // namespace testing
 
 }  // namespace mooncake

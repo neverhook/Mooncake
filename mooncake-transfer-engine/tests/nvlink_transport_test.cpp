@@ -1,11 +1,13 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
-#include <thread>
-#include <memory>
 #include <cstring>
+#include <memory>
+#include <string>
+#include <thread>
 
 #include "cuda_alike.h"
+#include "config.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
 
@@ -41,6 +43,73 @@ static void* allocateCudaBuffer(size_t size, int gpu_id) {
 
 static void freeCudaBuffer(void* addr) {
     checkCudaError(cudaFree(addr), "Failed to free device memory");
+}
+
+TEST(NvlinkTransportTest, HostNumaFabricRegistrationMetadata) {
+#if !defined(USE_CUDA) || !defined(USE_MNNVL)
+    GTEST_SKIP() << "CUDA MNNVL support is not compiled in";
+#else
+    if (!NvlinkTransport::supportHostNumaFabricMem()) {
+        GTEST_SKIP() << "HOST_NUMA fabric memory is not supported";
+    }
+
+    struct ConfigGuard {
+        GlobalConfig& config;
+        bool enable_nvlink_host_numa;
+        std::string scale_up_domain_id;
+        int host_numa_node;
+
+        explicit ConfigGuard(GlobalConfig& config)
+            : config(config),
+              enable_nvlink_host_numa(config.enable_nvlink_host_numa),
+              scale_up_domain_id(config.nvlink_scale_up_domain_id),
+              host_numa_node(config.nvlink_host_numa_node) {}
+
+        ~ConfigGuard() {
+            config.enable_nvlink_host_numa = enable_nvlink_host_numa;
+            config.nvlink_scale_up_domain_id = scale_up_domain_id;
+            config.nvlink_host_numa_node = host_numa_node;
+        }
+    };
+
+    auto& config = globalConfig();
+    ConfigGuard config_guard(config);
+    config.enable_nvlink_host_numa = true;
+    config.nvlink_scale_up_domain_id = "test-domain";
+    config.nvlink_host_numa_node = 0;
+
+    void* host_numa_buffer =
+        NvlinkTransport::allocateHostNumaFabricMemory(4096, 0);
+    if (!host_numa_buffer) {
+        GTEST_SKIP() << "failed to allocate HOST_NUMA fabric memory";
+    }
+    std::unique_ptr<void, decltype(&NvlinkTransport::freeHostNumaFabricMemory)>
+        buffer_guard(host_numa_buffer,
+                     &NvlinkTransport::freeHostNumaFabricMemory);
+
+    auto engine = std::make_unique<TransferEngine>(false);
+    engine->init(FLAGS_metadata_server, "cuda_host_numa_server:12347");
+
+    Transport* transport = engine->installTransport(MNNVL_PROTOCOL, nullptr);
+    ASSERT_NE(transport, nullptr);
+
+    int rc = engine->registerLocalMemory(host_numa_buffer, 4096, "host_numa:0");
+    ASSERT_EQ(rc, 0);
+
+    auto segment_desc = engine->getMetadata()->getSegmentDescByID(
+        LOCAL_SEGMENT_ID, false);
+    ASSERT_NE(segment_desc, nullptr);
+    ASSERT_EQ(segment_desc->buffers.size(), 1u);
+    const auto& buffer = segment_desc->buffers[0];
+    EXPECT_FALSE(buffer.shm_name.empty());
+    EXPECT_EQ(buffer.memory_kind, "HOST_NUMA");
+    EXPECT_EQ(buffer.scale_up_domain_id, "test-domain");
+#ifdef ENABLE_MULTI_PROTOCOL
+    EXPECT_EQ(buffer.protocol, "nvlink");
+#endif
+
+    EXPECT_EQ(engine->unregisterLocalMemory(host_numa_buffer), 0);
+#endif
 }
 
 TEST(NvlinkTransportTest, WriteAndRead) {

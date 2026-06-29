@@ -42,6 +42,12 @@ class NvlinkTransport : public Transport {
 
     static void freePinnedLocalMemory(void* addr);
 
+    static bool supportHostNumaFabricMem();
+
+    static void* allocateHostNumaFabricMemory(size_t length, int numa_node);
+
+    static void freeHostNumaFabricMemory(void* addr);
+
    protected:
     int install(std::string& local_server_name,
                 std::shared_ptr<TransferMetadata> meta,

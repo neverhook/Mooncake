@@ -206,6 +206,10 @@ _codeql_detected_source_root
 
 # CodeBuddy Memory
 .codebuddy/
+
+# Codex worktrees
+.worktrees/
+
 # MacOS
 .DS_Store
 .envrc

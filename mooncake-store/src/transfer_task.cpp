@@ -159,31 +159,50 @@ class AggregateTransferOperationState : public OperationState {
         : futures_(std::move(futures)) {}
 
     bool is_completed() override {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (result_.has_value()) {
-                return true;
-            }
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (result_.has_value()) {
+            return true;
+        }
+        if (collecting_) {
+            return false;
         }
         for (const auto& future : futures_) {
-            if (!future.isReady()) {
-                return false;
-            }
+            if (!future.isReady()) return false;
         }
+        collecting_ = true;
+        lock.unlock();
+
         const ErrorCode result = CollectResult();
-        std::lock_guard<std::mutex> lock(mutex_);
+        lock.lock();
         if (!result_.has_value()) {
             result_ = result;
         }
+        collecting_ = false;
+        lock.unlock();
+        cv_.notify_all();
         return true;
     }
 
     void wait_for_completion() override {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (result_.has_value()) {
+            return;
+        }
+        if (collecting_) {
+            cv_.wait(lock, [this] { return result_.has_value(); });
+            return;
+        }
+        collecting_ = true;
+        lock.unlock();
+
         const ErrorCode result = CollectResult();
-        std::lock_guard<std::mutex> lock(mutex_);
+        lock.lock();
         if (!result_.has_value()) {
             result_ = result;
         }
+        collecting_ = false;
+        lock.unlock();
+        cv_.notify_all();
     }
 
     TransferStrategy get_strategy() const override {
@@ -203,7 +222,35 @@ class AggregateTransferOperationState : public OperationState {
     }
 
     std::vector<TransferFuture> futures_;
+    bool collecting_ = false;
 };
+
+std::vector<std::string> SplitProtocols(const std::string& protocols) {
+    std::vector<std::string> result;
+    std::stringstream ss(protocols);
+    std::string protocol;
+    while (std::getline(ss, protocol, ',')) {
+        protocol.erase(protocol.begin(),
+                       std::find_if(protocol.begin(), protocol.end(),
+                                    [](unsigned char ch) {
+                                        return !std::isspace(ch);
+                                    }));
+        protocol.erase(std::find_if(protocol.rbegin(), protocol.rend(),
+                                    [](unsigned char ch) {
+                                        return !std::isspace(ch);
+                                    }).base(),
+                       protocol.end());
+        std::transform(protocol.begin(), protocol.end(), protocol.begin(),
+                       [](unsigned char ch) {
+                           return static_cast<char>(std::tolower(ch));
+                       });
+        if (!protocol.empty()) {
+            result.emplace_back(std::move(protocol));
+        }
+    }
+    return result;
+}
+
 }  // namespace
 
 #ifdef USE_NOF
@@ -1084,7 +1131,7 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
         segments.emplace_back(seg);
     }
     auto request_groups =
-        BuildBatchTransferGroupsForTest(replicas, all_slices, segments, op_code);
+        BuildBatchTransferGroups(replicas, all_slices, segments, op_code);
     std::vector<TransferFuture> futures;
     futures.reserve(request_groups.size());
     for (auto& group : request_groups) {
@@ -1094,6 +1141,7 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
         auto group_future =
             submitTransfer(group.requests, group.selected_protocol);
         if (!group_future) {
+            DrainSubmittedFutures(futures);
             return std::nullopt;
         }
         futures.emplace_back(std::move(*group_future));
@@ -1104,7 +1152,7 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
     if (futures.size() == 1) {
         future = std::move(futures.front());
     } else {
-        future = AggregateTransferFuturesForTest(std::move(futures));
+        future = AggregateTransferFutures(std::move(futures));
     }
     // Update metrics on successful submission
     if (future.has_value()) {
@@ -1242,7 +1290,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
     return TransferFuture(state);
 }
 
-std::vector<TransferRequest> TransferSubmitter::BuildTransferRequestsForTest(
+std::vector<TransferRequest> TransferSubmitter::BuildTransferRequests(
     SegmentHandle segment, uint64_t base_address,
     const std::vector<Slice>& slices, TransferRequest::OpCode op_code,
     uint64_t src_offset) {
@@ -1267,8 +1315,24 @@ std::vector<TransferRequest> TransferSubmitter::BuildTransferRequestsForTest(
     return requests;
 }
 
+std::string TransferSubmitter::ResolveSelectedProtocol(
+    const AllocatedBuffer::Descriptor& handle) {
+    if (!handle.selected_protocol_.empty()) {
+        return handle.selected_protocol_;
+    }
+    const auto protocols = SplitProtocols(handle.protocol_);
+    if (protocols.size() <= 1) {
+        return "";
+    }
+    auto rdma_it = std::find(protocols.begin(), protocols.end(), "rdma");
+    if (rdma_it != protocols.end()) {
+        return "rdma";
+    }
+    return protocols.front();
+}
+
 std::vector<TransferRequestGroup>
-TransferSubmitter::BuildBatchTransferGroupsForTest(
+TransferSubmitter::BuildBatchTransferGroups(
     const std::vector<Replica::Descriptor>& replicas,
     const std::vector<std::vector<Slice>>& all_slices,
     const std::vector<SegmentHandle>& segments,
@@ -1284,10 +1348,12 @@ TransferSubmitter::BuildBatchTransferGroupsForTest(
         const auto& replica = replicas[i];
         const auto& handle =
             replica.get_memory_descriptor().buffer_descriptor;
+        const std::string selected_protocol =
+            ResolveSelectedProtocol(handle);
         auto [it, inserted] =
-            group_indexes.emplace(handle.selected_protocol_, groups.size());
+            group_indexes.emplace(selected_protocol, groups.size());
         if (inserted) {
-            groups.push_back(TransferRequestGroup{handle.selected_protocol_, {}});
+            groups.push_back(TransferRequestGroup{selected_protocol, {}});
         }
 
         uint64_t offset = 0;
@@ -1306,10 +1372,22 @@ TransferSubmitter::BuildBatchTransferGroupsForTest(
     return groups;
 }
 
-TransferFuture TransferSubmitter::AggregateTransferFuturesForTest(
+TransferFuture TransferSubmitter::AggregateTransferFutures(
     std::vector<TransferFuture> futures) {
     return TransferFuture(std::make_shared<AggregateTransferOperationState>(
         std::move(futures)));
+}
+
+ErrorCode TransferSubmitter::DrainSubmittedFutures(
+    std::vector<TransferFuture>& futures) {
+    ErrorCode result = ErrorCode::OK;
+    for (auto& future : futures) {
+        const ErrorCode child_result = future.get();
+        if (child_result != ErrorCode::OK && result == ErrorCode::OK) {
+            result = child_result;
+        }
+    }
+    return result;
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
@@ -1329,9 +1407,9 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
     }
 
     uint64_t base_address = static_cast<uint64_t>(handle.buffer_address_);
-    auto requests = BuildTransferRequestsForTest(seg, base_address, slices,
-                                                 op_code, src_offset);
-    return submitTransfer(requests, handle.selected_protocol_);
+    auto requests =
+        BuildTransferRequests(seg, base_address, slices, op_code, src_offset);
+    return submitTransfer(requests, ResolveSelectedProtocol(handle));
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitMemoryReadOperation(

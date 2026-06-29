@@ -4,6 +4,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <memory>
@@ -18,15 +19,17 @@ namespace {
 
 class CountingOperationState : public OperationState {
    public:
-    CountingOperationState(ErrorCode result, int* wait_count)
+    CountingOperationState(ErrorCode result, std::atomic<int>* wait_count)
         : configured_result_(result), wait_count_(wait_count) {}
 
     bool is_completed() override { return false; }
 
     void wait_for_completion() override {
-        ++(*wait_count_);
+        wait_count_->fetch_add(1);
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
         std::lock_guard<std::mutex> lock(mutex_);
         result_ = configured_result_;
+        cv_.notify_all();
     }
 
     TransferStrategy get_strategy() const override {
@@ -35,15 +38,16 @@ class CountingOperationState : public OperationState {
 
    private:
     ErrorCode configured_result_;
-    int* wait_count_;
+    std::atomic<int>* wait_count_;
 };
 
 Replica::Descriptor MemoryReplicaForTransferTaskTest(
     const std::string& selected_protocol, uint64_t remote_address,
-    uint64_t size) {
+    uint64_t size, const std::string& protocol = "") {
     AllocatedBuffer::Descriptor buffer;
     buffer.size_ = size;
     buffer.buffer_address_ = remote_address;
+    buffer.protocol_ = protocol;
     buffer.transport_endpoint_ = "endpoint";
     buffer.selected_protocol_ = selected_protocol;
     return Replica::Descriptor{1, MemoryDescriptor{buffer},
@@ -219,7 +223,7 @@ TEST_F(TransferTaskTest, BuildTransferRequestsPreservesSliceVectorShape) {
     std::vector<Slice> slices = {{first.data(), first.size()},
                                  {second.data(), second.size()}};
 
-    auto requests = TransferSubmitter::BuildTransferRequestsForTest(
+    auto requests = TransferSubmitter::BuildTransferRequests(
         42, 0x100000, slices, TransferRequest::READ, 128);
 
     ASSERT_EQ(requests.size(), 2);
@@ -232,6 +236,16 @@ TEST_F(TransferTaskTest, BuildTransferRequestsPreservesSliceVectorShape) {
     EXPECT_EQ(requests[1].target_id, 42);
     EXPECT_EQ(requests[1].target_offset, 0x100000 + 128 + first.size());
     EXPECT_EQ(requests[1].length, second.size());
+}
+
+TEST_F(TransferTaskTest, ResolveSelectedProtocolDefaultsDualProtocolToRdma) {
+    AllocatedBuffer::Descriptor handle;
+    handle.protocol_ = "nvlink,rdma";
+
+    EXPECT_EQ(TransferSubmitter::ResolveSelectedProtocol(handle), "rdma");
+
+    handle.selected_protocol_ = "nvlink";
+    EXPECT_EQ(TransferSubmitter::ResolveSelectedProtocol(handle), "nvlink");
 }
 
 TEST_F(TransferTaskTest, BuildBatchTransferGroupsSplitsBySelectedProtocol) {
@@ -248,7 +262,7 @@ TEST_F(TransferTaskTest, BuildBatchTransferGroupsSplitsBySelectedProtocol) {
         {{rdma_second.data(), rdma_second.size()}}};
     std::vector<SegmentHandle> segments = {11, 22, 33};
 
-    auto groups = TransferSubmitter::BuildBatchTransferGroupsForTest(
+    auto groups = TransferSubmitter::BuildBatchTransferGroups(
         replicas, all_slices, segments, TransferRequest::READ);
 
     ASSERT_EQ(groups.size(), 2);
@@ -270,9 +284,29 @@ TEST_F(TransferTaskTest, BuildBatchTransferGroupsSplitsBySelectedProtocol) {
     EXPECT_EQ(nvlink_group.requests[0].target_offset, 0x200000);
 }
 
+TEST_F(TransferTaskTest, BuildBatchTransferGroupsDefaultsWriteDualProtocolToRdma) {
+    std::vector<char> data(16);
+    std::vector<Replica::Descriptor> replicas = {
+        MemoryReplicaForTransferTaskTest("", 0x100000, data.size(),
+                                         "nvlink,rdma")};
+    std::vector<std::vector<Slice>> all_slices = {
+        {{data.data(), data.size()}}};
+    std::vector<SegmentHandle> segments = {11};
+
+    auto groups = TransferSubmitter::BuildBatchTransferGroups(
+        replicas, all_slices, segments, TransferRequest::WRITE);
+
+    ASSERT_EQ(groups.size(), 1);
+    EXPECT_EQ(groups[0].selected_protocol, "rdma");
+    ASSERT_EQ(groups[0].requests.size(), 1);
+    EXPECT_EQ(groups[0].requests[0].opcode, TransferRequest::WRITE);
+    EXPECT_EQ(groups[0].requests[0].target_id, 11);
+    EXPECT_EQ(groups[0].requests[0].target_offset, 0x100000);
+}
+
 TEST_F(TransferTaskTest, AggregateTransferFutureWaitsForEveryChild) {
-    int ok_wait_count = 0;
-    int failed_wait_count = 0;
+    std::atomic<int> ok_wait_count{0};
+    std::atomic<int> failed_wait_count{0};
     std::vector<TransferFuture> futures;
     futures.emplace_back(std::make_shared<CountingOperationState>(
         ErrorCode::OK, &ok_wait_count));
@@ -280,11 +314,46 @@ TEST_F(TransferTaskTest, AggregateTransferFutureWaitsForEveryChild) {
         ErrorCode::TRANSFER_FAIL, &failed_wait_count));
 
     auto aggregate =
-        TransferSubmitter::AggregateTransferFuturesForTest(std::move(futures));
+        TransferSubmitter::AggregateTransferFutures(std::move(futures));
 
     EXPECT_EQ(aggregate.get(), ErrorCode::TRANSFER_FAIL);
-    EXPECT_EQ(ok_wait_count, 1);
-    EXPECT_EQ(failed_wait_count, 1);
+    EXPECT_EQ(ok_wait_count.load(), 1);
+    EXPECT_EQ(failed_wait_count.load(), 1);
+}
+
+TEST_F(TransferTaskTest, DrainSubmittedFuturesWaitsForEveryChild) {
+    std::atomic<int> ok_wait_count{0};
+    std::atomic<int> failed_wait_count{0};
+    std::vector<TransferFuture> futures;
+    futures.emplace_back(std::make_shared<CountingOperationState>(
+        ErrorCode::OK, &ok_wait_count));
+    futures.emplace_back(std::make_shared<CountingOperationState>(
+        ErrorCode::TRANSFER_FAIL, &failed_wait_count));
+
+    EXPECT_EQ(TransferSubmitter::DrainSubmittedFutures(futures),
+              ErrorCode::TRANSFER_FAIL);
+    EXPECT_EQ(ok_wait_count.load(), 1);
+    EXPECT_EQ(failed_wait_count.load(), 1);
+}
+
+TEST_F(TransferTaskTest, AggregateTransferFutureConcurrentWaitCollectsOnce) {
+    std::atomic<int> wait_count{0};
+    std::vector<TransferFuture> futures;
+    futures.emplace_back(std::make_shared<CountingOperationState>(
+        ErrorCode::OK, &wait_count));
+    auto aggregate = TransferSubmitter::AggregateTransferFutures(
+        std::move(futures));
+    ErrorCode first = ErrorCode::INTERNAL_ERROR;
+    ErrorCode second = ErrorCode::INTERNAL_ERROR;
+
+    std::thread t1([&] { first = aggregate.get(); });
+    std::thread t2([&] { second = aggregate.get(); });
+    t1.join();
+    t2.join();
+
+    EXPECT_EQ(first, ErrorCode::OK);
+    EXPECT_EQ(second, ErrorCode::OK);
+    EXPECT_EQ(wait_count.load(), 1);
 }
 
 // Test TransferStrategy enum and stream operator

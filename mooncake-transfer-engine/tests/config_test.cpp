@@ -216,5 +216,35 @@ TEST_F(PkeyIndexEnvTest, NvlinkHostNumaTruthyBoolVariantsAreApplied) {
     }
 }
 
+TEST_F(PkeyIndexEnvTest, NvlinkHostNumaFalseBoolValuesClearExistingTrue) {
+    ASSERT_EQ(::setenv("MC_ENABLE_NVLINK_HOST_NUMA", "true", 1), 0);
+    ASSERT_EQ(::setenv("MC_NVLINK_HOST_NUMA_STRICT", "true", 1), 0);
+
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_TRUE(config.enable_nvlink_host_numa);
+    EXPECT_TRUE(config.nvlink_host_numa_strict);
+
+    ASSERT_EQ(::setenv("MC_ENABLE_NVLINK_HOST_NUMA", "0", 1), 0);
+    ASSERT_EQ(::setenv("MC_NVLINK_HOST_NUMA_STRICT", "false", 1), 0);
+    loadGlobalConfig(config);
+
+    EXPECT_FALSE(config.enable_nvlink_host_numa);
+    EXPECT_FALSE(config.nvlink_host_numa_strict);
+}
+
+TEST_F(PkeyIndexEnvTest, NvlinkHostNumaInvalidBoolValuesPreserveExistingTrue) {
+    ASSERT_EQ(::setenv("MC_ENABLE_NVLINK_HOST_NUMA", "maybe", 1), 0);
+    ASSERT_EQ(::setenv("MC_NVLINK_HOST_NUMA_STRICT", "invalid", 1), 0);
+
+    GlobalConfig config;
+    config.enable_nvlink_host_numa = true;
+    config.nvlink_host_numa_strict = true;
+    loadGlobalConfig(config);
+
+    EXPECT_TRUE(config.enable_nvlink_host_numa);
+    EXPECT_TRUE(config.nvlink_host_numa_strict);
+}
+
 }  // namespace
 }  // namespace mooncake

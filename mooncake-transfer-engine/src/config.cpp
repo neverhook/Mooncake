@@ -26,15 +26,24 @@
 namespace mooncake {
 namespace {
 
-bool isTruthyEnvValue(const char* value) {
+bool parseBoolEnvValue(const char* value, bool& parsed) {
     if (!value) return false;
     std::string normalized(value);
     std::transform(normalized.begin(), normalized.end(), normalized.begin(),
                    [](unsigned char c) {
                        return static_cast<char>(std::tolower(c));
                    });
-    return normalized == "1" || normalized == "true" || normalized == "yes" ||
-           normalized == "on";
+    if (normalized == "1" || normalized == "true" || normalized == "yes" ||
+        normalized == "on") {
+        parsed = true;
+        return true;
+    }
+    if (normalized == "0" || normalized == "false" || normalized == "no" ||
+        normalized == "off") {
+        parsed = false;
+        return true;
+    }
+    return false;
 }
 
 }  // namespace
@@ -492,12 +501,30 @@ void loadGlobalConfig(GlobalConfig& config) {
         }
     }
 
-    if (isTruthyEnvValue(std::getenv("MC_ENABLE_NVLINK_HOST_NUMA"))) {
-        config.enable_nvlink_host_numa = true;
+    const char* enable_nvlink_host_numa_env =
+        std::getenv("MC_ENABLE_NVLINK_HOST_NUMA");
+    if (enable_nvlink_host_numa_env) {
+        bool val = false;
+        if (parseBoolEnvValue(enable_nvlink_host_numa_env, val)) {
+            config.enable_nvlink_host_numa = val;
+        } else {
+            LOG(WARNING) << "Ignore MC_ENABLE_NVLINK_HOST_NUMA: expected "
+                            "0/1/true/false/yes/no/on/off, got: "
+                         << enable_nvlink_host_numa_env;
+        }
     }
 
-    if (isTruthyEnvValue(std::getenv("MC_NVLINK_HOST_NUMA_STRICT"))) {
-        config.nvlink_host_numa_strict = true;
+    const char* nvlink_host_numa_strict_env =
+        std::getenv("MC_NVLINK_HOST_NUMA_STRICT");
+    if (nvlink_host_numa_strict_env) {
+        bool val = false;
+        if (parseBoolEnvValue(nvlink_host_numa_strict_env, val)) {
+            config.nvlink_host_numa_strict = val;
+        } else {
+            LOG(WARNING) << "Ignore MC_NVLINK_HOST_NUMA_STRICT: expected "
+                            "0/1/true/false/yes/no/on/off, got: "
+                         << nvlink_host_numa_strict_env;
+        }
     }
 
     const char* nvlink_host_numa_node_env =

@@ -1846,10 +1846,32 @@ TEST_F(ClientIntegrationTest, MountSegmentAndGetIdAndUnmountSegmentById) {
 }
 
 TEST_F(ClientIntegrationTest, AllocatedBufferDescriptorCarriesMemoryMetadata) {
-    AllocatedBuffer::Descriptor descriptor{};
+    class TestBufferAllocator : public BufferAllocatorBase {
+       public:
+        std::unique_ptr<AllocatedBuffer> allocate(size_t size) override {
+            (void)size;
+            return nullptr;
+        }
+        void deallocate(AllocatedBuffer* handle) override { (void)handle; }
+        size_t capacity() const override { return 0; }
+        size_t size() const override { return 0; }
+        std::string getSegmentName() const override { return "test-segment"; }
+        std::string getTransportEndpoint() const override {
+            return "test-endpoint";
+        }
+    };
+
+    std::vector<char> backing(64);
+    auto allocator = std::make_shared<TestBufferAllocator>();
+    AllocatedBuffer buffer(allocator, backing.data(), backing.size());
+    buffer.setMemoryAttributes("HOST_NUMA", "domain-a");
+
+    AllocatedBuffer::Descriptor descriptor = buffer.get_descriptor();
+    EXPECT_EQ(descriptor.memory_kind_, "HOST_NUMA");
+    EXPECT_EQ(descriptor.scale_up_domain_id_, "domain-a");
+    EXPECT_TRUE(descriptor.selected_protocol_.empty());
+
     descriptor.protocol_ = "nvlink,rdma";
-    descriptor.memory_kind_ = "HOST_NUMA";
-    descriptor.scale_up_domain_id_ = "domain-a";
     descriptor.selected_protocol_ = "nvlink";
 
     AllocatedBuffer::Descriptor round_trip = descriptor;

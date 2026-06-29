@@ -492,6 +492,53 @@ tl::expected<void, ErrorCode> CheckRegisterMemoryParams(const void* addr,
     return {};
 }
 
+#ifdef ENABLE_MULTI_PROTOCOL
+using RegisteredBufferMap =
+    std::unordered_map<std::string,
+                       std::vector<TransferEngine::RegisteredBuffer>>;
+
+std::vector<std::string> GetProtocolSpecificRegistrationProtocols(
+    const std::string& protocol) {
+    if (protocol == "nvlink,rdma" || protocol == "rdma,nvlink") {
+        return {"nvlink", "rdma"};
+    }
+    if (protocol == "rdma") {
+        return {"rdma"};
+    }
+    return {};
+}
+
+RegisteredBufferMap BuildRegisteredBufferMap(
+    const std::vector<std::string>& protocols, const void* buffer, size_t size,
+    const std::string& location, bool update_metadata) {
+    RegisteredBufferMap buffer_map;
+    for (const auto& protocol : protocols) {
+        buffer_map[protocol].emplace_back((void*)buffer, size, location, true,
+                                          update_metadata);
+    }
+    return buffer_map;
+}
+
+int RegisterMemoryForProtocols(TransferEngine* transfer_engine,
+                               const std::vector<std::string>& protocols,
+                               const void* buffer, size_t size,
+                               const std::string& location,
+                               bool update_metadata) {
+    auto buffer_map = BuildRegisteredBufferMap(protocols, buffer, size,
+                                               location, update_metadata);
+    return transfer_engine->mp_registerLocalMemory(buffer_map);
+}
+
+int UnregisterMemoryForProtocols(TransferEngine* transfer_engine,
+                                 const std::vector<std::string>& protocols,
+                                 const void* buffer, size_t size,
+                                 bool update_metadata) {
+    auto buffer_map = BuildRegisteredBufferMap(
+        protocols, buffer, size, kWildcardLocation, update_metadata);
+    return transfer_engine->mp_unregisterLocalMemory(buffer_map);
+}
+#endif
+
 ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
     auto ha_backend_spec = ParseHABackendSpec(master_server_entry);
     if (!ha_backend_spec) {
@@ -2723,6 +2770,7 @@ tl::expected<void, ErrorCode> Client::MountSegment(
 
 tl::expected<void, ErrorCode> Client::UnmountSegmentImpl(
     std::unordered_map<UUID, Segment, boost::hash<UUID>>::iterator it) {
+    auto& segment = it->second;
     auto unmount_result = master_client_.UnmountSegment(it->second.id);
     if (!unmount_result) {
         ErrorCode err = unmount_result.error();
@@ -2731,8 +2779,23 @@ tl::expected<void, ErrorCode> Client::UnmountSegmentImpl(
         return tl::unexpected(err);
     }
 
+#ifdef ENABLE_MULTI_PROTOCOL
+    auto protocols =
+        GetProtocolSpecificRegistrationProtocols(segment.protocol);
+    int rc = 0;
+    if (!protocols.empty()) {
+        rc = UnregisterMemoryForProtocols(
+            transfer_engine_.get(), protocols,
+            reinterpret_cast<void*>(segment.base), segment.size,
+            /*update_metadata=*/true);
+    } else {
+        rc = transfer_engine_->unregisterLocalMemory(
+            reinterpret_cast<void*>(segment.base));
+    }
+#else
     int rc = transfer_engine_->unregisterLocalMemory(
-        reinterpret_cast<void*>(it->second.base));
+        reinterpret_cast<void*>(segment.base));
+#endif
     if (rc != 0) {
         LOG(ERROR) << "Failed to unregister transfer buffer with transfer "
                       "engine ret is "
@@ -2788,6 +2851,13 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAfterRegistrationLocked(
         ErrorCode err = mount_result.error();
         LOG(ERROR) << "mount_segment_to_master_failed base=" << buffer
                    << " size=" << size << ", error=" << err;
+        auto cleanup_result = master_client_.UnmountSegment(segment.id);
+        if (!cleanup_result &&
+            cleanup_result.error() != ErrorCode::SEGMENT_NOT_FOUND) {
+            LOG(WARNING) << "best_effort_unmount_after_mount_failure_failed id="
+                         << UuidToString(segment.id)
+                         << " error=" << toString(cleanup_result.error());
+        }
         return tl::unexpected(err);
     }
 
@@ -2875,15 +2945,10 @@ tl::expected<UUID, ErrorCode> Client::MountDualProtocolSegmentAndGetId(
             }
         }
 
-        std::unordered_map<std::string,
-                           std::vector<TransferEngine::RegisteredBuffer>>
-            buffer_map;
-        buffer_map["nvlink"].emplace_back((void*)buffer, size, location, true,
-                                          false);
-        buffer_map["rdma"].emplace_back((void*)buffer, size, location, true,
-                                        false);
-
-        int rc = transfer_engine_->mp_registerLocalMemory(buffer_map);
+        const std::vector<std::string> dual_protocols = {"nvlink", "rdma"};
+        int rc = RegisterMemoryForProtocols(
+            transfer_engine_.get(), dual_protocols, buffer, size, location,
+            /*update_metadata=*/false);
         if (rc != 0) {
             LOG(ERROR) << "dual_protocol_register_local_memory_failed base="
                        << buffer << " size=" << size << ", error=" << rc;
@@ -2893,17 +2958,28 @@ tl::expected<UUID, ErrorCode> Client::MountDualProtocolSegmentAndGetId(
 
             LOG(WARNING) << "falling_back_to_rdma_only_registration base="
                          << buffer << " size=" << size;
-            rc = transfer_engine_->registerLocalMemory((void*)buffer, size,
-                                                       location, true, true);
+            const std::vector<std::string> rdma_protocol = {"rdma"};
+            rc = RegisterMemoryForProtocols(
+                transfer_engine_.get(), rdma_protocol, buffer, size, location,
+                /*update_metadata=*/true);
             if (rc != 0) {
-                LOG(ERROR) << "register_local_memory_failed base=" << buffer
-                           << " size=" << size << ", error=" << rc;
+                LOG(ERROR) << "rdma_register_local_memory_failed base="
+                           << buffer << " size=" << size << ", error=" << rc;
                 return tl::unexpected(ErrorCode::INVALID_PARAMS);
             }
 
             auto mounted =
                 MountSegmentAfterRegistrationLocked(buffer, size, "rdma");
             if (!mounted) {
+                int unregister_rc = UnregisterMemoryForProtocols(
+                    transfer_engine_.get(), rdma_protocol, buffer, size,
+                    /*update_metadata=*/true);
+                if (unregister_rc != 0 &&
+                    unregister_rc != ERR_ADDRESS_NOT_REGISTERED) {
+                    LOG(ERROR)
+                        << "rollback_rdma_unregister_failed base=" << buffer
+                        << " size=" << size << ", error=" << unregister_rc;
+                }
                 return tl::unexpected(mounted.error());
             }
             segment_id = mounted.value();
@@ -2911,6 +2987,15 @@ tl::expected<UUID, ErrorCode> Client::MountDualProtocolSegmentAndGetId(
             auto mounted = MountSegmentAfterRegistrationLocked(
                 buffer, size, "nvlink,rdma");
             if (!mounted) {
+                int unregister_rc = UnregisterMemoryForProtocols(
+                    transfer_engine_.get(), dual_protocols, buffer, size,
+                    /*update_metadata=*/false);
+                if (unregister_rc != 0 &&
+                    unregister_rc != ERR_ADDRESS_NOT_REGISTERED) {
+                    LOG(ERROR)
+                        << "rollback_dual_unregister_failed base=" << buffer
+                        << " size=" << size << ", error=" << unregister_rc;
+                }
                 return tl::unexpected(mounted.error());
             }
             segment_id = mounted.value();
@@ -2918,6 +3003,24 @@ tl::expected<UUID, ErrorCode> Client::MountDualProtocolSegmentAndGetId(
             auto metadata = transfer_engine_->getMetadata();
             if (!metadata) {
                 LOG(ERROR) << "metadata_unavailable_for_dual_protocol_segment";
+                auto unmount_result = master_client_.UnmountSegment(segment_id);
+                if (!unmount_result &&
+                    unmount_result.error() != ErrorCode::SEGMENT_NOT_FOUND) {
+                    LOG(WARNING)
+                        << "best_effort_unmount_after_metadata_failure_failed "
+                        << "id=" << UuidToString(segment_id)
+                        << " error=" << toString(unmount_result.error());
+                }
+                mounted_segments_.erase(segment_id);
+                int unregister_rc = UnregisterMemoryForProtocols(
+                    transfer_engine_.get(), dual_protocols, buffer, size,
+                    /*update_metadata=*/true);
+                if (unregister_rc != 0 &&
+                    unregister_rc != ERR_ADDRESS_NOT_REGISTERED) {
+                    LOG(ERROR)
+                        << "rollback_dual_unregister_failed base=" << buffer
+                        << " size=" << size << ", error=" << unregister_rc;
+                }
                 return tl::unexpected(ErrorCode::INTERNAL_ERROR);
             }
 
@@ -2925,6 +3028,24 @@ tl::expected<UUID, ErrorCode> Client::MountDualProtocolSegmentAndGetId(
             if (rc_update != 0) {
                 LOG(ERROR) << "update_dual_protocol_segment_metadata_failed rc="
                            << rc_update;
+                auto unmount_result = master_client_.UnmountSegment(segment_id);
+                if (!unmount_result &&
+                    unmount_result.error() != ErrorCode::SEGMENT_NOT_FOUND) {
+                    LOG(WARNING)
+                        << "best_effort_unmount_after_metadata_failure_failed "
+                        << "id=" << UuidToString(segment_id)
+                        << " error=" << toString(unmount_result.error());
+                }
+                mounted_segments_.erase(segment_id);
+                int unregister_rc = UnregisterMemoryForProtocols(
+                    transfer_engine_.get(), dual_protocols, buffer, size,
+                    /*update_metadata=*/true);
+                if (unregister_rc != 0 &&
+                    unregister_rc != ERR_ADDRESS_NOT_REGISTERED) {
+                    LOG(ERROR)
+                        << "rollback_dual_unregister_failed base=" << buffer
+                        << " size=" << size << ", error=" << unregister_rc;
+                }
                 return tl::unexpected(ErrorCode::INTERNAL_ERROR);
             }
         }
@@ -3016,8 +3137,23 @@ void Client::OnGracefulUnmountTimer(const UUID& segment_id, int retry_left) {
             std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
             auto it = gracefully_unmounting_segments_.find(segment_id);
             if (it != gracefully_unmounting_segments_.end()) {
+#ifdef ENABLE_MULTI_PROTOCOL
+                auto protocols =
+                    GetProtocolSpecificRegistrationProtocols(it->second.protocol);
+                int rc = 0;
+                if (!protocols.empty()) {
+                    rc = UnregisterMemoryForProtocols(
+                        transfer_engine_.get(), protocols,
+                        reinterpret_cast<void*>(it->second.base),
+                        it->second.size, /*update_metadata=*/true);
+                } else {
+                    rc = transfer_engine_->unregisterLocalMemory(
+                        reinterpret_cast<void*>(it->second.base));
+                }
+#else
                 int rc = transfer_engine_->unregisterLocalMemory(
                     reinterpret_cast<void*>(it->second.base));
+#endif
                 if (rc != 0 && rc != ERR_ADDRESS_NOT_REGISTERED) {
                     LOG(ERROR)
                         << "Failed to unregister TE MR for graceful unmount: "

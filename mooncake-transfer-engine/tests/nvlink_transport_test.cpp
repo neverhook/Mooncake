@@ -9,6 +9,7 @@
 #include "cuda_alike.h"
 #include "config.h"
 #include "transfer_engine.h"
+#include "transport/nvlink_transport/nvlink_transport.h"
 #include "transport/transport.h"
 
 using namespace mooncake;

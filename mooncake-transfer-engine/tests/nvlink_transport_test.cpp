@@ -1,10 +1,12 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
+#include <cstdint>
 #include <cstring>
 #include <memory>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "cuda_alike.h"
 #include "config.h"
@@ -84,6 +86,73 @@ class RegisteredMemoryGuard {
     void* addr_;
     bool active_ = true;
 };
+
+struct CudaBufferDeleter {
+    void operator()(void* addr) const {
+        if (addr) freeCudaBuffer(addr);
+    }
+};
+
+struct HostNumaFabricMemoryDeleter {
+    void operator()(void* addr) const {
+        if (addr) NvlinkTransport::freeHostNumaFabricMemory(addr);
+    }
+};
+
+::testing::AssertionResult copyHostToCudaVisibleMemory(void* dst,
+                                                       const void* src,
+                                                       size_t length) {
+    cudaError_t err = cudaMemcpy(dst, src, length, cudaMemcpyHostToDevice);
+    if (err == cudaSuccess) {
+        return ::testing::AssertionSuccess();
+    }
+
+    const char* host_to_device_error = cudaGetErrorString(err);
+    cudaGetLastError();
+    cudaError_t default_err = cudaMemcpy(dst, src, length, cudaMemcpyDefault);
+    if (default_err == cudaSuccess) {
+        return ::testing::AssertionSuccess();
+    }
+
+    return ::testing::AssertionFailure()
+           << "cudaMemcpyHostToDevice failed for CUDA-visible memory: "
+           << host_to_device_error << "; cudaMemcpyDefault also failed: "
+           << cudaGetErrorString(default_err);
+}
+
+::testing::AssertionResult submitAndWaitForTransfer(
+    TransferEngine* engine, const TransferRequest& entry) {
+    auto batch_id = engine->allocateBatchID(1);
+    Status s = engine->submitTransfer(batch_id, {entry});
+    if (!s.ok()) {
+        Status free_status = engine->freeBatchID(batch_id);
+        return ::testing::AssertionFailure()
+               << "submitTransfer failed: " << s.ToString()
+               << "; freeBatchID status: " << free_status.ToString();
+    }
+
+    TransferStatus status;
+    do {
+        s = engine->getTransferStatus(batch_id, 0, status);
+        if (!s.ok()) {
+            Status free_status = engine->freeBatchID(batch_id);
+            return ::testing::AssertionFailure()
+                   << "getTransferStatus failed: " << s.ToString()
+                   << "; freeBatchID status: " << free_status.ToString();
+        }
+    } while (status.s == TransferStatusEnum::WAITING);
+
+    Status free_status = engine->freeBatchID(batch_id);
+    if (!free_status.ok()) {
+        return ::testing::AssertionFailure()
+               << "freeBatchID failed: " << free_status.ToString();
+    }
+    if (status.s != TransferStatusEnum::COMPLETED) {
+        return ::testing::AssertionFailure()
+               << "transfer ended with status " << status.s;
+    }
+    return ::testing::AssertionSuccess();
+}
 
 }  // namespace
 
@@ -184,6 +253,117 @@ TEST(NvlinkTransportTest, DeviceVmmRegistrationDoesNotAdvertiseHostNuma) {
     EXPECT_EQ(buffer.protocol, "nvlink");
 #endif
 
+#endif
+}
+
+TEST(NvlinkTransportTest, HostNumaRemoteDramToLocalHbmRead) {
+#if !defined(USE_CUDA) || !defined(USE_MNNVL)
+    GTEST_SKIP() << "CUDA MNNVL support is not compiled in";
+#else
+    if (!NvlinkTransport::supportHostNumaFabricMem()) {
+        GTEST_SKIP() << "HOST_NUMA fabric memory is not supported";
+    }
+
+    constexpr size_t kDataLength = 1 << 20;
+    int gpu_id = FLAGS_gpu_id;
+
+    auto& config = globalConfig();
+    ConfigGuard config_guard(config);
+    config.enable_nvlink_host_numa = true;
+    config.nvlink_scale_up_domain_id = "test-domain";
+    config.nvlink_host_numa_node = 0;
+
+    void* host_numa_buffer = NvlinkTransport::allocateHostNumaFabricMemory(
+        kDataLength, config.nvlink_host_numa_node);
+    if (!host_numa_buffer) {
+        GTEST_SKIP() << "failed to allocate HOST_NUMA fabric memory";
+    }
+    std::unique_ptr<void, HostNumaFabricMemoryDeleter> host_numa_guard(
+        host_numa_buffer);
+
+    std::vector<uint8_t> expected(kDataLength);
+    for (size_t i = 0; i < expected.size(); ++i) {
+        expected[i] = static_cast<uint8_t>((i * 131 + 17) & 0xff);
+    }
+    auto fill_result = copyHostToCudaVisibleMemory(
+        host_numa_buffer, expected.data(), expected.size());
+    if (!fill_result) {
+        GTEST_SKIP() << fill_result.message();
+    }
+
+    cudaError_t cuda_err = cudaSetDevice(gpu_id);
+    if (cuda_err != cudaSuccess) {
+        GTEST_SKIP() << "failed to set CUDA device " << gpu_id << ": "
+                     << cudaGetErrorString(cuda_err);
+    }
+
+    void* local_hbm_buffer = nullptr;
+    cuda_err = cudaMalloc(&local_hbm_buffer, kDataLength);
+    if (cuda_err != cudaSuccess) {
+        GTEST_SKIP() << "failed to allocate local HBM buffer: "
+                     << cudaGetErrorString(cuda_err);
+    }
+    std::unique_ptr<void, CudaBufferDeleter> local_hbm_guard(local_hbm_buffer);
+
+    cuda_err = cudaMemset(local_hbm_buffer, 0, kDataLength);
+    ASSERT_EQ(cuda_err, cudaSuccess)
+        << "failed to initialize local HBM buffer: "
+        << cudaGetErrorString(cuda_err);
+
+    const std::string server_name = "cuda_host_numa_read_server:12349";
+    const std::string client_name = "cuda_host_numa_read_client:12350";
+
+    auto server_engine = std::make_unique<TransferEngine>(false);
+    ASSERT_EQ(server_engine->init(FLAGS_metadata_server, server_name), 0);
+    Transport* server_transport =
+        server_engine->installTransport(MNNVL_PROTOCOL, nullptr);
+    ASSERT_NE(server_transport, nullptr);
+
+    int rc =
+        server_engine->registerLocalMemory(host_numa_buffer, kDataLength,
+                                           "host_numa:0");
+    ASSERT_EQ(rc, 0);
+    RegisteredMemoryGuard server_registration_guard(server_engine.get(),
+                                                    host_numa_buffer);
+
+    auto client_engine = std::make_unique<TransferEngine>(false);
+    ASSERT_EQ(client_engine->init(FLAGS_metadata_server, client_name), 0);
+    Transport* client_transport =
+        client_engine->installTransport(MNNVL_PROTOCOL, nullptr);
+    ASSERT_NE(client_transport, nullptr);
+
+    rc = client_engine->registerLocalMemory(
+        local_hbm_buffer, kDataLength, "cuda:" + std::to_string(gpu_id));
+    ASSERT_EQ(rc, 0);
+    RegisteredMemoryGuard client_registration_guard(client_engine.get(),
+                                                    local_hbm_buffer);
+
+    auto segment_id = client_engine->openSegment(server_name);
+    ASSERT_NE(segment_id, static_cast<SegmentHandle>(-1));
+    auto segment_desc =
+        client_engine->getMetadata()->getSegmentDescByID(segment_id, false);
+    ASSERT_NE(segment_desc, nullptr);
+    ASSERT_EQ(segment_desc->protocol, "nvlink");
+    ASSERT_EQ(segment_desc->buffers.size(), 1u);
+    const auto& remote_buffer = segment_desc->buffers[0];
+    EXPECT_EQ(remote_buffer.memory_kind, "HOST_NUMA");
+    EXPECT_EQ(remote_buffer.scale_up_domain_id, "test-domain");
+
+    TransferRequest entry;
+    entry.opcode = TransferRequest::READ;
+    entry.length = kDataLength;
+    entry.source = local_hbm_buffer;
+    entry.target_id = segment_id;
+    entry.target_offset = remote_buffer.addr;
+    ASSERT_TRUE(submitAndWaitForTransfer(client_engine.get(), entry));
+
+    std::vector<uint8_t> actual(kDataLength);
+    cuda_err = cudaMemcpy(actual.data(), local_hbm_buffer, kDataLength,
+                          cudaMemcpyDeviceToHost);
+    ASSERT_EQ(cuda_err, cudaSuccess)
+        << "failed to copy local HBM buffer back to host: "
+        << cudaGetErrorString(cuda_err);
+    EXPECT_EQ(actual, expected);
 #endif
 }
 

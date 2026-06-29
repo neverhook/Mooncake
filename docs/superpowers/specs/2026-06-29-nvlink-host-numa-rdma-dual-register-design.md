@@ -204,6 +204,39 @@ bytes.
 5. Worker picks RDMA for cross-domain reads or when NVLink is not usable.
 6. Worker submits the transfer with the selected protocol.
 
+### Data-plane batching semantics
+
+After the control-plane query and candidate selection complete, the data plane
+keeps the existing Mooncake transfer shape. Paged-attention block layouts are
+represented as a vector of store `Slice` entries. Each slice becomes one
+`TransferRequest`, and the whole request vector is submitted in one batch.
+
+The selected protocol changes only the transport used for that batch:
+
+- single-protocol legacy segments can keep using `submitTransfer()`
+- dual-protocol segments use `mp_submitTransfer(..., selected_protocol)`
+- the same request vector can be submitted through `nvlink` or `rdma`
+
+This means HOST_NUMA NVLink does not need a new scatter/gather protocol for the
+first version. It reuses the existing `Slice -> TransferRequest vector ->
+TransferEngine batch -> transport batch` pipeline.
+
+The transport-specific batching remains unchanged:
+
+- RDMA may split each `TransferRequest` into transport slices using
+  `globalConfig().slice_size`, group them by RDMA context, and post work
+  requests in batches.
+- NVLink maps each `TransferRequest` to a memcpy slice, collects source
+  pointers, destination pointers, and sizes, then submits them with
+  `cudaMemcpyBatchAsync` when available, or per-slice `cudaMemcpyAsync`
+  otherwise.
+
+The object layout assumption also stays unchanged: the requester may provide
+many scattered local slices, while the selected store replica describes one
+linear object interval. If a future feature needs a single logical object whose
+remote backing storage is itself non-contiguous, that should be modeled as a
+separate object-layout descriptor change, not as part of this transport slice.
+
 ## Error Handling
 
 - Feature disabled: no behavior change.
@@ -239,6 +272,8 @@ Add logs and counters for:
 - Worker candidate selection chooses NVLink for same domain and RDMA for
   cross-domain.
 - Worker candidate selection skips NVLink when the destination is not HBM.
+- Worker transfer submission preserves scattered local slices as a single
+  batched request vector and switches only the selected protocol.
 - Strict and non-strict mount behavior handles NVLink capability failure.
 
 ### Transfer engine tests

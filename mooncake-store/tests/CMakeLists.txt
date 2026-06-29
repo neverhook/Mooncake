@@ -64,6 +64,7 @@ add_store_test(thread_pool_test thread_pool_test.cpp)
 add_store_test(transfer_task_test transfer_task_test.cpp)
 add_store_test(transfer_candidate_selector_test
                transfer_candidate_selector_test.cpp)
+add_store_test(client_read_selection_test client_read_selection_test.cpp)
 add_store_test(tenant_quota_test tenant_quota_test.cpp)
 add_store_test(segment_test segment_test.cpp)
 add_store_test(offset_allocator_test offset_allocator_test.cpp)

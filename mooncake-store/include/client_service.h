@@ -654,6 +654,19 @@ class Client {
     bool IsReplicaOnLocalMemory(const Replica::Descriptor& replica);
 
    protected:
+    static bool ReadDestinationIsDevice(const std::vector<Slice>& slices);
+
+    static tl::expected<Replica::Descriptor, ErrorCode>
+    SelectReadReplicaForTransfer(
+        const std::vector<Replica::Descriptor>& replicas,
+        const std::unordered_set<std::string>& local_endpoints,
+        bool destination_is_device, bool enable_nvlink_host_numa,
+        const std::string& local_scale_up_domain_id);
+
+    static bool HasVerifiedNvlinkHostNumaBuffer(
+        const TransferMetadata::SegmentDesc& desc, const void* buffer,
+        size_t size, const std::string& expected_scale_up_domain_id);
+
     /**
      * @brief Constructor exposed to subclasses for testing only; production
      * code must go through Create().

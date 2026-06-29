@@ -38,6 +38,7 @@
 #include "rpc_types.h"
 #include "local_hot_cache.h"
 #include "gpu_staging_utils.h"
+#include "transfer_candidate_selector.h"
 
 namespace mooncake {
 
@@ -1173,18 +1174,98 @@ tl::expected<std::vector<std::string>, ErrorCode> Client::BatchReplicaClear(
     return result;
 }
 
+bool Client::ReadDestinationIsDevice(const std::vector<Slice>& slices) {
+    bool saw_non_empty_buffer = false;
+    for (const auto& slice : slices) {
+        if (slice.size == 0 || slice.ptr == nullptr) {
+            continue;
+        }
+        saw_non_empty_buffer = true;
+        if (!IsDevicePointer(slice.ptr, nullptr)) {
+            return false;
+        }
+    }
+    return saw_non_empty_buffer;
+}
+
+tl::expected<Replica::Descriptor, ErrorCode>
+Client::SelectReadReplicaForTransfer(
+    const std::vector<Replica::Descriptor>& replicas,
+    const std::unordered_set<std::string>& local_endpoints,
+    bool destination_is_device, bool enable_nvlink_host_numa,
+    const std::string& local_scale_up_domain_id) {
+    TransferCandidateContext context;
+    context.local_endpoints = local_endpoints;
+    context.enable_nvlink_host_numa = enable_nvlink_host_numa;
+    context.local_scale_up_domain_id = local_scale_up_domain_id;
+    context.destination_is_device = destination_is_device;
+
+    auto candidate = SelectTransferCandidate(replicas, context);
+    if (!candidate) {
+        return tl::unexpected(ErrorCode::INVALID_REPLICA);
+    }
+
+    auto replica = candidate->replica;
+    if (!candidate->selected_protocol.empty() && replica.is_memory_replica()) {
+        replica.get_memory_descriptor().buffer_descriptor.selected_protocol_ =
+            candidate->selected_protocol;
+    }
+    return replica;
+}
+
+bool Client::HasVerifiedNvlinkHostNumaBuffer(
+    const TransferMetadata::SegmentDesc& desc, const void* buffer, size_t size,
+    const std::string& expected_scale_up_domain_id) {
+    if (buffer == nullptr || size == 0 ||
+        expected_scale_up_domain_id.empty()) {
+        return false;
+    }
+
+    const uint64_t requested_begin =
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(buffer));
+    if (size > std::numeric_limits<uint64_t>::max() - requested_begin) {
+        return false;
+    }
+    const uint64_t requested_end = requested_begin + size;
+
+    for (const auto& entry : desc.buffers) {
+#ifdef ENABLE_MULTI_PROTOCOL
+        if (entry.protocol != "nvlink") {
+            continue;
+        }
+#endif
+        if (entry.memory_kind != "HOST_NUMA" ||
+            entry.scale_up_domain_id.empty() ||
+            entry.scale_up_domain_id != expected_scale_up_domain_id ||
+            entry.length == 0) {
+            continue;
+        }
+        if (entry.length > std::numeric_limits<uint64_t>::max() - entry.addr) {
+            continue;
+        }
+        const uint64_t entry_end = entry.addr + entry.length;
+        if (entry.addr <= requested_begin && requested_end <= entry_end) {
+            return true;
+        }
+    }
+    return false;
+}
+
 tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
                                           const QueryResult& query_result,
                                           std::vector<Slice>& slices) {
-    // Find the first complete replica
-    Replica::Descriptor replica;
-    ErrorCode err = FindFirstCompleteReplica(query_result.replicas, replica);
-    if (err != ErrorCode::OK) {
-        if (err == ErrorCode::INVALID_REPLICA) {
+    auto selected = SelectReadReplicaForTransfer(
+        query_result.replicas, GetLocalEndpoints(),
+        ReadDestinationIsDevice(slices),
+        globalConfig().enable_nvlink_host_numa,
+        globalConfig().nvlink_scale_up_domain_id);
+    if (!selected) {
+        if (selected.error() == ErrorCode::INVALID_REPLICA) {
             LOG(ERROR) << "no_complete_replicas_found key=" << object_key;
         }
-        return tl::unexpected(err);
+        return tl::unexpected(selected.error());
     }
+    Replica::Descriptor replica = selected.value();
 
     // Check local hot cache and update replica descriptor if cache hit
     bool cache_used = false;
@@ -1193,7 +1274,7 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     }
 
     auto t0_get = std::chrono::steady_clock::now();
-    err = TransferRead(replica, slices);
+    ErrorCode err = TransferRead(replica, slices);
 
     // Release the cache block after transfer completes (memcpy is done)
     if (hot_cache_ && cache_used) {
@@ -1237,14 +1318,18 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
                                           const QueryResult& query_result,
                                           std::vector<Slice>& slices,
                                           uint64_t src_offset) {
-    Replica::Descriptor replica;
-    ErrorCode err = FindFirstCompleteReplica(query_result.replicas, replica);
-    if (err != ErrorCode::OK) {
-        if (err == ErrorCode::INVALID_REPLICA) {
+    auto selected = SelectReadReplicaForTransfer(
+        query_result.replicas, GetLocalEndpoints(),
+        ReadDestinationIsDevice(slices),
+        globalConfig().enable_nvlink_host_numa,
+        globalConfig().nvlink_scale_up_domain_id);
+    if (!selected) {
+        if (selected.error() == ErrorCode::INVALID_REPLICA) {
             LOG(ERROR) << "no_complete_replicas_found key=" << object_key;
         }
-        return tl::unexpected(err);
+        return tl::unexpected(selected.error());
     }
+    Replica::Descriptor replica = selected.value();
     if (!replica.is_memory_replica()) {
         LOG(ERROR) << "Range read only supported for memory replicas, key="
                    << object_key;
@@ -1252,7 +1337,7 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     }
 
     auto t0_get = std::chrono::steady_clock::now();
-    err = TransferReadRange(replica, slices, src_offset);
+    ErrorCode err = TransferReadRange(replica, slices, src_offset);
     auto us_get = std::chrono::duration_cast<std::chrono::microseconds>(
                       std::chrono::steady_clock::now() - t0_get)
                       .count();
@@ -1288,6 +1373,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
     results.resize(object_keys.size());
 
     std::unordered_map<std::string, BatchGetOperation> seg_to_op_map{};
+    const auto local_endpoints = GetLocalEndpoints();
     for (size_t i = 0; i < object_keys.size(); ++i) {
         const auto& key = object_keys[i];
         const auto& replica_list = query_results[i].replicas;
@@ -1297,15 +1383,19 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
             results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
             continue;
         }
-        Replica::Descriptor replica;
-        ErrorCode err = FindFirstCompleteReplica(replica_list, replica);
-        if (err != ErrorCode::OK) {
-            if (err == ErrorCode::INVALID_REPLICA) {
+        auto selected = SelectReadReplicaForTransfer(
+            replica_list, local_endpoints,
+            ReadDestinationIsDevice(slices_it->second),
+            globalConfig().enable_nvlink_host_numa,
+            globalConfig().nvlink_scale_up_domain_id);
+        if (!selected) {
+            if (selected.error() == ErrorCode::INVALID_REPLICA) {
                 LOG(ERROR) << "no_complete_replicas_found key=" << key;
             }
-            results[i] = tl::unexpected(err);
+            results[i] = tl::unexpected(selected.error());
             continue;
         }
+        Replica::Descriptor replica = selected.value();
         if (!replica.is_memory_replica()) {
             results[i] = tl::unexpected(ErrorCode::INVALID_REPLICA);
             continue;
@@ -1440,6 +1530,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
 
     // Collect cache hit statistics for the entire batch
     size_t total_cache_hits = 0;
+    const auto local_endpoints = GetLocalEndpoints();
 
     // Submit all transfers in parallel
     for (size_t i = 0; i < object_keys.size(); ++i) {
@@ -1453,17 +1544,19 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             continue;
         }
 
-        // Find the first complete replica for this key
-        Replica::Descriptor replica;
-        ErrorCode err =
-            FindFirstCompleteReplica(query_result.replicas, replica);
-        if (err != ErrorCode::OK) {
-            if (err == ErrorCode::INVALID_REPLICA) {
+        auto selected = SelectReadReplicaForTransfer(
+            query_result.replicas, local_endpoints,
+            ReadDestinationIsDevice(slices_it->second),
+            globalConfig().enable_nvlink_host_numa,
+            globalConfig().nvlink_scale_up_domain_id);
+        if (!selected) {
+            if (selected.error() == ErrorCode::INVALID_REPLICA) {
                 LOG(ERROR) << "no_complete_replicas_found key=" << key;
             }
-            results[i] = tl::unexpected(err);
+            results[i] = tl::unexpected(selected.error());
             continue;
         }
+        Replica::Descriptor replica = selected.value();
 
         bool cache_used = false;
         if (hot_cache_ && replica.is_memory_replica()) {
@@ -3003,25 +3096,29 @@ tl::expected<UUID, ErrorCode> Client::MountDualProtocolSegmentAndGetId(
         }
 
         const std::vector<std::string> dual_protocols = {"nvlink", "rdma"};
-        int rc = RegisterMemoryForProtocols(
-            transfer_engine_.get(), dual_protocols, buffer, size, location,
-            /*update_metadata=*/false);
-        if (rc != 0) {
-            LOG(ERROR) << "dual_protocol_register_local_memory_failed base="
-                       << buffer << " size=" << size << ", error=" << rc;
-            if (globalConfig().nvlink_host_numa_strict) {
-                return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        auto unregister_dual_registration = [&]() {
+            for (const auto& protocol_name : dual_protocols) {
+                int unregister_rc = UnregisterMemoryForProtocols(
+                    transfer_engine_.get(), {protocol_name}, buffer, size,
+                    /*update_metadata=*/false);
+                if (unregister_rc != 0 &&
+                    unregister_rc != ERR_ADDRESS_NOT_REGISTERED) {
+                    LOG(ERROR) << "rollback_dual_unregister_failed protocol="
+                               << protocol_name << " base=" << buffer
+                               << " size=" << size
+                               << ", error=" << unregister_rc;
+                }
             }
-
-            LOG(WARNING) << "falling_back_to_rdma_only_registration base="
-                         << buffer << " size=" << size;
+        };
+        auto mount_rdma_only = [&]() -> tl::expected<UUID, ErrorCode> {
             const std::vector<std::string> rdma_protocol = {"rdma"};
-            rc = RegisterMemoryForProtocols(
+            int rdma_rc = RegisterMemoryForProtocols(
                 transfer_engine_.get(), rdma_protocol, buffer, size, location,
                 /*update_metadata=*/true);
-            if (rc != 0) {
+            if (rdma_rc != 0) {
                 LOG(ERROR) << "rdma_register_local_memory_failed base="
-                           << buffer << " size=" << size << ", error=" << rc;
+                           << buffer << " size=" << size
+                           << ", error=" << rdma_rc;
                 return tl::unexpected(ErrorCode::INVALID_PARAMS);
             }
 
@@ -3039,72 +3136,88 @@ tl::expected<UUID, ErrorCode> Client::MountDualProtocolSegmentAndGetId(
                 }
                 return tl::unexpected(mounted.error());
             }
+            return mounted.value();
+        };
+
+        int rc = RegisterMemoryForProtocols(
+            transfer_engine_.get(), dual_protocols, buffer, size, location,
+            /*update_metadata=*/false);
+        if (rc != 0) {
+            LOG(ERROR) << "dual_protocol_register_local_memory_failed base="
+                       << buffer << " size=" << size << ", error=" << rc;
+            if (globalConfig().nvlink_host_numa_strict) {
+                return tl::unexpected(ErrorCode::INVALID_PARAMS);
+            }
+
+            LOG(WARNING) << "falling_back_to_rdma_only_registration base="
+                         << buffer << " size=" << size;
+            auto mounted = mount_rdma_only();
+            if (!mounted) return tl::unexpected(mounted.error());
             segment_id = mounted.value();
         } else {
-            auto mounted = MountSegmentAfterRegistrationLocked(
-                buffer, size, "nvlink,rdma", "HOST_NUMA",
-                globalConfig().nvlink_scale_up_domain_id);
-            if (!mounted) {
-                int unregister_rc = UnregisterMemoryForProtocols(
-                    transfer_engine_.get(), dual_protocols, buffer, size,
-                    /*update_metadata=*/false);
-                if (unregister_rc != 0 &&
-                    unregister_rc != ERR_ADDRESS_NOT_REGISTERED) {
-                    LOG(ERROR)
-                        << "rollback_dual_unregister_failed base=" << buffer
-                        << " size=" << size << ", error=" << unregister_rc;
-                }
-                return tl::unexpected(mounted.error());
-            }
-            segment_id = mounted.value();
-
             auto metadata = transfer_engine_->getMetadata();
             if (!metadata) {
                 LOG(ERROR) << "metadata_unavailable_for_dual_protocol_segment";
-                auto unmount_result = master_client_.UnmountSegment(segment_id);
-                if (!unmount_result &&
-                    unmount_result.error() != ErrorCode::SEGMENT_NOT_FOUND) {
+                unregister_dual_registration();
+                if (globalConfig().nvlink_host_numa_strict) {
+                    return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+                }
+                LOG(WARNING) << "falling_back_to_rdma_only_registration base="
+                             << buffer << " size=" << size;
+                auto mounted = mount_rdma_only();
+                if (!mounted) return tl::unexpected(mounted.error());
+                segment_id = mounted.value();
+            } else {
+                auto local_desc =
+                    metadata->getSegmentDescByID(LOCAL_SEGMENT_ID, false);
+                if (!local_desc ||
+                    !HasVerifiedNvlinkHostNumaBuffer(
+                        *local_desc, buffer, size,
+                        globalConfig().nvlink_scale_up_domain_id)) {
+                    LOG(ERROR) << "dual_protocol_nvlink_host_numa_metadata_"
+                                  "verification_failed base="
+                               << buffer << " size=" << size;
+                    unregister_dual_registration();
+                    if (globalConfig().nvlink_host_numa_strict) {
+                        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+                    }
                     LOG(WARNING)
-                        << "best_effort_unmount_after_metadata_failure_failed "
-                        << "id=" << UuidToString(segment_id)
-                        << " error=" << toString(unmount_result.error());
-                }
-                mounted_segments_.erase(segment_id);
-                int unregister_rc = UnregisterMemoryForProtocols(
-                    transfer_engine_.get(), dual_protocols, buffer, size,
-                    /*update_metadata=*/false);
-                if (unregister_rc != 0 &&
-                    unregister_rc != ERR_ADDRESS_NOT_REGISTERED) {
-                    LOG(ERROR)
-                        << "rollback_dual_unregister_failed base=" << buffer
-                        << " size=" << size << ", error=" << unregister_rc;
-                }
-                return tl::unexpected(ErrorCode::INTERNAL_ERROR);
-            }
+                        << "falling_back_to_rdma_only_registration base="
+                        << buffer << " size=" << size;
+                    auto mounted = mount_rdma_only();
+                    if (!mounted) return tl::unexpected(mounted.error());
+                    segment_id = mounted.value();
+                } else {
+                    auto mounted = MountSegmentAfterRegistrationLocked(
+                        buffer, size, "nvlink,rdma", "HOST_NUMA",
+                        globalConfig().nvlink_scale_up_domain_id);
+                    if (!mounted) {
+                        unregister_dual_registration();
+                        return tl::unexpected(mounted.error());
+                    }
+                    segment_id = mounted.value();
 
-            int rc_update = metadata->updateLocalSegmentDesc();
-            if (rc_update != 0) {
-                LOG(ERROR) << "update_dual_protocol_segment_metadata_failed rc="
-                           << rc_update;
-                auto unmount_result = master_client_.UnmountSegment(segment_id);
-                if (!unmount_result &&
-                    unmount_result.error() != ErrorCode::SEGMENT_NOT_FOUND) {
-                    LOG(WARNING)
-                        << "best_effort_unmount_after_metadata_failure_failed "
-                        << "id=" << UuidToString(segment_id)
-                        << " error=" << toString(unmount_result.error());
+                    int rc_update = metadata->updateLocalSegmentDesc();
+                    if (rc_update != 0) {
+                        LOG(ERROR)
+                            << "update_dual_protocol_segment_metadata_failed "
+                            << "rc=" << rc_update;
+                        auto unmount_result =
+                            master_client_.UnmountSegment(segment_id);
+                        if (!unmount_result &&
+                            unmount_result.error() !=
+                                ErrorCode::SEGMENT_NOT_FOUND) {
+                            LOG(WARNING)
+                                << "best_effort_unmount_after_metadata_"
+                                   "failure_failed id="
+                                << UuidToString(segment_id)
+                                << " error=" << toString(unmount_result.error());
+                        }
+                        mounted_segments_.erase(segment_id);
+                        unregister_dual_registration();
+                        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+                    }
                 }
-                mounted_segments_.erase(segment_id);
-                int unregister_rc = UnregisterMemoryForProtocols(
-                    transfer_engine_.get(), dual_protocols, buffer, size,
-                    /*update_metadata=*/false);
-                if (unregister_rc != 0 &&
-                    unregister_rc != ERR_ADDRESS_NOT_REGISTERED) {
-                    LOG(ERROR)
-                        << "rollback_dual_unregister_failed base=" << buffer
-                        << " size=" << size << ", error=" << unregister_rc;
-                }
-                return tl::unexpected(ErrorCode::INTERNAL_ERROR);
             }
         }
     }

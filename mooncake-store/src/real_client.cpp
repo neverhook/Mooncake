@@ -35,6 +35,9 @@
 #include "shm_helper.h"
 #include "memory_location.h"
 #include "transfer_candidate_selector.h"
+#if defined(USE_MNNVL) && !defined(USE_HIP)
+#include "transport/nvlink_transport/nvlink_transport.h"
+#endif
 #ifdef USE_NOF
 #include "spdk/spdk_wrapper.h"
 #endif
@@ -308,6 +311,49 @@ inline bool all_destinations_are_device(const std::vector<void *> &buffers,
     return saw_non_empty_buffer;
 }
 
+inline bool is_dual_nvlink_rdma_protocol(const std::string &protocol) {
+    return protocol == "nvlink,rdma" || protocol == "rdma,nvlink";
+}
+
+inline bool should_use_nvlink_host_numa_allocation(
+    const std::string &protocol) {
+    return globalConfig().enable_nvlink_host_numa &&
+           is_dual_nvlink_rdma_protocol(protocol);
+}
+
+inline void *allocate_nvlink_host_numa_fabric_memory(size_t size,
+                                                     int numa_node) {
+#if defined(USE_MNNVL) && !defined(USE_HIP)
+    return NvlinkTransport::allocateHostNumaFabricMemory(size, numa_node);
+#else
+    (void)size;
+    (void)numa_node;
+    return nullptr;
+#endif
+}
+
+inline void free_nvlink_host_numa_fabric_memory(void *ptr) {
+#if defined(USE_MNNVL) && !defined(USE_HIP)
+    NvlinkTransport::freeHostNumaFabricMemory(ptr);
+#else
+    (void)ptr;
+#endif
+}
+
+inline void free_allocated_segment_record(
+    const RealClient::AllocatedSegmentRecord &record) {
+    if (!record.base) {
+        return;
+    }
+    if (record.free_method ==
+        RealClient::AllocatedSegmentRecord::FreeMethod::
+            kNvlinkHostNumaFabric) {
+        free_nvlink_host_numa_fabric_memory(record.base);
+        return;
+    }
+    free_memory(record.protocol, record.base);
+}
+
 inline TransferCandidateContext make_transfer_candidate_context(
     const std::unordered_set<std::string> &local_endpoints,
     bool destination_is_device) {
@@ -347,6 +393,12 @@ inline QueryResult FilterQueryResult(const QueryResult &qr,
     return QueryResult({replica}, qr.lease_timeout);
 }
 }  // namespace
+
+void RealClient::HostNumaFabricSegmentDeleter::operator()(void *ptr) const {
+    if (ptr) {
+        free_nvlink_host_numa_fabric_memory(ptr);
+    }
+}
 
 PyClient::~PyClient() {}
 
@@ -847,8 +899,28 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             size_t mapped_size = segment_size;
             void *ptr = nullptr;
             std::string seg_location = kWildcardLocation;
+            bool allocated_host_numa_fabric = false;
 
-            if (!seg_numa_nodes.empty()) {
+            if (should_use_nvlink_host_numa_allocation(this->protocol)) {
+                ptr = allocate_nvlink_host_numa_fabric_memory(
+                    segment_size, globalConfig().nvlink_host_numa_node);
+                if (ptr) {
+                    allocated_host_numa_fabric = true;
+                } else if (globalConfig().nvlink_host_numa_strict) {
+                    LOG(ERROR)
+                        << "Failed to allocate NVLink HOST_NUMA fabric "
+                        << "segment memory";
+                    return tl::unexpected(ErrorCode::INVALID_PARAMS);
+                } else {
+                    LOG(WARNING)
+                        << "Falling back to default allocation after NVLink "
+                        << "HOST_NUMA fabric allocation failed";
+                }
+            }
+
+            if (ptr) {
+                // HOST_NUMA fabric allocation succeeded above.
+            } else if (!seg_numa_nodes.empty()) {
                 // NUMA-segmented allocation: contiguous VMA, per-region binding
                 size_t page_sz = should_use_hugepage
                                      ? get_hugepage_size_from_env()
@@ -878,6 +950,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             } else if (this->protocol == "ub") {
                 ub_segment_ptrs_.emplace_back(ptr,
                                               UbSegmentDeleter{mapped_size});
+            } else if (allocated_host_numa_fabric) {
+                host_numa_fabric_segment_ptrs_.emplace_back(
+                    ptr, HostNumaFabricSegmentDeleter{});
             } else if (!seg_numa_nodes.empty() || should_use_hugepage) {
                 // NUMA-segmented or hugepage: track as mmap allocation for
                 // munmap cleanup
@@ -1321,7 +1396,7 @@ void RealClient::ReleaseAllocatedSegmentRecord(const std::string &segment_id) {
         }
     }
     if (found && record.base) {
-        free_memory(record.protocol, record.base);
+        free_allocated_segment_record(record);
     }
 }
 
@@ -1333,7 +1408,7 @@ void RealClient::ReleaseAllAllocatedSegmentRecords() {
     }
     for (auto &entry : records) {
         if (entry.second.base) {
-            free_memory(entry.second.protocol, entry.second.base);
+            free_allocated_segment_record(entry.second);
         }
     }
 }
@@ -1467,7 +1542,27 @@ int RealClient::allocateAndMountSegment(
         size_t chunk_size = std::min(remaining, aligned_max_chunk);
         if (chunk_size == 0) break;
 
-        void *ptr = allocate_buffer_allocator_memory(chunk_size, protocol);
+        void *ptr = nullptr;
+        bool allocated_host_numa_fabric = false;
+        if (should_use_nvlink_host_numa_allocation(protocol)) {
+            ptr = allocate_nvlink_host_numa_fabric_memory(
+                chunk_size, globalConfig().nvlink_host_numa_node);
+            if (ptr) {
+                allocated_host_numa_fabric = true;
+            } else if (globalConfig().nvlink_host_numa_strict) {
+                LOG(ERROR)
+                    << "allocateHostNumaFabricMemory failed for size "
+                    << chunk_size;
+                break;
+            } else {
+                LOG(WARNING)
+                    << "Falling back to default allocation after NVLink "
+                    << "HOST_NUMA fabric allocation failed";
+            }
+        }
+        if (!ptr) {
+            ptr = allocate_buffer_allocator_memory(chunk_size, protocol);
+        }
         if (!ptr) {
             LOG(ERROR) << "allocate_buffer_allocator_memory failed for size "
                        << chunk_size;
@@ -1478,13 +1573,23 @@ int RealClient::allocateAndMountSegment(
             client_->MountSegmentAndGetId(ptr, chunk_size, protocol, location);
         if (!result.has_value()) {
             LOG(ERROR) << "MountSegmentAndGetId failed";
-            free_memory(protocol, ptr);
+            AllocatedSegmentRecord failed_record{
+                ptr, chunk_size, protocol,
+                allocated_host_numa_fabric
+                    ? AllocatedSegmentRecord::FreeMethod::
+                          kNvlinkHostNumaFabric
+                    : AllocatedSegmentRecord::FreeMethod::kProtocolDefault};
+            free_allocated_segment_record(failed_record);
             break;
         }
 
         std::string segment_id = UuidToString(result.value());
         mounted_ids.push_back(segment_id);
-        allocated_records.push_back({ptr, chunk_size, protocol});
+        allocated_records.push_back(
+            {ptr, chunk_size, protocol,
+             allocated_host_numa_fabric
+                 ? AllocatedSegmentRecord::FreeMethod::kNvlinkHostNumaFabric
+                 : AllocatedSegmentRecord::FreeMethod::kProtocolDefault});
 
         remaining -= chunk_size;
     }
@@ -1496,8 +1601,7 @@ int RealClient::allocateAndMountSegment(
                 client_->UnmountSegmentById(id);
             }
             if (allocated_records[i].base) {
-                free_memory(allocated_records[i].protocol,
-                            allocated_records[i].base);
+                free_allocated_segment_record(allocated_records[i]);
             }
         }
         out_segment_ids.clear();
@@ -1584,7 +1688,7 @@ int RealClient::unmountAndFreeSegment(
 
     for (auto &p : to_cleanup) {
         if (p.second.base) {
-            free_memory(p.second.protocol, p.second.base);
+            free_allocated_segment_record(p.second);
         }
     }
 

@@ -721,7 +721,9 @@ class RealClient : public PyClient {
     /**
      * @brief Allocate memory internally and mount segments to master.
      *        If size > max_mr_size, it will be split into multiple chunks.
-     *        Memory is allocated via allocate_buffer_allocator_memory.
+     *        Dual NVLink/RDMA HOST_NUMA mode first tries NVLink fabric VMM
+     *        memory, otherwise memory is allocated via
+     *        allocate_buffer_allocator_memory.
      *        The actual allocated size (aligned up to Slab::kSize) is written
      *        to out_allocated_size if non-null.
      */
@@ -744,9 +746,15 @@ class RealClient : public PyClient {
     };
 
     struct AllocatedSegmentRecord {
+        enum class FreeMethod {
+            kProtocolDefault,
+            kNvlinkHostNumaFabric,
+        };
+
         void *base = nullptr;
         size_t size = 0;
         std::string protocol;
+        FreeMethod free_method = FreeMethod::kProtocolDefault;
     };
 
     std::unique_ptr<AutoPortBinder> port_binder_ = nullptr;
@@ -787,12 +795,18 @@ class RealClient : public PyClient {
         }
     };
 
+    struct HostNumaFabricSegmentDeleter {
+        void operator()(void *ptr) const;
+    };
+
     std::vector<std::unique_ptr<void, HugepageSegmentDeleter>>
         hugepage_segment_ptrs_;
     std::vector<std::unique_ptr<void, SegmentDeleter>> segment_ptrs_;
     std::vector<std::unique_ptr<void, AscendSegmentDeleter>>
         ascend_segment_ptrs_;
     std::vector<std::unique_ptr<void, UbSegmentDeleter>> ub_segment_ptrs_;
+    std::vector<std::unique_ptr<void, HostNumaFabricSegmentDeleter>>
+        host_numa_fabric_segment_ptrs_;
     std::string protocol;
     std::string device_name;
     std::string local_hostname;

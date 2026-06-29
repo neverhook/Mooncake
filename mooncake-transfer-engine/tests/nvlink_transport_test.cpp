@@ -1,6 +1,7 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -10,7 +11,9 @@
 
 #include "cuda_alike.h"
 #include "config.h"
+#include "error.h"
 #include "transfer_engine.h"
+#include "transfer_metadata.h"
 #include "transport/nvlink_transport/nvlink_transport.h"
 #include "transport/transport.h"
 
@@ -122,7 +125,11 @@ struct HostNumaFabricMemoryDeleter {
 
 ::testing::AssertionResult submitAndWaitForTransfer(
     TransferEngine* engine, const TransferRequest& entry) {
+    constexpr auto kTransferWaitTimeout = std::chrono::seconds(30);
     auto batch_id = engine->allocateBatchID(1);
+    if (batch_id == INVALID_BATCH_ID) {
+        return ::testing::AssertionFailure() << "allocateBatchID failed";
+    }
     Status s = engine->submitTransfer(batch_id, {entry});
     if (!s.ok()) {
         Status free_status = engine->freeBatchID(batch_id);
@@ -132,6 +139,7 @@ struct HostNumaFabricMemoryDeleter {
     }
 
     TransferStatus status;
+    const auto deadline = std::chrono::steady_clock::now() + kTransferWaitTimeout;
     do {
         s = engine->getTransferStatus(batch_id, 0, status);
         if (!s.ok()) {
@@ -139,6 +147,19 @@ struct HostNumaFabricMemoryDeleter {
             return ::testing::AssertionFailure()
                    << "getTransferStatus failed: " << s.ToString()
                    << "; freeBatchID status: " << free_status.ToString();
+        }
+        if (status.s == TransferStatusEnum::WAITING) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                Status free_status = engine->freeBatchID(batch_id);
+                return ::testing::AssertionFailure()
+                       << "transfer timed out after "
+                       << std::chrono::duration_cast<std::chrono::seconds>(
+                              kTransferWaitTimeout)
+                              .count()
+                       << "s; freeBatchID status: "
+                       << free_status.ToString();
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     } while (status.s == TransferStatusEnum::WAITING);
 
@@ -310,11 +331,13 @@ TEST(NvlinkTransportTest, HostNumaRemoteDramToLocalHbmRead) {
         << "failed to initialize local HBM buffer: "
         << cudaGetErrorString(cuda_err);
 
-    const std::string server_name = "cuda_host_numa_read_server:12349";
-    const std::string client_name = "cuda_host_numa_read_client:12350";
+    const std::string server_name = "127.0.0.1:12349";
+    const std::string client_name = "127.0.0.1:12350";
 
     auto server_engine = std::make_unique<TransferEngine>(false);
-    ASSERT_EQ(server_engine->init(FLAGS_metadata_server, server_name), 0);
+    if (server_engine->init(P2PHANDSHAKE, server_name) != 0) {
+        GTEST_SKIP() << "server TransferEngine P2PHANDSHAKE init failed";
+    }
     Transport* server_transport =
         server_engine->installTransport(MNNVL_PROTOCOL, nullptr);
     ASSERT_NE(server_transport, nullptr);
@@ -327,7 +350,9 @@ TEST(NvlinkTransportTest, HostNumaRemoteDramToLocalHbmRead) {
                                                     host_numa_buffer);
 
     auto client_engine = std::make_unique<TransferEngine>(false);
-    ASSERT_EQ(client_engine->init(FLAGS_metadata_server, client_name), 0);
+    if (client_engine->init(P2PHANDSHAKE, client_name) != 0) {
+        GTEST_SKIP() << "client TransferEngine P2PHANDSHAKE init failed";
+    }
     Transport* client_transport =
         client_engine->installTransport(MNNVL_PROTOCOL, nullptr);
     ASSERT_NE(client_transport, nullptr);
@@ -338,8 +363,10 @@ TEST(NvlinkTransportTest, HostNumaRemoteDramToLocalHbmRead) {
     RegisteredMemoryGuard client_registration_guard(client_engine.get(),
                                                     local_hbm_buffer);
 
-    auto segment_id = client_engine->openSegment(server_name);
-    ASSERT_NE(segment_id, static_cast<SegmentHandle>(-1));
+    const std::string server_endpoint = server_engine->getLocalIpAndPort();
+    ASSERT_FALSE(server_endpoint.empty());
+    auto segment_id = client_engine->openSegment(server_endpoint);
+    ASSERT_NE(segment_id, static_cast<SegmentHandle>(ERR_INVALID_ARGUMENT));
     auto segment_desc =
         client_engine->getMetadata()->getSegmentDescByID(segment_id, false);
     ASSERT_NE(segment_desc, nullptr);

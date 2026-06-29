@@ -14,14 +14,31 @@
 
 #include "config.h"
 
-#include <cstring>
+#include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <sstream>
 #include <unistd.h>
 
 namespace mooncake {
+namespace {
+
+bool isTruthyEnvValue(const char* value) {
+    if (!value) return false;
+    std::string normalized(value);
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                   [](unsigned char c) {
+                       return static_cast<char>(std::tolower(c));
+                   });
+    return normalized == "1" || normalized == "true" || normalized == "yes" ||
+           normalized == "on";
+}
+
+}  // namespace
+
 void loadGlobalConfig(GlobalConfig& config) {
     const char* num_cq_per_ctx_env = std::getenv("MC_NUM_CQ_PER_CTX");
     if (num_cq_per_ctx_env) {
@@ -474,6 +491,41 @@ void loadGlobalConfig(GlobalConfig& config) {
                              << val;
         }
     }
+
+    if (isTruthyEnvValue(std::getenv("MC_ENABLE_NVLINK_HOST_NUMA"))) {
+        config.enable_nvlink_host_numa = true;
+    }
+
+    if (isTruthyEnvValue(std::getenv("MC_NVLINK_HOST_NUMA_STRICT"))) {
+        config.nvlink_host_numa_strict = true;
+    }
+
+    const char* nvlink_host_numa_node_env =
+        std::getenv("MC_NVLINK_HOST_NUMA_NODE");
+    if (nvlink_host_numa_node_env && *nvlink_host_numa_node_env) {
+        try {
+            size_t pos = 0;
+            int val = std::stoi(nvlink_host_numa_node_env, &pos);
+            if (pos == std::strlen(nvlink_host_numa_node_env) && val >= 0) {
+                config.nvlink_host_numa_node = val;
+            } else {
+                LOG(WARNING)
+                    << "Ignore value from environment variable "
+                       "MC_NVLINK_HOST_NUMA_NODE";
+            }
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "Invalid MC_NVLINK_HOST_NUMA_NODE environment "
+                            "value: "
+                         << nvlink_host_numa_node_env << ". Error: "
+                         << e.what();
+        }
+    }
+
+    const char* nvlink_scale_up_domain_id_env =
+        std::getenv("MC_NVLINK_SCALE_UP_DOMAIN_ID");
+    if (nvlink_scale_up_domain_id_env) {
+        config.nvlink_scale_up_domain_id = nvlink_scale_up_domain_id_env;
+    }
 }
 
 std::string mtuLengthToString(ibv_mtu mtu) {
@@ -538,6 +590,15 @@ void dumpGlobalConfig() {
     }
     LOG(INFO) << "mlx5_qp_lag_port_balance = "
               << (config.mlx5_qp_lag_port_balance ? "true" : "false");
+    LOG(INFO) << "enable_nvlink_host_numa = "
+              << (config.enable_nvlink_host_numa ? "true" : "false");
+    LOG(INFO) << "nvlink_host_numa_strict = "
+              << (config.nvlink_host_numa_strict ? "true" : "false");
+    LOG(INFO) << "nvlink_host_numa_node = " << config.nvlink_host_numa_node;
+    LOG(INFO) << "nvlink_scale_up_domain_id = "
+              << (config.nvlink_scale_up_domain_id.empty()
+                      ? "<unset>"
+                      : config.nvlink_scale_up_domain_id);
 }
 
 GlobalConfig& globalConfig() {

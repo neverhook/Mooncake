@@ -27,6 +27,10 @@ class PkeyIndexEnvTest : public ::testing::Test {
         ::unsetenv("MC_PKEY_INDEX");
         ::unsetenv("MC_AUTO_GID_MAX_RETRIES");
         ::unsetenv("MC_IB_SL");
+        ::unsetenv("MC_ENABLE_NVLINK_HOST_NUMA");
+        ::unsetenv("MC_NVLINK_HOST_NUMA_STRICT");
+        ::unsetenv("MC_NVLINK_HOST_NUMA_NODE");
+        ::unsetenv("MC_NVLINK_SCALE_UP_DOMAIN_ID");
     }
 };
 
@@ -156,6 +160,60 @@ TEST_F(PkeyIndexEnvTest, IbSlNonNumericKeepsDefault) {
     config.ib_service_level = 9;
     loadGlobalConfig(config);
     EXPECT_EQ(config.ib_service_level, 9);
+}
+
+TEST_F(PkeyIndexEnvTest, NvlinkHostNumaDefaultsToDisabledWhenUnset) {
+    ::unsetenv("MC_ENABLE_NVLINK_HOST_NUMA");
+    ::unsetenv("MC_NVLINK_HOST_NUMA_STRICT");
+    ::unsetenv("MC_NVLINK_HOST_NUMA_NODE");
+    ::unsetenv("MC_NVLINK_SCALE_UP_DOMAIN_ID");
+
+    GlobalConfig config;
+    loadGlobalConfig(config);
+
+    EXPECT_FALSE(config.enable_nvlink_host_numa);
+    EXPECT_FALSE(config.nvlink_host_numa_strict);
+    EXPECT_EQ(config.nvlink_host_numa_node, 0);
+    EXPECT_TRUE(config.nvlink_scale_up_domain_id.empty());
+}
+
+TEST_F(PkeyIndexEnvTest, NvlinkHostNumaEnvOverridesAreApplied) {
+    ASSERT_EQ(::setenv("MC_ENABLE_NVLINK_HOST_NUMA", "yes", 1), 0);
+    ASSERT_EQ(::setenv("MC_NVLINK_HOST_NUMA_STRICT", "on", 1), 0);
+    ASSERT_EQ(::setenv("MC_NVLINK_HOST_NUMA_NODE", "2", 1), 0);
+    ASSERT_EQ(::setenv("MC_NVLINK_SCALE_UP_DOMAIN_ID", "domain-a", 1), 0);
+
+    GlobalConfig config;
+    loadGlobalConfig(config);
+
+    EXPECT_TRUE(config.enable_nvlink_host_numa);
+    EXPECT_TRUE(config.nvlink_host_numa_strict);
+    EXPECT_EQ(config.nvlink_host_numa_node, 2);
+    EXPECT_EQ(config.nvlink_scale_up_domain_id, "domain-a");
+}
+
+TEST_F(PkeyIndexEnvTest, NvlinkHostNumaInvalidNegativeNodeIsIgnored) {
+    ASSERT_EQ(::setenv("MC_NVLINK_HOST_NUMA_NODE", "-1", 1), 0);
+
+    GlobalConfig config;
+    config.nvlink_host_numa_node = 7;
+    loadGlobalConfig(config);
+
+    EXPECT_EQ(config.nvlink_host_numa_node, 7);
+}
+
+TEST_F(PkeyIndexEnvTest, NvlinkHostNumaTruthyBoolVariantsAreApplied) {
+    const char* truthy_values[] = {"1", "true", "yes", "on"};
+    for (const char* value : truthy_values) {
+        ASSERT_EQ(::setenv("MC_ENABLE_NVLINK_HOST_NUMA", value, 1), 0);
+        ASSERT_EQ(::setenv("MC_NVLINK_HOST_NUMA_STRICT", value, 1), 0);
+
+        GlobalConfig config;
+        loadGlobalConfig(config);
+
+        EXPECT_TRUE(config.enable_nvlink_host_numa) << value;
+        EXPECT_TRUE(config.nvlink_host_numa_strict) << value;
+    }
 }
 
 }  // namespace

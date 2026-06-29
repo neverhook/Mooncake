@@ -96,6 +96,10 @@ struct GlobalConfig {
     // ASCEND_GLOBAL_RESOURCE_CONFIG (e.g. Store=RoCE, P2P=HCCS). Assumes TE
     // inits are serialized within the process.
     bool ascend_store_te_init = false;
+    bool enable_nvlink_host_numa = false;
+    bool nvlink_host_numa_strict = false;
+    int nvlink_host_numa_node = 0;
+    std::string nvlink_scale_up_domain_id;
     // ub config parameters
     size_t num_jfc_per_ctx = 2;
     size_t num_jfce_per_ctx = 2;

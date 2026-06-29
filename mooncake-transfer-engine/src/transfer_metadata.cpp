@@ -37,6 +37,26 @@ static std::vector<std::string> splitProtocols(const std::string &protocols) {
     }
     return result;
 }
+
+static bool isSupportedMultiProtocolPair(
+    const std::vector<std::string> &protocols) {
+    if (protocols.size() != 2) return false;
+    bool has_cxl = false;
+    bool has_tcp = false;
+    bool has_rdma = false;
+    bool has_nvlink = false;
+    for (const auto &proto : protocols) {
+        if (proto == "cxl")
+            has_cxl = true;
+        else if (proto == "tcp")
+            has_tcp = true;
+        else if (proto == "rdma")
+            has_rdma = true;
+        else if (proto == "nvlink")
+            has_nvlink = true;
+    }
+    return (has_cxl && (has_tcp || has_rdma)) || (has_nvlink && has_rdma);
+}
 #endif
 
 static inline std::string extractProtocolFromConnString(
@@ -217,7 +237,7 @@ int TransferMetadata::getNotifies(std::vector<NotifyDesc> &notifies) {
 static int encodeMultiProtocolSegmentDesc(
     const std::vector<std::string> &protocols,
     const TransferMetadata::SegmentDesc &desc, Json::Value &segmentJSON) {
-    // Multi-protocol encoding for CXL+TCP or CXL+RDMA combination
+    // Multi-protocol encoding for supported protocol pairs.
     segmentJSON["name"] = desc.name;
     if (!desc.rdma_server_name.empty()) {
         segmentJSON["rdma_server_name"] = desc.rdma_server_name;
@@ -260,6 +280,16 @@ static int encodeMultiProtocolSegmentDesc(
             Json::Value lkeyJSON(Json::arrayValue);
             for (auto &entry : buffer.lkey) lkeyJSON.append(entry);
             bufferJSON["lkey"] = lkeyJSON;
+        } else if (buffer.protocol == "nvlink") {
+            bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
+            bufferJSON["shm_name"] = buffer.shm_name;
+            if (!buffer.memory_kind.empty()) {
+                bufferJSON["memory_kind"] = buffer.memory_kind;
+            }
+            if (!buffer.scale_up_domain_id.empty()) {
+                bufferJSON["scale_up_domain_id"] =
+                    buffer.scale_up_domain_id;
+            }
         } else if (buffer.protocol == "tcp") {
             bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
         }
@@ -277,29 +307,19 @@ static int encodeMultiProtocolSegmentDesc(
 int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
                                         Json::Value &segmentJSON) {
 #ifdef ENABLE_MULTI_PROTOCOL
-    // Check if this is a multi-protocol scenario (CXL+TCP or CXL+RDMA)
+    // Check if this is a supported multi-protocol scenario.
     std::vector<std::string> protocols = splitProtocols(desc.protocol);
     bool is_multi_protocol = false;
     if (protocols.size() == 2) {
-        // Only support CXL+TCP or CXL+RDMA combinations
-        bool has_cxl = false, has_tcp = false, has_rdma = false;
-        for (const auto &proto : protocols) {
-            if (proto == "cxl")
-                has_cxl = true;
-            else if (proto == "tcp")
-                has_tcp = true;
-            else if (proto == "rdma")
-                has_rdma = true;
-        }
-        // Multi-protocol only supported for CXL+TCP or CXL+RDMA
-        if (has_cxl && (has_tcp || has_rdma)) {
+        if (isSupportedMultiProtocolPair(protocols)) {
             is_multi_protocol = true;
         }
         // If not valid multi-protocol combination, return error
         if (!is_multi_protocol) {
             LOG(ERROR) << "Unsupported multi-protocol combination: "
                        << desc.protocol
-                       << ". Only CXL+TCP or CXL+RDMA are supported.";
+                       << ". Only CXL+TCP, CXL+RDMA, or NVLink+RDMA are "
+                          "supported.";
             return ERR_INVALID_ARGUMENT;
         }
     } else if (protocols.size() > 2) {
@@ -593,6 +613,28 @@ decodeMultiProtocolSegmentDesc(Json::Value &segmentJSON,
                 return nullptr;
             }
             desc->buffers.push_back(buffer);
+        } else if (buffer_protocol == "nvlink") {
+            TransferMetadata::BufferDesc buffer;
+            buffer.name = bufferJSON["name"].asString();
+            buffer.addr = bufferJSON["addr"].asUInt64();
+            buffer.length = bufferJSON["length"].asUInt64();
+            buffer.protocol = buffer_protocol;
+            buffer.shm_name = bufferJSON["shm_name"].asString();
+            if (bufferJSON.isMember("memory_kind")) {
+                buffer.memory_kind = bufferJSON["memory_kind"].asString();
+            }
+            if (bufferJSON.isMember("scale_up_domain_id")) {
+                buffer.scale_up_domain_id =
+                    bufferJSON["scale_up_domain_id"].asString();
+            }
+            if (buffer.name.empty() || !buffer.addr || !buffer.length ||
+                buffer.shm_name.empty()) {
+                LOG(WARNING)
+                    << "Corrupted segment descriptor, name " << segment_name
+                    << " buffer_protocol " << buffer_protocol;
+                return nullptr;
+            }
+            desc->buffers.push_back(buffer);
         } else if (buffer_protocol == "tcp") {
             TransferMetadata::BufferDesc buffer;
             buffer.name = bufferJSON["name"].asString();
@@ -617,24 +659,16 @@ std::shared_ptr<TransferMetadata::SegmentDesc>
 TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
                                     const std::string &segment_name) {
 #ifdef ENABLE_MULTI_PROTOCOL
-    // Check if this is a multi-protocol scenario (CXL+TCP or CXL+RDMA)
+    // Check if this is a supported multi-protocol scenario.
     bool is_multi_protocol = false;
     if (segmentJSON["protocol"].isArray()) {
         size_t proto_count = segmentJSON["protocol"].size();
         if (proto_count == 2) {
-            // Only support CXL+TCP or CXL+RDMA combinations
-            bool has_cxl = false, has_tcp = false, has_rdma = false;
+            std::vector<std::string> protocols;
             for (const auto &protocolStr : segmentJSON["protocol"]) {
-                std::string proto = protocolStr.asString();
-                if (proto == "cxl")
-                    has_cxl = true;
-                else if (proto == "tcp")
-                    has_tcp = true;
-                else if (proto == "rdma")
-                    has_rdma = true;
+                protocols.push_back(protocolStr.asString());
             }
-            // Multi-protocol only supported for CXL+TCP or CXL+RDMA
-            if (has_cxl && (has_tcp || has_rdma)) {
+            if (isSupportedMultiProtocolPair(protocols)) {
                 is_multi_protocol = true;
             }
             // If not valid multi-protocol combination, return error
@@ -642,7 +676,8 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
                 LOG(ERROR)
                     << "Unsupported multi-protocol combination in segment: "
                     << segment_name
-                    << ". Only CXL+TCP or CXL+RDMA are supported.";
+                    << ". Only CXL+TCP, CXL+RDMA, or NVLink+RDMA are "
+                       "supported.";
                 return nullptr;
             }
         } else if (proto_count > 2) {

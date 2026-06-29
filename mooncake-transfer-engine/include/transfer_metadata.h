@@ -67,6 +67,8 @@ class TransferMetadata {
         std::vector<mr_key_t> lkey;         // for rdma/efa
         std::vector<mr_key_t> rkey;         // for rdma/efa
         std::string shm_name;               // for nvlink and hip
+        std::string memory_kind;            // optional, e.g. HOST_NUMA
+        std::string scale_up_domain_id;     // optional NVLink scale-up domain
         uint64_t offset;                    // for cxl
         std::vector<std::string> tseg;      // for ub/urma
         std::vector<uint32_t> l_seg_index;  // for ub/urma

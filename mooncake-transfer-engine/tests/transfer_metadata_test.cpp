@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#define private public
 #include "transfer_metadata.h"
+#undef private
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>
@@ -58,6 +60,74 @@ class TransferMetadataTest : public ::testing::Test {
     std::string metadata_server;
     std::string local_server_name;
 };
+
+TEST_F(TransferMetadataTest, EncodeDecodeNvlinkRdmaSegment) {
+#ifndef ENABLE_MULTI_PROTOCOL
+    GTEST_SKIP() << "ENABLE_MULTI_PROTOCOL is not compiled in";
+#else
+    TransferMetadata::SegmentDesc desc;
+    desc.name = "dual-segment";
+    desc.protocol = "nvlink,rdma";
+    desc.rdma_server_name = "10.0.0.1:12345";
+    desc.tcp_data_port = 0;
+
+    TransferMetadata::DeviceDesc device;
+    device.name = "mlx5_0";
+    device.lid = 1;
+    device.gid = "0000:0000:0000:0000:0000:ffff:0a00:0001";
+    desc.devices.push_back(device);
+
+    TransferMetadata::BufferDesc nvlink_buffer;
+    nvlink_buffer.name = "host_numa:0";
+    nvlink_buffer.addr = 0x100000;
+    nvlink_buffer.length = 4096;
+    nvlink_buffer.protocol = "nvlink";
+    nvlink_buffer.shm_name = "fabric-handle-bytes";
+    nvlink_buffer.memory_kind = "HOST_NUMA";
+    nvlink_buffer.scale_up_domain_id = "domain-a";
+    desc.buffers.push_back(nvlink_buffer);
+
+    TransferMetadata::BufferDesc rdma_buffer;
+    rdma_buffer.name = "host_numa:0";
+    rdma_buffer.addr = 0x100000;
+    rdma_buffer.length = 4096;
+    rdma_buffer.protocol = "rdma";
+    rdma_buffer.lkey.push_back(11);
+    rdma_buffer.rkey.push_back(22);
+    desc.buffers.push_back(rdma_buffer);
+
+    Json::Value encoded;
+    ASSERT_EQ(metadata_client->encodeSegmentDesc(desc, encoded), 0);
+    ASSERT_TRUE(encoded["protocol"].isArray());
+    ASSERT_EQ(encoded["protocol"][0].asString(), "nvlink");
+    ASSERT_EQ(encoded["protocol"][1].asString(), "rdma");
+
+    auto decoded =
+        metadata_client->decodeSegmentDesc(encoded, "dual-segment");
+    ASSERT_NE(decoded, nullptr);
+    EXPECT_EQ(decoded->protocol, "nvlink,rdma");
+    ASSERT_EQ(decoded->buffers.size(), 2u);
+    EXPECT_EQ(decoded->buffers[0].protocol, "nvlink");
+    EXPECT_EQ(decoded->buffers[0].memory_kind, "HOST_NUMA");
+    EXPECT_EQ(decoded->buffers[0].scale_up_domain_id, "domain-a");
+    EXPECT_EQ(decoded->buffers[0].shm_name, "fabric-handle-bytes");
+    EXPECT_EQ(decoded->buffers[1].protocol, "rdma");
+    EXPECT_EQ(decoded->buffers[1].rkey[0], 22u);
+#endif
+}
+
+TEST_F(TransferMetadataTest, RejectsUnsupportedMultiProtocolTriple) {
+#ifndef ENABLE_MULTI_PROTOCOL
+    GTEST_SKIP() << "ENABLE_MULTI_PROTOCOL is not compiled in";
+#else
+    TransferMetadata::SegmentDesc desc;
+    desc.name = "bad-segment";
+    desc.protocol = "nvlink,rdma,tcp";
+    Json::Value encoded;
+    EXPECT_EQ(metadata_client->encodeSegmentDesc(desc, encoded),
+              ERR_INVALID_ARGUMENT);
+#endif
+}
 
 // add and search LocalSegmentMeta
 TEST_F(TransferMetadataTest, LocalSegmentTest) {

@@ -677,7 +677,7 @@ int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
 #endif
         desc.shm_name =
             serializeBinaryData(&handle, sizeof(cudaIpcMemHandle_t));
-        return metadata_->addLocalMemoryBuffer(desc, true);
+        return metadata_->addLocalMemoryBuffer(desc, update_metadata);
     } else {
         CUmemGenericAllocationHandle handle;
         auto result = cuMemRetainAllocationHandle(&handle, addr);
@@ -728,7 +728,7 @@ int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
         }
         desc.shm_name =
             serializeBinaryData(&export_handle, sizeof(CUmemFabricHandle));
-        return metadata_->addLocalMemoryBuffer(desc, true);
+        return metadata_->addLocalMemoryBuffer(desc, update_metadata);
     }
 }
 

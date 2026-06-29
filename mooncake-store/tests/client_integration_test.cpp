@@ -1859,6 +1859,7 @@ TEST_F(ClientIntegrationTest, AllocatedBufferDescriptorCarriesMemoryMetadata) {
         std::string getTransportEndpoint() const override {
             return "test-endpoint";
         }
+        size_t getLargestFreeRegion() const override { return 0; }
     };
 
     std::vector<char> backing(64);

@@ -3014,7 +3014,7 @@ tl::expected<UUID, ErrorCode> Client::MountDualProtocolSegmentAndGetId(
                 mounted_segments_.erase(segment_id);
                 int unregister_rc = UnregisterMemoryForProtocols(
                     transfer_engine_.get(), dual_protocols, buffer, size,
-                    /*update_metadata=*/true);
+                    /*update_metadata=*/false);
                 if (unregister_rc != 0 &&
                     unregister_rc != ERR_ADDRESS_NOT_REGISTERED) {
                     LOG(ERROR)
@@ -3039,7 +3039,7 @@ tl::expected<UUID, ErrorCode> Client::MountDualProtocolSegmentAndGetId(
                 mounted_segments_.erase(segment_id);
                 int unregister_rc = UnregisterMemoryForProtocols(
                     transfer_engine_.get(), dual_protocols, buffer, size,
-                    /*update_metadata=*/true);
+                    /*update_metadata=*/false);
                 if (unregister_rc != 0 &&
                     unregister_rc != ERR_ADDRESS_NOT_REGISTERED) {
                     LOG(ERROR)

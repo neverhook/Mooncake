@@ -12,22 +12,66 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#define private public
-#include "transfer_metadata.h"
-#undef private
-
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <sys/time.h>
 
-#include <cstdlib>
+#if __has_include(<jsoncpp/json/json.h>)
+#include <jsoncpp/json/json.h>
+#else
+#include <json/json.h>
+#endif
+#include <netdb.h>
 
+#include <atomic>
+#include <cstdlib>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <string>
+#include <thread>
+#include <unordered_map>
+
+#include "common.h"
+#include "topology.h"
+
+#define private public
+#include "transfer_metadata.h"
+#undef private
+
+#include "transfer_metadata_plugin.h"
 #include "transport/transport.h"
 
 using namespace mooncake;
 
 namespace mooncake {
+
+namespace {
+
+class InMemoryMetadataStoragePlugin : public MetadataStoragePlugin {
+   public:
+    bool get(const std::string &key, Json::Value &value) override {
+        auto it = values_.find(key);
+        if (it == values_.end()) return false;
+        value = it->second;
+        return true;
+    }
+
+    bool set(const std::string &key, const Json::Value &value) override {
+        values_[key] = value;
+        return true;
+    }
+
+    bool remove(const std::string &key) override {
+        return values_.erase(key) != 0;
+    }
+
+   private:
+    std::unordered_map<std::string, Json::Value> values_;
+};
+
+}  // namespace
 
 class TransferMetadataTest : public ::testing::Test {
    protected:
@@ -40,7 +84,7 @@ class TransferMetadataTest : public ::testing::Test {
         if (env)
             metadata_server = env;
         else
-            metadata_server = metadata_server;
+            metadata_server = P2PHANDSHAKE;
         LOG(INFO) << "metadata_server: " << metadata_server;
 
         env = std::getenv("MC_LOCAL_SERVER_NAME");
@@ -51,6 +95,11 @@ class TransferMetadataTest : public ::testing::Test {
         LOG(INFO) << "local_server_name: " << local_server_name;
 
         metadata_client = std::make_unique<TransferMetadata>(metadata_server);
+        if (metadata_server == P2PHANDSHAKE) {
+            metadata_client->p2p_handshake_mode_ = false;
+            metadata_client->storage_plugin_ =
+                std::make_shared<InMemoryMetadataStoragePlugin>();
+        }
     }
     void TearDown() override {
         // clean up glog

@@ -48,15 +48,6 @@ using gpu_staging::SetDevice;
 
 namespace {
 
-#ifdef ENABLE_MULTI_PROTOCOL
-std::vector<std::string> GetProtocolSpecificRegistrationProtocols(
-    const std::string& protocol);
-int UnregisterMemoryForProtocols(TransferEngine* transfer_engine,
-                                 const std::vector<std::string>& protocols,
-                                 const void* buffer, size_t size,
-                                 bool update_metadata);
-#endif
-
 #ifdef USE_NOF
 std::optional<int> GetConfiguredNumaSocketId() {
     const char* raw_value = std::getenv("MC_STORE_NUMA_SOCKET_ID");
@@ -262,6 +253,15 @@ FinalizeDecision DetermineFinalizeDecision(
 }
 
 }  // namespace
+
+#ifdef ENABLE_MULTI_PROTOCOL
+std::vector<std::string> GetProtocolSpecificRegistrationProtocols(
+    const std::string& protocol);
+int UnregisterMemoryForProtocols(TransferEngine* transfer_engine,
+                                 const std::vector<std::string>& protocols,
+                                 const void* buffer, size_t size,
+                                 bool update_metadata);
+#endif
 
 [[nodiscard]] size_t CalculateSliceSize(const std::vector<Slice>& slices) {
     size_t slice_size = 0;

@@ -80,6 +80,16 @@ bool IsNvlinkHostNumaCandidate(const Replica::Descriptor& replica,
            buffer.scale_up_domain_id_ == context.local_scale_up_domain_id;
 }
 
+bool IsOrdinaryNvlinkCandidate(const Replica::Descriptor& replica) {
+    if (!replica.is_memory_replica()) {
+        return false;
+    }
+    const auto& buffer =
+        replica.get_memory_descriptor().buffer_descriptor;
+    return AdvertisesProtocol(buffer, "nvlink") &&
+           buffer.memory_kind_ != "HOST_NUMA";
+}
+
 bool IsRdmaCandidate(const Replica::Descriptor& replica) {
     if (!replica.is_memory_replica()) {
         return false;
@@ -129,6 +139,15 @@ std::optional<TransferCandidate> SelectTransferCandidate(
     for (const auto& replica : replicas) {
         if (!IsComplete(replica) ||
             !IsNvlinkHostNumaCandidate(replica, context)) {
+            continue;
+        }
+        const auto& buffer =
+            replica.get_memory_descriptor().buffer_descriptor;
+        return MemoryCandidate(replica, SelectedProtocolFor(buffer, "nvlink"));
+    }
+
+    for (const auto& replica : replicas) {
+        if (!IsComplete(replica) || !IsOrdinaryNvlinkCandidate(replica)) {
             continue;
         }
         const auto& buffer =

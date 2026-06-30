@@ -102,6 +102,23 @@ TEST(TransferCandidateSelectorTest, EmptyDomainDoesNotSelectNvlink) {
     EXPECT_EQ(candidate->selected_protocol, "rdma");
 }
 
+TEST(TransferCandidateSelectorTest, ChoosesOrdinaryRemoteNvlinkMemory) {
+    auto context = GpuSameDomainContext();
+    context.enable_nvlink_host_numa = false;
+    std::vector<Replica::Descriptor> replicas = {
+        MemoryReplica("remote-hbm:1234", "nvlink", "", ""),
+        DiskReplica()};
+
+    auto candidate = SelectTransferCandidate(replicas, context);
+
+    ASSERT_TRUE(candidate.has_value());
+    ASSERT_TRUE(candidate->replica.is_memory_replica());
+    EXPECT_EQ(candidate->replica.get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "remote-hbm:1234");
+    EXPECT_TRUE(candidate->selected_protocol.empty());
+}
+
 TEST(TransferCandidateSelectorTest, UsesDiskFallbackAfterMemoryCandidates) {
     auto context = GpuSameDomainContext();
     std::vector<Replica::Descriptor> replicas = {DiskReplica()};

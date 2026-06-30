@@ -3096,11 +3096,11 @@ tl::expected<UUID, ErrorCode> Client::MountDualProtocolSegmentAndGetId(
         }
 
         const std::vector<std::string> dual_protocols = {"nvlink", "rdma"};
-        auto unregister_dual_registration = [&]() {
+        auto unregister_dual_registration = [&](bool update_metadata) {
             for (const auto& protocol_name : dual_protocols) {
                 int unregister_rc = UnregisterMemoryForProtocols(
                     transfer_engine_.get(), {protocol_name}, buffer, size,
-                    /*update_metadata=*/false);
+                    update_metadata);
                 if (unregister_rc != 0 &&
                     unregister_rc != ERR_ADDRESS_NOT_REGISTERED) {
                     LOG(ERROR) << "rollback_dual_unregister_failed protocol="
@@ -3158,7 +3158,7 @@ tl::expected<UUID, ErrorCode> Client::MountDualProtocolSegmentAndGetId(
             auto metadata = transfer_engine_->getMetadata();
             if (!metadata) {
                 LOG(ERROR) << "metadata_unavailable_for_dual_protocol_segment";
-                unregister_dual_registration();
+                unregister_dual_registration(/*update_metadata=*/false);
                 if (globalConfig().nvlink_host_numa_strict) {
                     return tl::unexpected(ErrorCode::INTERNAL_ERROR);
                 }
@@ -3177,7 +3177,7 @@ tl::expected<UUID, ErrorCode> Client::MountDualProtocolSegmentAndGetId(
                     LOG(ERROR) << "dual_protocol_nvlink_host_numa_metadata_"
                                   "verification_failed base="
                                << buffer << " size=" << size;
-                    unregister_dual_registration();
+                    unregister_dual_registration(/*update_metadata=*/false);
                     if (globalConfig().nvlink_host_numa_strict) {
                         return tl::unexpected(ErrorCode::INVALID_PARAMS);
                     }
@@ -3188,35 +3188,23 @@ tl::expected<UUID, ErrorCode> Client::MountDualProtocolSegmentAndGetId(
                     if (!mounted) return tl::unexpected(mounted.error());
                     segment_id = mounted.value();
                 } else {
-                    auto mounted = MountSegmentAfterRegistrationLocked(
-                        buffer, size, "nvlink,rdma", "HOST_NUMA",
-                        globalConfig().nvlink_scale_up_domain_id);
-                    if (!mounted) {
-                        unregister_dual_registration();
-                        return tl::unexpected(mounted.error());
-                    }
-                    segment_id = mounted.value();
-
                     int rc_update = metadata->updateLocalSegmentDesc();
                     if (rc_update != 0) {
                         LOG(ERROR)
                             << "update_dual_protocol_segment_metadata_failed "
                             << "rc=" << rc_update;
-                        auto unmount_result =
-                            master_client_.UnmountSegment(segment_id);
-                        if (!unmount_result &&
-                            unmount_result.error() !=
-                                ErrorCode::SEGMENT_NOT_FOUND) {
-                            LOG(WARNING)
-                                << "best_effort_unmount_after_metadata_"
-                                   "failure_failed id="
-                                << UuidToString(segment_id)
-                                << " error=" << toString(unmount_result.error());
-                        }
-                        mounted_segments_.erase(segment_id);
-                        unregister_dual_registration();
+                        unregister_dual_registration(/*update_metadata=*/false);
                         return tl::unexpected(ErrorCode::INTERNAL_ERROR);
                     }
+
+                    auto mounted = MountSegmentAfterRegistrationLocked(
+                        buffer, size, "nvlink,rdma", "HOST_NUMA",
+                        globalConfig().nvlink_scale_up_domain_id);
+                    if (!mounted) {
+                        unregister_dual_registration(/*update_metadata=*/true);
+                        return tl::unexpected(mounted.error());
+                    }
+                    segment_id = mounted.value();
                 }
             }
         }

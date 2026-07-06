@@ -464,7 +464,7 @@ TEST(NvlinkTransportTest, HostNumaFabricAllocationHasMetadata) {
 Run:
 
 ```bash
-cmake -S . -B build-mnnvl -DBUILD_UNIT_TESTS=ON -DWITH_TE=ON -DWITH_STORE=ON -DENABLE_MULTI_PROTOCOL=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DUSE_TCP=ON
+cmake -S . -B build-mnnvl -DBUILD_UNIT_TESTS=ON -DWITH_TE=ON -DWITH_STORE=ON -DENABLE_MULTI_PROTOCOL=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DUSE_TCP=ON -DUSE_ETCD=ON
 cmake --build build-mnnvl --target nvlink_transport_test -j
 ```
 
@@ -603,10 +603,12 @@ Run:
 
 ```bash
 cmake --build build-mnnvl --target nvlink_transport_test -j
+# In another terminal, or as a background process, provide the default metadata backend:
+etcd --listen-client-urls http://127.0.0.1:2379 --advertise-client-urls http://127.0.0.1:2379 --data-dir /tmp/mooncake-etcd-mnnvl
 ctest --test-dir build-mnnvl -R '^nvlink_transport_test$' --output-on-failure
 ```
 
-Expected on non-GB200 or non-fabric systems: test binary passes with the HOST_NUMA test skipped. Expected on GB200/NVL72 with fabric support: test passes and validates metadata.
+Expected on non-GB200 or non-fabric systems: test binary passes with the HOST_NUMA test skipped. Expected on GB200/NVL72 with fabric support: test passes and validates metadata. The default `nvlink_transport_test` metadata backend is etcd, so `build-mnnvl` must be configured with `-DUSE_ETCD=ON` and an etcd service must be reachable at `127.0.0.1:2379` unless the test is run with an explicit non-etcd `--metadata_server`. For two-node validation, run etcd on a shared metadata node and pass that node's reachable IP as `--metadata_server`.
 
 - [ ] **Step 8: Commit NVLink HOST_NUMA helpers**
 
@@ -1440,10 +1442,12 @@ Run:
 
 ```bash
 cmake --build build-mnnvl --target nvlink_transport_test -j
+# In another terminal, or as a background process, provide the default metadata backend:
+etcd --listen-client-urls http://127.0.0.1:2379 --advertise-client-urls http://127.0.0.1:2379 --data-dir /tmp/mooncake-etcd-mnnvl
 ctest --test-dir build-mnnvl -R '^nvlink_transport_test$' --output-on-failure
 ```
 
-Expected on unsupported hardware: test passes with skips. Expected on GB200/NVL72: HOST_NUMA read test passes.
+Expected on unsupported hardware: test passes with skips. Expected on GB200/NVL72: HOST_NUMA read test passes. The default `nvlink_transport_test` metadata backend is etcd, so `build-mnnvl` must be configured with `-DUSE_ETCD=ON` and an etcd service must be reachable at `127.0.0.1:2379` unless the test is run with an explicit non-etcd `--metadata_server`. For two-node validation, run etcd on a shared metadata node and pass that node's reachable IP as `--metadata_server`.
 
 - [ ] **Step 3: Run store regression tests**
 
@@ -1495,8 +1499,10 @@ git status --short
 For GB200/NVL72 validation:
 
 ```bash
-cmake -S . -B build-mnnvl -DBUILD_UNIT_TESTS=ON -DWITH_TE=ON -DWITH_STORE=ON -DENABLE_MULTI_PROTOCOL=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DUSE_TCP=ON
+cmake -S . -B build-mnnvl -DBUILD_UNIT_TESTS=ON -DWITH_TE=ON -DWITH_STORE=ON -DENABLE_MULTI_PROTOCOL=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DUSE_TCP=ON -DUSE_ETCD=ON
 cmake --build build-mnnvl --target nvlink_transport_test -j
+# In another terminal, or as a background process, provide the default metadata backend:
+etcd --listen-client-urls http://127.0.0.1:2379 --advertise-client-urls http://127.0.0.1:2379 --data-dir /tmp/mooncake-etcd-mnnvl
 ctest --test-dir build-mnnvl -R '^nvlink_transport_test$' --output-on-failure
 ```
 

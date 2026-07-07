@@ -165,6 +165,89 @@ TEST_F(TransferMetadataTest, EncodeDecodeNvlinkRdmaSegment) {
 #endif
 }
 
+TEST_F(TransferMetadataTest, EncodeDecodeSingleNvlinkHostNumaZeroAddress) {
+    TransferMetadata::SegmentDesc desc;
+    desc.name = "host-numa-segment";
+    desc.protocol = "nvlink";
+    desc.tcp_data_port = 0;
+
+    TransferMetadata::BufferDesc nvlink_buffer;
+    nvlink_buffer.name = "host_numa:0";
+    nvlink_buffer.addr = 0;
+    nvlink_buffer.length = 2 * 1024 * 1024;
+    nvlink_buffer.shm_name = "fabric-handle-bytes";
+    nvlink_buffer.memory_kind = "HOST_NUMA";
+    nvlink_buffer.scale_up_domain_id = "domain-a";
+    desc.buffers.push_back(nvlink_buffer);
+
+    Json::Value encoded;
+    ASSERT_EQ(metadata_client->encodeSegmentDesc(desc, encoded), 0);
+    ASSERT_EQ(encoded["buffers"].size(), 1u);
+    EXPECT_EQ(encoded["buffers"][0]["addr"].asUInt64(), Json::UInt64(0));
+    EXPECT_EQ(encoded["buffers"][0]["memory_kind"].asString(), "HOST_NUMA");
+    EXPECT_EQ(encoded["buffers"][0]["scale_up_domain_id"].asString(),
+              "domain-a");
+
+    auto decoded =
+        metadata_client->decodeSegmentDesc(encoded, "host-numa-segment");
+    ASSERT_NE(decoded, nullptr);
+    ASSERT_EQ(decoded->buffers.size(), 1u);
+    EXPECT_EQ(decoded->buffers[0].addr, 0u);
+    EXPECT_EQ(decoded->buffers[0].memory_kind, "HOST_NUMA");
+    EXPECT_EQ(decoded->buffers[0].scale_up_domain_id, "domain-a");
+    EXPECT_EQ(decoded->buffers[0].shm_name, "fabric-handle-bytes");
+}
+
+TEST_F(TransferMetadataTest, EncodeDecodeNvlinkRdmaHostNumaZeroNvlinkAddress) {
+#ifndef ENABLE_MULTI_PROTOCOL
+    GTEST_SKIP() << "ENABLE_MULTI_PROTOCOL is not compiled in";
+#else
+    TransferMetadata::SegmentDesc desc;
+    desc.name = "dual-host-numa-segment";
+    desc.protocol = "nvlink,rdma";
+    desc.tcp_data_port = 0;
+
+    TransferMetadata::DeviceDesc device;
+    device.name = "mlx5_0";
+    device.lid = 1;
+    device.gid = "0000:0000:0000:0000:0000:ffff:0a00:0001";
+    desc.devices.push_back(device);
+
+    TransferMetadata::BufferDesc nvlink_buffer;
+    nvlink_buffer.name = "host_numa:0";
+    nvlink_buffer.addr = 0;
+    nvlink_buffer.length = 2 * 1024 * 1024;
+    nvlink_buffer.protocol = "nvlink";
+    nvlink_buffer.shm_name = "fabric-handle-bytes";
+    nvlink_buffer.memory_kind = "HOST_NUMA";
+    nvlink_buffer.scale_up_domain_id = "domain-a";
+    desc.buffers.push_back(nvlink_buffer);
+
+    TransferMetadata::BufferDesc rdma_buffer;
+    rdma_buffer.name = "host_numa:0";
+    rdma_buffer.addr = 0x100000;
+    rdma_buffer.length = 2 * 1024 * 1024;
+    rdma_buffer.protocol = "rdma";
+    rdma_buffer.lkey.push_back(11);
+    rdma_buffer.rkey.push_back(22);
+    desc.buffers.push_back(rdma_buffer);
+
+    Json::Value encoded;
+    ASSERT_EQ(metadata_client->encodeSegmentDesc(desc, encoded), 0);
+
+    auto decoded =
+        metadata_client->decodeSegmentDesc(encoded, "dual-host-numa-segment");
+    ASSERT_NE(decoded, nullptr);
+    ASSERT_EQ(decoded->buffers.size(), 2u);
+    EXPECT_EQ(decoded->buffers[0].protocol, "nvlink");
+    EXPECT_EQ(decoded->buffers[0].addr, 0u);
+    EXPECT_EQ(decoded->buffers[0].memory_kind, "HOST_NUMA");
+    EXPECT_EQ(decoded->buffers[0].scale_up_domain_id, "domain-a");
+    EXPECT_EQ(decoded->buffers[1].protocol, "rdma");
+    EXPECT_EQ(decoded->buffers[1].addr, 0x100000u);
+#endif
+}
+
 TEST_F(TransferMetadataTest, RejectsUnsupportedMultiProtocolTriple) {
 #ifndef ENABLE_MULTI_PROTOCOL
     GTEST_SKIP() << "ENABLE_MULTI_PROTOCOL is not compiled in";

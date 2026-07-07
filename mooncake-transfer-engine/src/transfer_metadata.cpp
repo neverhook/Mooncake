@@ -26,6 +26,10 @@
 #include "transfer_metadata_plugin.h"
 
 namespace mooncake {
+static bool isHostNumaBuffer(const TransferMetadata::BufferDesc &buffer) {
+    return buffer.memory_kind == "HOST_NUMA";
+}
+
 #ifdef ENABLE_MULTI_PROTOCOL
 // Split comma-separated protocol string into vector
 static std::vector<std::string> splitProtocols(const std::string &protocols) {
@@ -488,6 +492,13 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
             bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
             bufferJSON["length"] = static_cast<Json::UInt64>(buffer.length);
             bufferJSON["shm_name"] = buffer.shm_name;
+            if (!buffer.memory_kind.empty()) {
+                bufferJSON["memory_kind"] = buffer.memory_kind;
+            }
+            if (!buffer.scale_up_domain_id.empty()) {
+                bufferJSON["scale_up_domain_id"] =
+                    buffer.scale_up_domain_id;
+            }
             buffersJSON.append(bufferJSON);
         }
         segmentJSON["buffers"] = buffersJSON;
@@ -666,7 +677,9 @@ decodeMultiProtocolSegmentDesc(Json::Value &segmentJSON,
                 buffer.scale_up_domain_id =
                     bufferJSON["scale_up_domain_id"].asString();
             }
-            if (buffer.name.empty() || !buffer.addr || !buffer.length ||
+            if (buffer.name.empty() ||
+                (buffer.addr == 0 && !isHostNumaBuffer(buffer)) ||
+                !buffer.length ||
                 buffer.shm_name.empty()) {
                 LOG(WARNING)
                     << "Corrupted segment descriptor, name " << segment_name
@@ -853,7 +866,16 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             buffer.addr = bufferJSON["addr"].asUInt64();
             buffer.length = bufferJSON["length"].asUInt64();
             buffer.shm_name = bufferJSON["shm_name"].asString();
-            if (buffer.name.empty() || !buffer.addr || !buffer.length ||
+            if (bufferJSON.isMember("memory_kind")) {
+                buffer.memory_kind = bufferJSON["memory_kind"].asString();
+            }
+            if (bufferJSON.isMember("scale_up_domain_id")) {
+                buffer.scale_up_domain_id =
+                    bufferJSON["scale_up_domain_id"].asString();
+            }
+            if (buffer.name.empty() ||
+                (buffer.addr == 0 && !isHostNumaBuffer(buffer)) ||
+                !buffer.length ||
                 buffer.shm_name.empty()) {
                 LOG(WARNING) << "Corrupted segment descriptor, name "
                              << segment_name << " protocol " << desc->protocol

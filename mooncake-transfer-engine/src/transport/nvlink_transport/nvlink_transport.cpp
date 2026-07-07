@@ -689,8 +689,8 @@ int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
         }
 
         // Find whole physical page for memory registration
-        void *real_addr;
-        size_t real_size;
+        void *real_addr = nullptr;
+        size_t real_size = 0;
         result = cuMemGetAddressRange((CUdeviceptr *)&real_addr, &real_size,
                                       (CUdeviceptr)addr);
         if (result != CUDA_SUCCESS) {
@@ -701,6 +701,23 @@ int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
             real_size = (length + granularity - 1) & ~(granularity - 1);
         }
         const bool is_host_numa = isHostNumaAllocation(handle);
+        if (globalConfig().trace) {
+            LOG(INFO) << "NvlinkTransport: fabric memory registration addr "
+                      << addr << ", length " << length << ", real_addr "
+                      << real_addr << ", real_size " << real_size
+                      << ", location " << location << ", is_host_numa "
+                      << is_host_numa;
+        }
+        if (real_addr == nullptr) {
+            LOG(ERROR)
+                << "NvlinkTransport: fabric memory registration resolved null "
+                   "base address, addr "
+                << addr << ", length " << length << ", real_size "
+                << real_size << ", location " << location
+                << ", is_host_numa " << is_host_numa;
+            cuMemRelease(handle);
+            return -1;
+        }
 
         CUmemFabricHandle export_handle;
         result = cuMemExportToShareableHandle(&export_handle, handle,

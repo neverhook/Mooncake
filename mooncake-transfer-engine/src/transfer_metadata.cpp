@@ -26,10 +26,6 @@
 #include "transfer_metadata_plugin.h"
 
 namespace mooncake {
-static bool isHostNumaBuffer(const TransferMetadata::BufferDesc &buffer) {
-    return buffer.memory_kind == "HOST_NUMA";
-}
-
 #ifdef ENABLE_MULTI_PROTOCOL
 // Split comma-separated protocol string into vector
 static std::vector<std::string> splitProtocols(const std::string &protocols) {
@@ -666,7 +662,8 @@ decodeMultiProtocolSegmentDesc(Json::Value &segmentJSON,
         } else if (buffer_protocol == "nvlink") {
             TransferMetadata::BufferDesc buffer;
             buffer.name = bufferJSON["name"].asString();
-            buffer.addr = bufferJSON["addr"].asUInt64();
+            bool has_addr = bufferJSON.isMember("addr");
+            buffer.addr = has_addr ? bufferJSON["addr"].asUInt64() : 0;
             buffer.length = bufferJSON["length"].asUInt64();
             buffer.protocol = buffer_protocol;
             buffer.shm_name = bufferJSON["shm_name"].asString();
@@ -677,13 +674,18 @@ decodeMultiProtocolSegmentDesc(Json::Value &segmentJSON,
                 buffer.scale_up_domain_id =
                     bufferJSON["scale_up_domain_id"].asString();
             }
-            if (buffer.name.empty() ||
-                (buffer.addr == 0 && !isHostNumaBuffer(buffer)) ||
+            if (buffer.name.empty() || !has_addr || !buffer.addr ||
                 !buffer.length ||
                 buffer.shm_name.empty()) {
                 LOG(WARNING)
                     << "Corrupted segment descriptor, name " << segment_name
-                    << " buffer_protocol " << buffer_protocol;
+                    << " buffer_protocol " << buffer_protocol
+                    << " buffer name " << buffer.name << " has_addr "
+                    << has_addr << " buffer addr " << buffer.addr
+                    << " buffer length " << buffer.length
+                    << " buffer shm_name " << buffer.shm_name
+                    << " memory_kind " << buffer.memory_kind
+                    << " scale_up_domain_id " << buffer.scale_up_domain_id;
                 return nullptr;
             }
             desc->buffers.push_back(buffer);
@@ -863,7 +865,8 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
         for (const auto &bufferJSON : segmentJSON["buffers"]) {
             BufferDesc buffer;
             buffer.name = bufferJSON["name"].asString();
-            buffer.addr = bufferJSON["addr"].asUInt64();
+            bool has_addr = bufferJSON.isMember("addr");
+            buffer.addr = has_addr ? bufferJSON["addr"].asUInt64() : 0;
             buffer.length = bufferJSON["length"].asUInt64();
             buffer.shm_name = bufferJSON["shm_name"].asString();
             if (bufferJSON.isMember("memory_kind")) {
@@ -873,15 +876,18 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
                 buffer.scale_up_domain_id =
                     bufferJSON["scale_up_domain_id"].asString();
             }
-            if (buffer.name.empty() ||
-                (buffer.addr == 0 && !isHostNumaBuffer(buffer)) ||
+            if (buffer.name.empty() || !has_addr || !buffer.addr ||
                 !buffer.length ||
                 buffer.shm_name.empty()) {
                 LOG(WARNING) << "Corrupted segment descriptor, name "
                              << segment_name << " protocol " << desc->protocol
-                             << "buffer name " << buffer.name << "buffer addr "
-                             << buffer.addr << "buffer length " << buffer.length
-                             << "buffer shm_name " << buffer.shm_name;
+                             << " buffer name " << buffer.name
+                             << " has_addr " << has_addr << " buffer addr "
+                             << buffer.addr << " buffer length "
+                             << buffer.length << " buffer shm_name "
+                             << buffer.shm_name << " memory_kind "
+                             << buffer.memory_kind << " scale_up_domain_id "
+                             << buffer.scale_up_domain_id;
                 return nullptr;
             }
             desc->buffers.push_back(buffer);

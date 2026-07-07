@@ -708,7 +708,17 @@ int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
                       << ", location " << location << ", is_host_numa "
                       << is_host_numa;
         }
-        if (real_addr == nullptr) {
+        if (real_addr == nullptr && is_host_numa) {
+            if (globalConfig().trace) {
+                LOG(INFO)
+                    << "NvlinkTransport: cuMemGetAddressRange returned null "
+                       "base for HOST_NUMA allocation, using registered "
+                       "address "
+                    << addr << ", length " << length << ", real_size "
+                    << real_size << ", location " << location;
+            }
+            real_addr = addr;
+        } else if (real_addr == nullptr) {
             LOG(ERROR)
                 << "NvlinkTransport: fabric memory registration resolved null "
                    "base address, addr "

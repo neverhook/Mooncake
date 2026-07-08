@@ -226,6 +226,31 @@ TEST(NvlinkTransportTest, HostNumaFabricRegistrationMetadata) {
 #endif
 }
 
+TEST(NvlinkTransportTest, HostNumaAccessIncludesHostNumaAndCudaDevices) {
+#if !defined(USE_CUDA) || !defined(USE_MNNVL)
+    GTEST_SKIP() << "CUDA MNNVL support is not compiled in";
+#else
+    constexpr int kDeviceCount = 4;
+    constexpr int kNumaNode = 2;
+
+    auto access_desc =
+        NvlinkTransport::buildHostNumaAccessDescsForTest(kDeviceCount,
+                                                         kNumaNode);
+
+    ASSERT_EQ(access_desc.size(), static_cast<size_t>(kDeviceCount + 1));
+    EXPECT_EQ(access_desc[0].location.type, CU_MEM_LOCATION_TYPE_HOST_NUMA);
+    EXPECT_EQ(access_desc[0].location.id, kNumaNode);
+    EXPECT_EQ(access_desc[0].flags, CU_MEM_ACCESS_FLAGS_PROT_READWRITE);
+
+    for (int device_id = 0; device_id < kDeviceCount; ++device_id) {
+        const auto& device_access = access_desc[device_id + 1];
+        EXPECT_EQ(device_access.location.type, CU_MEM_LOCATION_TYPE_DEVICE);
+        EXPECT_EQ(device_access.location.id, device_id);
+        EXPECT_EQ(device_access.flags, CU_MEM_ACCESS_FLAGS_PROT_READWRITE);
+    }
+#endif
+}
+
 TEST(NvlinkTransportTest, DeviceVmmRegistrationDoesNotAdvertiseHostNuma) {
 #if !defined(USE_CUDA) || !defined(USE_MNNVL)
     GTEST_SKIP() << "CUDA MNNVL support is not compiled in";

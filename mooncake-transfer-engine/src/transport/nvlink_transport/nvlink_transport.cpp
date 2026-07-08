@@ -77,6 +77,30 @@ struct CudaEventNVLinkRAII {
 };
 
 static thread_local CudaEventNVLinkRAII tl_nvlink_sync_event;
+
+static std::vector<CUmemAccessDesc> buildCudaDeviceAccessDescs(
+    int device_count) {
+    std::vector<CUmemAccessDesc> access_desc(device_count);
+    for (int device_id = 0; device_id < device_count; ++device_id) {
+        access_desc[device_id].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        access_desc[device_id].location.id = device_id;
+        access_desc[device_id].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    }
+    return access_desc;
+}
+
+static std::vector<CUmemAccessDesc> buildHostNumaAccessDescs(int device_count,
+                                                             int numa_node) {
+    std::vector<CUmemAccessDesc> access_desc(device_count + 1);
+    access_desc[0].location.type = CU_MEM_LOCATION_TYPE_HOST_NUMA;
+    access_desc[0].location.id = numa_node;
+    access_desc[0].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+
+    auto device_access_descs = buildCudaDeviceAccessDescs(device_count);
+    std::copy(device_access_descs.begin(), device_access_descs.end(),
+              access_desc.begin() + 1);
+    return access_desc;
+}
 }  // anonymous namespace
 
 using Slice = Transport::Slice;
@@ -260,12 +284,7 @@ static bool setAccessForAllCudaDevices(void *ptr, size_t size) {
         return false;
     }
 
-    std::vector<CUmemAccessDesc> access_desc(device_count);
-    for (int device_id = 0; device_id < device_count; ++device_id) {
-        access_desc[device_id].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-        access_desc[device_id].location.id = device_id;
-        access_desc[device_id].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-    }
+    auto access_desc = buildCudaDeviceAccessDescs(device_count);
     auto result = cuMemSetAccess((CUdeviceptr)ptr, size, access_desc.data(),
                                  access_desc.size());
     if (result != CUDA_SUCCESS) {
@@ -990,7 +1009,29 @@ void *NvlinkTransport::allocateHostNumaFabricMemory(size_t size,
         return nullptr;
     }
 
-    if (!setAccessForAllCudaDevices(ptr, size)) {
+    int device_count = 0;
+    cudaError_t err = cudaGetDeviceCount(&device_count);
+    if (err != cudaSuccess) {
+        LOG(ERROR) << "NvlinkTransport: cudaGetDeviceCount failed: "
+                   << cudaGetErrorString(err);
+        cuMemUnmap((CUdeviceptr)ptr, size);
+        cuMemAddressFree((CUdeviceptr)ptr, size);
+        cuMemRelease(handle);
+        return nullptr;
+    }
+    if (device_count == 0) {
+        LOG(ERROR) << "NvlinkTransport: no device found";
+        cuMemUnmap((CUdeviceptr)ptr, size);
+        cuMemAddressFree((CUdeviceptr)ptr, size);
+        cuMemRelease(handle);
+        return nullptr;
+    }
+
+    auto access_desc = buildHostNumaAccessDescs(device_count, numa_node);
+    result = cuMemSetAccess((CUdeviceptr)ptr, size, access_desc.data(),
+                            access_desc.size());
+    if (result != CUDA_SUCCESS) {
+        LOG(ERROR) << "NvlinkTransport: cuMemSetAccess failed: " << result;
         cuMemUnmap((CUdeviceptr)ptr, size);
         cuMemAddressFree((CUdeviceptr)ptr, size);
         cuMemRelease(handle);
@@ -1008,6 +1049,12 @@ void *NvlinkTransport::allocateHostNumaFabricMemory(size_t size,
 
 void NvlinkTransport::freeHostNumaFabricMemory(void *ptr) {
     freeVmmMappedMemory(ptr);
+}
+
+std::vector<CUmemAccessDesc>
+NvlinkTransport::buildHostNumaAccessDescsForTest(int device_count,
+                                                 int numa_node) {
+    return buildHostNumaAccessDescs(device_count, numa_node);
 }
 
 void *NvlinkTransport::allocatePinnedLocalMemory(size_t size) {

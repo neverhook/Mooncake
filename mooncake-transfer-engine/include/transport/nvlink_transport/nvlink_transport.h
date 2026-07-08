@@ -48,6 +48,11 @@ class NvlinkTransport : public Transport {
 
     static void freeHostNumaFabricMemory(void* addr);
 
+#ifdef USE_CUDA
+    static std::vector<CUmemAccessDesc> buildHostNumaAccessDescsForTest(
+        int device_count, int numa_node);
+#endif
+
    protected:
     int install(std::string& local_server_name,
                 std::shared_ptr<TransferMetadata> meta,

@@ -22,6 +22,8 @@ cat >"$SRC" <<'CPP'
 #include <dlfcn.h>
 #include <errno.h>
 #include <infiniband/verbs.h>
+#include <setjmp.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -84,6 +86,25 @@ struct DmaBufResult {
     CUresult cuda_err = CUDA_SUCCESS;
     const char* stage = "skipped";
 };
+
+struct TouchResult {
+    bool attempted = false;
+    bool ok = false;
+    int signal = 0;
+    size_t offset = 0;
+};
+
+static sigjmp_buf touch_jmp;
+static volatile sig_atomic_t touch_active = 0;
+static volatile sig_atomic_t touch_signal = 0;
+static volatile size_t touch_offset = 0;
+
+static void touch_signal_handler(int sig) {
+    if (touch_active) {
+        touch_signal = sig;
+        siglongjmp(touch_jmp, 1);
+    }
+}
 
 static RegResult try_reg_mr(ibv_pd* pd, const char* label, void* addr,
                             size_t length) {
@@ -231,6 +252,66 @@ static DmaBufResult try_reg_dmabuf_mr(ibv_pd* pd,
     return {true, true, false, saved_errno, CUDA_SUCCESS, "register"};
 }
 
+static TouchResult try_cpu_touch(const char* label, CUdeviceptr ptr,
+                                 size_t length) {
+    struct sigaction action = {};
+    struct sigaction old_sigsegv = {};
+    struct sigaction old_sigbus = {};
+    action.sa_handler = touch_signal_handler;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = 0;
+
+    bool sigsegv_installed = sigaction(SIGSEGV, &action, &old_sigsegv) == 0;
+    bool sigbus_installed = sigaction(SIGBUS, &action, &old_sigbus) == 0;
+    if (!sigsegv_installed || !sigbus_installed) {
+        int saved_errno = errno;
+        if (sigsegv_installed) sigaction(SIGSEGV, &old_sigsegv, nullptr);
+        if (sigbus_installed) sigaction(SIGBUS, &old_sigbus, nullptr);
+        printf("[%s] CPU touch SKIP: sigaction failed errno=%d %s\n", label,
+               saved_errno, strerror(saved_errno));
+        return {false, false, 0, 0};
+    }
+
+    TouchResult result;
+    result.attempted = true;
+    touch_active = 1;
+    touch_signal = 0;
+    touch_offset = 0;
+
+    if (sigsetjmp(touch_jmp, 1) == 0) {
+        long page_size_long = sysconf(_SC_PAGESIZE);
+        size_t page_size = page_size_long > 0 ? (size_t)page_size_long : 4096;
+        volatile unsigned char* p =
+            reinterpret_cast<volatile unsigned char*>((uintptr_t)ptr);
+        for (size_t off = 0; off < length; off += page_size) {
+            touch_offset = off;
+            unsigned char value = p[off];
+            p[off] = (unsigned char)(value ^ 0x5a);
+            p[off] = value;
+        }
+        if (length > 0 && ((length - 1) % page_size) != 0) {
+            touch_offset = length - 1;
+            unsigned char value = p[length - 1];
+            p[length - 1] = (unsigned char)(value ^ 0x5a);
+            p[length - 1] = value;
+        }
+        result.ok = true;
+        printf("[%s] CPU page touch OK addr=%p len=%zu page_size=%zu\n", label,
+               (void*)ptr, length, page_size);
+    } else {
+        result.ok = false;
+        result.signal = touch_signal;
+        result.offset = (size_t)touch_offset;
+        printf("[%s] CPU page touch FAIL addr=%p len=%zu signal=%d offset=%zu\n",
+               label, (void*)ptr, length, result.signal, result.offset);
+    }
+
+    touch_active = 0;
+    sigaction(SIGSEGV, &old_sigsegv, nullptr);
+    sigaction(SIGBUS, &old_sigbus, nullptr);
+    return result;
+}
+
 static void print_reg_summary(const char* label, const RegResult& result) {
     if (!result.attempted) {
         printf("  %-44s SKIP\n", label);
@@ -260,6 +341,17 @@ static void print_dmabuf_summary(const char* label,
     } else {
         printf("  %-44s FAIL stage=%s errno=%d %s\n", label, result.stage,
                result.err, strerror(result.err));
+    }
+}
+
+static void print_touch_summary(const char* label, const TouchResult& result) {
+    if (!result.attempted) {
+        printf("  %-44s SKIP\n", label);
+    } else if (result.ok) {
+        printf("  %-44s OK\n", label);
+    } else {
+        printf("  %-44s FAIL signal=%d offset=%zu\n", label, result.signal,
+               result.offset);
     }
 }
 
@@ -368,11 +460,14 @@ static HostNumaAllocation alloc_host_numa_fabric(size_t requested_size,
 
     int device_count = 0;
     die_cuda(cuDeviceGetCount(&device_count), "cuDeviceGetCount");
-    std::vector<CUmemAccessDesc> access(device_count);
+    std::vector<CUmemAccessDesc> access(device_count + 1);
+    access[0].location.type = CU_MEM_LOCATION_TYPE_HOST_NUMA;
+    access[0].location.id = numa_node;
+    access[0].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
     for (int i = 0; i < device_count; ++i) {
-        access[i].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-        access[i].location.id = i;
-        access[i].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        access[i + 1].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        access[i + 1].location.id = i;
+        access[i + 1].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
     }
     rc = cuMemSetAccess(addr, size, access.data(), access.size());
     if (rc != CUDA_SUCCESS) {
@@ -384,8 +479,8 @@ static HostNumaAllocation alloc_host_numa_fabric(size_t requested_size,
 
     cuMemRelease(handle);
     printf("Allocated HOST_NUMA fabric VMM addr=%p size=%zu granularity=%zu "
-           "numa_node=%d\n",
-           (void*)addr, size, granularity, numa_node);
+           "numa_node=%d access_entries=%zu\n",
+           (void*)addr, size, granularity, numa_node, access.size());
     return {addr, size};
 }
 
@@ -493,6 +588,9 @@ int main(int argc, char** argv) {
     }
 
     HostNumaAllocation host_numa = alloc_host_numa_fabric(size, numa_node);
+    TouchResult host_numa_touch_result =
+        try_cpu_touch("cuda-host-numa-fabric/cpu-touch", host_numa.addr,
+                      host_numa.size);
     RegResult host_numa_legacy_result =
         try_reg_mr(pd, "cuda-host-numa-fabric/legacy-ibv_reg_mr",
                    (void*)host_numa.addr, host_numa.size);
@@ -511,6 +609,7 @@ int main(int argc, char** argv) {
     print_reg_summary("HBM legacy ibv_reg_mr", hbm_legacy_result);
     print_dmabuf_summary("HBM DMA-BUF ibv_reg_dmabuf_mr",
                          hbm_dmabuf_result);
+    print_touch_summary("HOST_NUMA CPU page touch", host_numa_touch_result);
     print_reg_summary("HOST_NUMA legacy ibv_reg_mr",
                       host_numa_legacy_result);
     print_dmabuf_summary("HOST_NUMA DMA-BUF ibv_reg_dmabuf_mr",

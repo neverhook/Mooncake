@@ -1857,10 +1857,19 @@ PYBIND11_MODULE(store, m) {
                        &AllocatedBuffer::Descriptor::buffer_address_)
         .def_readwrite("transport_endpoint",
                        &AllocatedBuffer::Descriptor::transport_endpoint_)
+        .def_readwrite("memory_kind",
+                       &AllocatedBuffer::Descriptor::memory_kind_)
+        .def_readwrite("scale_up_domain_id",
+                       &AllocatedBuffer::Descriptor::scale_up_domain_id_)
+        .def_readwrite("selected_protocol",
+                       &AllocatedBuffer::Descriptor::selected_protocol_)
         .def("__repr__", [](const AllocatedBuffer::Descriptor &desc) {
             return "<Descriptor size=" + std::to_string(desc.size_) +
                    " buffer_address=" + std::to_string(desc.buffer_address_) +
-                   " transport_endpoint=" + desc.transport_endpoint_ + ">";
+                   " transport_endpoint=" + desc.transport_endpoint_ +
+                   " memory_kind=" + desc.memory_kind_ +
+                   " scale_up_domain_id=" + desc.scale_up_domain_id_ +
+                   " selected_protocol=" + desc.selected_protocol_ + ">";
         });
 
     py::enum_<TaskType>(m, "TaskType")
@@ -2882,6 +2891,23 @@ PYBIND11_MODULE(store, m) {
                 return self.store_->get_replica_desc(key);
             },
             py::arg("key"))
+        .def(
+            "get_selected_replica_desc_for_buffer",
+            [](MooncakeStorePyWrapper &self, const std::string &key,
+               uintptr_t buffer_ptr, size_t size) {
+                auto real_client =
+                    std::dynamic_pointer_cast<RealClient>(self.store_);
+                if (!real_client) {
+                    LOG(ERROR) << "get_selected_replica_desc_for_buffer requires "
+                                  "RealClient";
+                    return std::vector<Replica::Descriptor>{};
+                }
+                void *buffer = reinterpret_cast<void *>(buffer_ptr);
+                py::gil_scoped_release release;
+                return real_client->get_selected_replica_desc_for_buffer(
+                    key, buffer, size);
+            },
+            py::arg("key"), py::arg("buffer_ptr"), py::arg("size"))
         .def(
             "batch_get_replica_desc",
             [](MooncakeStorePyWrapper &self,

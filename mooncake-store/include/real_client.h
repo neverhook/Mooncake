@@ -667,6 +667,8 @@ class RealClient : public PyClient {
     std::vector<CachedQueryResultResponse> batch_get_query_results(
         const std::vector<std::string> &keys);
     std::vector<Replica::Descriptor> get_replica_desc(const std::string &key);
+    std::vector<Replica::Descriptor> get_selected_replica_desc_for_buffer(
+        const std::string &key, void *buffer, size_t size);
 
     std::vector<std::string> batch_replica_clear(
         const std::vector<std::string> &keys,

@@ -535,11 +535,12 @@ std::vector<std::string> GetProtocolSpecificRegistrationProtocols(
 
 RegisteredBufferMap BuildRegisteredBufferMap(
     const std::vector<std::string>& protocols, const void* buffer, size_t size,
-    const std::string& location, bool update_metadata) {
+    const std::string& location, bool update_metadata,
+    bool remote_accessible = true) {
     RegisteredBufferMap buffer_map;
     for (const auto& protocol : protocols) {
-        buffer_map[protocol].emplace_back((void*)buffer, size, location, true,
-                                          update_metadata);
+        buffer_map[protocol].emplace_back((void*)buffer, size, location,
+                                          remote_accessible, update_metadata);
     }
     return buffer_map;
 }
@@ -548,9 +549,11 @@ int RegisterMemoryForProtocols(TransferEngine* transfer_engine,
                                const std::vector<std::string>& protocols,
                                const void* buffer, size_t size,
                                const std::string& location,
-                               bool update_metadata) {
+                               bool update_metadata,
+                               bool remote_accessible = true) {
     auto buffer_map = BuildRegisteredBufferMap(protocols, buffer, size,
-                                               location, update_metadata);
+                                               location, update_metadata,
+                                               remote_accessible);
     return transfer_engine->mp_registerLocalMemory(buffer_map);
 }
 
@@ -3360,6 +3363,35 @@ tl::expected<void, ErrorCode> Client::RegisterLocalMemory(
     }
     if (this->transfer_engine_->registerLocalMemory(
             addr, length, location, remote_accessible, update_metadata) != 0) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return {};
+}
+
+tl::expected<void, ErrorCode> Client::RegisterLocalTransferBuffer(
+    void* addr, size_t length, const std::string& location,
+    bool remote_accessible) {
+    auto check_result = CheckRegisterMemoryParams(addr, length);
+    if (!check_result) {
+        return tl::unexpected(check_result.error());
+    }
+
+#ifdef ENABLE_MULTI_PROTOCOL
+    auto protocols = GetProtocolSpecificRegistrationProtocols(protocol_);
+    if (!protocols.empty()) {
+        if (RegisterMemoryForProtocols(transfer_engine_.get(), protocols, addr,
+                                       length, location,
+                                       /*update_metadata=*/false,
+                                       remote_accessible) != 0) {
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        return {};
+    }
+#endif
+
+    if (this->transfer_engine_->registerLocalMemory(
+            addr, length, location, remote_accessible,
+            /*update_metadata=*/false) != 0) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     return {};

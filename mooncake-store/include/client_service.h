@@ -343,6 +343,19 @@ class Client {
         bool remote_accessible = true, bool update_metadata = true);
 
     /**
+     * @brief Registers a local transfer buffer without publishing it as a
+     *        remotely discoverable replica segment.
+     * @param addr Memory address to register
+     * @param length Size of the memory region
+     * @param location Device location (e.g. "cpu:0")
+     * @param remote_accessible Whether the memory can be accessed remotely
+     * @return ErrorCode indicating success/failure
+     */
+    tl::expected<void, ErrorCode> RegisterLocalTransferBuffer(
+        void* addr, size_t length, const std::string& location,
+        bool remote_accessible = false);
+
+    /**
      * @brief Unregisters memory buffer from TransferEngine
      * @param addr Memory address to unregister
      * @param update_metadata Whether to update metadata service

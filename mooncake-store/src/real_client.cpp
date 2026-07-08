@@ -820,9 +820,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     if (local_buffer_size > 0 && protocol != "cxl") {
         LOG(INFO) << "Registering local memory: " << local_buffer_size
                   << " bytes";
-        auto result = client_->RegisterLocalMemory(
+        auto result = client_->RegisterLocalTransferBuffer(
             client_buffer_allocator_->getBase(), local_buffer_size,
-            kWildcardLocation, false, true);
+            kWildcardLocation, false);
         if (!result.has_value()) {
             LOG(ERROR) << "Failed to register local memory: "
                        << toString(result.error());
@@ -1190,7 +1190,7 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     if (client_buffer_allocator_ && client_buffer_allocator_->size() > 0 &&
         protocol != "cxl") {
         auto unregister_result = client_->unregisterLocalMemory(
-            client_buffer_allocator_->getBase(), true);
+            client_buffer_allocator_->getBase(), false);
         if (!unregister_result) {
             LOG(WARNING)
                 << "Failed to unregister client local buffer on tear down: "
@@ -3169,8 +3169,8 @@ tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    auto result = client_->RegisterLocalMemory(buffer, size, kWildcardLocation,
-                                               false, true);
+    auto result = client_->RegisterLocalTransferBuffer(
+        buffer, size, kWildcardLocation, false);
     if (!result) {
         return result;
     }
@@ -3191,7 +3191,7 @@ tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    auto unregister_result = client_->unregisterLocalMemory(buffer, true);
+    auto unregister_result = client_->unregisterLocalMemory(buffer, false);
     if (!unregister_result) {
         LOG(ERROR) << "Unregister buffer failed with error: "
                    << toString(unregister_result.error());
@@ -5611,6 +5611,45 @@ std::vector<Replica::Descriptor> RealClient::get_replica_desc(
     if (replica_list.empty()) {
         LOG(ERROR) << "Empty replica list for key: " << key;
     }
+    return replica_list;
+}
+
+std::vector<Replica::Descriptor>
+RealClient::get_selected_replica_desc_for_buffer(const std::string &key,
+                                                 void *buffer, size_t size) {
+    std::vector<Replica::Descriptor> replica_list = {};
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return replica_list;
+    }
+
+    auto query_result = client_->Query(key);
+    if (!query_result) {
+        if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
+            query_result.error() == ErrorCode::REPLICA_IS_NOT_READY) {
+            LOG(ERROR) << "Object not found for key: " << key;
+        } else {
+            LOG(ERROR) << "Query failed for key: " << key
+                       << " with error: " << toString(query_result.error());
+        }
+        return replica_list;
+    }
+
+    const auto &replicas = query_result.value().replicas;
+    if (replicas.empty()) {
+        LOG(ERROR) << "Empty replica list for key: " << key;
+        return replica_list;
+    }
+
+    auto selected_replica = select_replica_for_read(
+        replicas, client_->GetLocalEndpoints(),
+        size > 0 && buffer != nullptr && is_device_destination(buffer));
+    if (!selected_replica) {
+        LOG(ERROR) << "No usable replica for key: " << key;
+        return replica_list;
+    }
+
+    replica_list.push_back(std::move(*selected_replica));
     return replica_list;
 }
 

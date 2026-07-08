@@ -38,6 +38,11 @@ export MC_NVLINK_SCALE_UP_DOMAIN_ID=${MC_NVLINK_SCALE_UP_DOMAIN_ID:-$DOMAIN}
 export MC_LOG_LEVEL=${MC_LOG_LEVEL:-TRACE}
 export MC_RPC_TIMEOUT_MS=${MC_RPC_TIMEOUT_MS:-3000}
 
+# GB200 validation targets the modern DMA-BUF/GDR_C2C path. Keep this explicit
+# because Mooncake's runtime default may still select the legacy nvidia-peermem
+# ibv_reg_mr path when the variable is unset.
+export WITH_NVIDIA_PEERMEM=${WITH_NVIDIA_PEERMEM:-0}
+
 # Keep GB200 data-path validation on TCP control-plane RPC unless the caller
 # explicitly starts processes outside this wrapper with a different setting.
 unset MC_RPC_PROTOCOL
@@ -69,6 +74,7 @@ if [ "${1:-}" = "--print-env" ]; then
     printf 'MC_NVLINK_SCALE_UP_DOMAIN_ID=%s\n' "$MC_NVLINK_SCALE_UP_DOMAIN_ID"
     printf 'MC_LOG_LEVEL=%s\n' "$MC_LOG_LEVEL"
     printf 'MC_RPC_TIMEOUT_MS=%s\n' "$MC_RPC_TIMEOUT_MS"
+    printf 'WITH_NVIDIA_PEERMEM=%s\n' "$WITH_NVIDIA_PEERMEM"
     printf 'RDMA_DEVICES=%s\n' "$RDMA_DEVICES"
     printf 'KEY=%s\n' "$KEY"
     printf 'SIZE_MB=%s\n' "$SIZE_MB"

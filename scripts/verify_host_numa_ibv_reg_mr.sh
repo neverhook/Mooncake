@@ -1,14 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Verify whether CUDA HOST_NUMA fabric VMM memory can be registered as an RDMA
-# memory region with ibv_reg_mr.
-#
-# The test intentionally uses two registrations in one process:
-#   1. ordinary CPU host memory, which must register successfully; this proves
-#      the selected RDMA device and verbs stack are usable.
-#   2. CU_MEM_LOCATION_TYPE_HOST_NUMA + CU_MEM_HANDLE_TYPE_FABRIC VMM memory,
-#      matching Mooncake's HOST_NUMA fabric allocation path.
+# Verify whether CUDA HBM and HOST_NUMA fabric VMM memory can be registered as
+# RDMA memory regions through both the legacy nvidia-peermem path and the modern
+# DMA-BUF path used on GB200/GDR_C2C systems.
 
 SIZE_MB="${SIZE_MB:-64}"
 HOST_NUMA_NODE="${HOST_NUMA_NODE:-${MC_NVLINK_HOST_NUMA_NODE:-0}}"
@@ -24,6 +19,7 @@ BIN="$WORKDIR/verify_host_numa_ibv_reg_mr"
 
 cat >"$SRC" <<'CPP'
 #include <cuda.h>
+#include <dlfcn.h>
 #include <errno.h>
 #include <infiniband/verbs.h>
 #include <stdint.h>
@@ -36,10 +32,32 @@ cat >"$SRC" <<'CPP'
 #include <string>
 #include <vector>
 
+#ifndef EPROTONOSUPPORT
+#define EPROTONOSUPPORT EOPNOTSUPP
+#endif
+
+using IbvRegDmabufMrFn = ibv_mr* (*)(ibv_pd*, uint64_t, size_t, uint64_t,
+                                     int, int);
+
 static const char* cuda_name(CUresult rc) {
     const char* name = nullptr;
     if (cuGetErrorName(rc, &name) == CUDA_SUCCESS && name) return name;
     return "CUDA_ERROR_UNKNOWN";
+}
+
+static const char* mem_type_name(CUmemorytype mem_type) {
+    switch (mem_type) {
+        case CU_MEMORYTYPE_HOST:
+            return "HOST";
+        case CU_MEMORYTYPE_DEVICE:
+            return "DEVICE";
+        case CU_MEMORYTYPE_ARRAY:
+            return "ARRAY";
+        case CU_MEMORYTYPE_UNIFIED:
+            return "UNIFIED";
+        default:
+            return "UNKNOWN";
+    }
 }
 
 static void die_cuda(CUresult rc, const char* what) {
@@ -53,8 +71,18 @@ static size_t align_up(size_t value, size_t alignment) {
 }
 
 struct RegResult {
-    bool ok;
-    int err;
+    bool attempted = false;
+    bool ok = false;
+    int err = 0;
+};
+
+struct DmaBufResult {
+    bool attempted = false;
+    bool export_ok = false;
+    bool reg_ok = false;
+    int err = 0;
+    CUresult cuda_err = CUDA_SUCCESS;
+    const char* stage = "skipped";
 };
 
 static RegResult try_reg_mr(ibv_pd* pd, const char* label, void* addr,
@@ -71,12 +99,168 @@ static RegResult try_reg_mr(ibv_pd* pd, const char* label, void* addr,
             fprintf(stderr, "[%s] ibv_dereg_mr failed: errno=%d %s\n", label,
                     errno, strerror(errno));
         }
-        return {true, 0};
+        return {true, true, 0};
     }
 
     printf("[%s] ibv_reg_mr FAIL addr=%p len=%zu errno=%d %s\n", label, addr,
            length, saved_errno, strerror(saved_errno));
-    return {false, saved_errno};
+    return {true, false, saved_errno};
+}
+
+static IbvRegDmabufMrFn load_ibv_reg_dmabuf_mr() {
+    dlerror();
+    void* sym = dlsym(RTLD_DEFAULT, "ibv_reg_dmabuf_mr");
+    const char* err = dlerror();
+    if (!sym) {
+        printf("[verbs-dmabuf-symbol] SKIP ibv_reg_dmabuf_mr not found%s%s\n",
+               err ? ": " : "", err ? err : "");
+        return nullptr;
+    }
+    printf("[verbs-dmabuf-symbol] ibv_reg_dmabuf_mr found\n");
+    return reinterpret_cast<IbvRegDmabufMrFn>(sym);
+}
+
+static bool probe_ibv_dmabuf(ibv_pd* pd, IbvRegDmabufMrFn reg_dmabuf_mr) {
+    if (!reg_dmabuf_mr) return false;
+
+    errno = 0;
+    ibv_mr* mr = reg_dmabuf_mr(pd, 0ULL, 0ULL, 0ULL, -1, 0);
+    int saved_errno = errno;
+    if (mr) {
+        printf("[verbs-dmabuf-probe] ibv_reg_dmabuf_mr dummy call unexpectedly "
+               "succeeded; treating DMA-BUF as available\n");
+        ibv_dereg_mr(mr);
+        return true;
+    }
+
+    if (saved_errno == EOPNOTSUPP || saved_errno == EPROTONOSUPPORT) {
+        printf("[verbs-dmabuf-probe] NOT_SUPPORTED errno=%d %s\n",
+               saved_errno, strerror(saved_errno));
+        return false;
+    }
+
+    printf("[verbs-dmabuf-probe] available; dummy fd=-1 failed with errno=%d "
+           "%s\n",
+           saved_errno, strerror(saved_errno));
+    return true;
+}
+
+static DmaBufResult try_reg_dmabuf_mr(ibv_pd* pd,
+                                      IbvRegDmabufMrFn reg_dmabuf_mr,
+                                      bool verbs_dmabuf_supported,
+                                      const char* label, CUdeviceptr ptr,
+                                      size_t length) {
+    if (!reg_dmabuf_mr) {
+        printf("[%s] ibv_reg_dmabuf_mr SKIP: symbol missing\n", label);
+        return {false, false, false, 0, CUDA_SUCCESS, "symbol"};
+    }
+    if (!verbs_dmabuf_supported) {
+        printf("[%s] ibv_reg_dmabuf_mr SKIP: verbs DMA-BUF unsupported\n",
+               label);
+        return {false, false, false, 0, CUDA_SUCCESS, "verbs-probe"};
+    }
+
+    CUmemorytype mem_type;
+    CUresult rc =
+        cuPointerGetAttribute(&mem_type, CU_POINTER_ATTRIBUTE_MEMORY_TYPE, ptr);
+    if (rc == CUDA_SUCCESS) {
+        printf("[%s] CUDA pointer memory_type=%s\n", label,
+               mem_type_name(mem_type));
+    } else {
+        printf("[%s] cuPointerGetAttribute MEMORY_TYPE failed: %s (%d); "
+               "continuing with cuMemGetAddressRange\n",
+               label, cuda_name(rc), (int)rc);
+    }
+
+    CUdeviceptr alloc_base = 0;
+    size_t alloc_size = 0;
+    rc = cuMemGetAddressRange(&alloc_base, &alloc_size, ptr);
+    if (rc != CUDA_SUCCESS) {
+        printf("[%s] cuMemGetAddressRange FAIL addr=%p len=%zu cuda=%s (%d)\n",
+               label, (void*)ptr, length, cuda_name(rc), (int)rc);
+        return {true, false, false, 0, rc, "address-range"};
+    }
+
+    uint64_t offset = (uint64_t)(ptr - alloc_base);
+    if (offset > alloc_size || length > alloc_size - offset) {
+        printf("[%s] allocation range mismatch addr=%p len=%zu base=%p "
+               "alloc_size=%zu offset=%llu\n",
+               label, (void*)ptr, length, (void*)alloc_base, alloc_size,
+               (unsigned long long)offset);
+        return {true, false, false, EINVAL, CUDA_SUCCESS, "address-range"};
+    }
+
+    int dmabuf_fd = -1;
+    rc = cuMemGetHandleForAddressRange(
+        (void*)&dmabuf_fd, alloc_base, alloc_size,
+        CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
+    if (rc != CUDA_SUCCESS) {
+        printf("[%s] cuMemGetHandleForAddressRange DMA_BUF_FD FAIL base=%p "
+               "alloc_size=%zu cuda=%s (%d)\n",
+               label, (void*)alloc_base, alloc_size, cuda_name(rc), (int)rc);
+        return {true, false, false, 0, rc, "dmabuf-export"};
+    }
+
+    int access = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
+                 IBV_ACCESS_REMOTE_WRITE;
+    errno = 0;
+    ibv_mr* mr =
+        reg_dmabuf_mr(pd, offset, length, (uintptr_t)ptr, dmabuf_fd, access);
+    int saved_errno = errno;
+    if (close(dmabuf_fd) != 0) {
+        fprintf(stderr, "[%s] close(dmabuf_fd) failed: errno=%d %s\n", label,
+                errno, strerror(errno));
+    }
+
+    if (mr) {
+        printf("[%s] ibv_reg_dmabuf_mr OK addr=%p len=%zu base=%p "
+               "alloc_size=%zu offset=%llu lkey=0x%x rkey=0x%x\n",
+               label, (void*)ptr, length, (void*)alloc_base, alloc_size,
+               (unsigned long long)offset, mr->lkey, mr->rkey);
+        if (ibv_dereg_mr(mr) != 0) {
+            fprintf(stderr, "[%s] ibv_dereg_mr failed: errno=%d %s\n", label,
+                    errno, strerror(errno));
+        }
+        return {true, true, true, 0, CUDA_SUCCESS, "register"};
+    }
+
+    printf("[%s] ibv_reg_dmabuf_mr FAIL addr=%p len=%zu base=%p "
+           "alloc_size=%zu offset=%llu errno=%d %s\n",
+           label, (void*)ptr, length, (void*)alloc_base, alloc_size,
+           (unsigned long long)offset, saved_errno, strerror(saved_errno));
+    return {true, true, false, saved_errno, CUDA_SUCCESS, "register"};
+}
+
+static void print_reg_summary(const char* label, const RegResult& result) {
+    if (!result.attempted) {
+        printf("  %-44s SKIP\n", label);
+    } else if (result.ok) {
+        printf("  %-44s OK\n", label);
+    } else {
+        printf("  %-44s FAIL errno=%d %s\n", label, result.err,
+               strerror(result.err));
+    }
+}
+
+static void print_dmabuf_summary(const char* label,
+                                 const DmaBufResult& result) {
+    if (!result.attempted) {
+        printf("  %-44s SKIP stage=%s\n", label, result.stage);
+    } else if (result.reg_ok) {
+        printf("  %-44s OK\n", label);
+    } else if (!result.export_ok) {
+        if (result.err != 0) {
+            printf("  %-44s FAIL stage=%s errno=%d %s\n", label,
+                   result.stage, result.err, strerror(result.err));
+        } else {
+            printf("  %-44s FAIL stage=%s cuda=%s (%d)\n", label,
+                   result.stage, cuda_name(result.cuda_err),
+                   (int)result.cuda_err);
+        }
+    } else {
+        printf("  %-44s FAIL stage=%s errno=%d %s\n", label, result.stage,
+               result.err, strerror(result.err));
+    }
 }
 
 static ibv_context* open_rdma_device(const char* requested_name) {
@@ -96,7 +280,8 @@ static ibv_context* open_rdma_device(const char* requested_name) {
             }
         }
         if (!selected) {
-            fprintf(stderr, "requested IB_DEV=%s not found. Available:", requested_name);
+            fprintf(stderr, "requested IB_DEV=%s not found. Available:",
+                    requested_name);
             for (int i = 0; i < num_devices; ++i) {
                 fprintf(stderr, " %s", ibv_get_device_name(devices[i]));
             }
@@ -137,7 +322,8 @@ static bool all_devices_support_fabric() {
                                   CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED,
                                   dev);
         if (rc != CUDA_SUCCESS || !supported) {
-            fprintf(stderr, "CUDA device %d does not support FABRIC handles\n", i);
+            fprintf(stderr, "CUDA device %d does not support FABRIC handles\n",
+                    i);
             return false;
         }
     }
@@ -197,7 +383,8 @@ static HostNumaAllocation alloc_host_numa_fabric(size_t requested_size,
     }
 
     cuMemRelease(handle);
-    printf("Allocated HOST_NUMA fabric VMM addr=%p size=%zu granularity=%zu numa_node=%d\n",
+    printf("Allocated HOST_NUMA fabric VMM addr=%p size=%zu granularity=%zu "
+           "numa_node=%d\n",
            (void*)addr, size, granularity, numa_node);
     return {addr, size};
 }
@@ -239,15 +426,18 @@ int main(int argc, char** argv) {
     void* host = nullptr;
     if (posix_memalign(&host, 4096, size) != 0 || !host) {
         fprintf(stderr, "posix_memalign failed\n");
+        ibv_dealloc_pd(pd);
+        ibv_close_device(rdma_ctx);
         return 14;
     }
     memset(host, 0x5a, size);
-    RegResult host_result = try_reg_mr(pd, "ordinary-host", host, size);
+    RegResult host_result =
+        try_reg_mr(pd, "ordinary-host/legacy-ibv_reg_mr", host, size);
     free(host);
     if (!host_result.ok) {
         fprintf(stderr,
                 "Baseline ordinary host memory registration failed; RDMA stack "
-                "is not healthy enough to validate HOST_NUMA.\n");
+                "is not healthy enough to validate CUDA memory.\n");
         ibv_dealloc_pd(pd);
         ibv_close_device(rdma_ctx);
         return 20;
@@ -259,46 +449,89 @@ int main(int argc, char** argv) {
     CUcontext cuda_ctx;
     die_cuda(cuCtxCreate(&cuda_ctx, 0, cuda_device), "cuCtxCreate");
 
+    int device_dmabuf_supported = 0;
+    CUresult attr_rc =
+        cuDeviceGetAttribute(&device_dmabuf_supported,
+                             CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED,
+                             cuda_device);
+    if (attr_rc == CUDA_SUCCESS) {
+        printf("[cuda-device] CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED=%d\n",
+               device_dmabuf_supported);
+    } else {
+        printf("[cuda-device] CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED query "
+               "failed: %s (%d)\n",
+               cuda_name(attr_rc), (int)attr_rc);
+    }
+
+    IbvRegDmabufMrFn reg_dmabuf_mr = load_ibv_reg_dmabuf_mr();
+    bool verbs_dmabuf_supported = probe_ibv_dmabuf(pd, reg_dmabuf_mr);
+
+    RegResult hbm_legacy_result;
+    DmaBufResult hbm_dmabuf_result;
     CUdeviceptr dptr = 0;
     CUresult dalloc = cuMemAlloc(&dptr, size);
     if (dalloc == CUDA_SUCCESS) {
-        RegResult device_result =
-            try_reg_mr(pd, "cuda-device-gpudirect-optional", (void*)dptr, size);
-        printf("[cuda-device-gpudirect-optional] result is informational; "
-               "success depends on GPUDirect RDMA / nvidia-peermem support.\n");
-        (void)device_result;
+        hbm_legacy_result =
+            try_reg_mr(pd, "cuda-hbm/legacy-ibv_reg_mr", (void*)dptr, size);
+        hbm_dmabuf_result =
+            try_reg_dmabuf_mr(pd, reg_dmabuf_mr, verbs_dmabuf_supported,
+                              "cuda-hbm/dmabuf", dptr, size);
         cuMemFree(dptr);
     } else {
-        printf("[cuda-device-gpudirect-optional] cuMemAlloc skipped: %s (%d)\n",
-               cuda_name(dalloc), (int)dalloc);
+        printf("[cuda-hbm] cuMemAlloc skipped: %s (%d)\n", cuda_name(dalloc),
+               (int)dalloc);
     }
 
     if (!all_devices_support_fabric()) {
-        fprintf(stderr, "HOST_NUMA fabric allocation is unsupported here; cannot validate ibv_reg_mr behavior.\n");
+        fprintf(stderr,
+                "HOST_NUMA fabric allocation is unsupported here; cannot "
+                "validate HOST_NUMA registration behavior.\n");
         cuCtxDestroy(cuda_ctx);
         ibv_dealloc_pd(pd);
         ibv_close_device(rdma_ctx);
         return 30;
     }
 
-    HostNumaAllocation host_numa =
-        alloc_host_numa_fabric(size, numa_node);
-    RegResult host_numa_result =
-        try_reg_mr(pd, "cuda-host-numa-fabric-vmm", (void*)host_numa.addr,
-                   host_numa.size);
+    HostNumaAllocation host_numa = alloc_host_numa_fabric(size, numa_node);
+    RegResult host_numa_legacy_result =
+        try_reg_mr(pd, "cuda-host-numa-fabric/legacy-ibv_reg_mr",
+                   (void*)host_numa.addr, host_numa.size);
+    DmaBufResult host_numa_dmabuf_result =
+        try_reg_dmabuf_mr(pd, reg_dmabuf_mr, verbs_dmabuf_supported,
+                          "cuda-host-numa-fabric/dmabuf", host_numa.addr,
+                          host_numa.size);
     free_host_numa_fabric(host_numa);
 
     cuCtxDestroy(cuda_ctx);
     ibv_dealloc_pd(pd);
     ibv_close_device(rdma_ctx);
 
-    if (host_numa_result.ok) {
-        printf("RESULT: HOST_NUMA fabric VMM memory DID register with ibv_reg_mr on this system.\n");
-        return 40;
-    }
+    printf("\nSUMMARY:\n");
+    print_reg_summary("ordinary host legacy ibv_reg_mr", host_result);
+    print_reg_summary("HBM legacy ibv_reg_mr", hbm_legacy_result);
+    print_dmabuf_summary("HBM DMA-BUF ibv_reg_dmabuf_mr",
+                         hbm_dmabuf_result);
+    print_reg_summary("HOST_NUMA legacy ibv_reg_mr",
+                      host_numa_legacy_result);
+    print_dmabuf_summary("HOST_NUMA DMA-BUF ibv_reg_dmabuf_mr",
+                         host_numa_dmabuf_result);
 
-    printf("RESULT: CONFIRMED - ordinary host memory registered, but HOST_NUMA fabric VMM memory failed ibv_reg_mr with errno=%d (%s).\n",
-           host_numa_result.err, strerror(host_numa_result.err));
+    if (host_numa_dmabuf_result.reg_ok) {
+        printf("RESULT: HOST_NUMA fabric VMM memory can be registered through "
+               "DMA-BUF on this system.\n");
+    } else if (host_numa_dmabuf_result.attempted &&
+               !host_numa_dmabuf_result.export_ok) {
+        printf("RESULT: HOST_NUMA fabric VMM memory could not export a DMA-BUF "
+               "fd on this system.\n");
+    } else if (host_numa_dmabuf_result.attempted) {
+        printf("RESULT: HOST_NUMA fabric VMM memory exported a DMA-BUF fd, but "
+               "ibv_reg_dmabuf_mr failed on this system.\n");
+    } else {
+        printf("RESULT: HOST_NUMA DMA-BUF validation was skipped; see probe "
+               "output above.\n");
+    }
+    printf("NOTE: legacy ibv_reg_mr failures for CUDA UVA are expected when "
+           "nvidia-peermem is absent and do not disprove DMA-BUF GDR.\n");
     return 0;
 }
 CPP
@@ -316,7 +549,7 @@ echo "Compiling $BIN"
 "$CXX" -std=c++17 -O2 -Wall -Wextra \
   -I"$CUDA_INC" \
   "$SRC" -o "$BIN" \
-  "${CUDA_LIBS[@]}" -lcuda -libverbs
+  "${CUDA_LIBS[@]}" -lcuda -libverbs -ldl
 
 SIZE_BYTES=$((SIZE_MB * 1024 * 1024))
 echo "Running: SIZE_MB=$SIZE_MB HOST_NUMA_NODE=$HOST_NUMA_NODE CUDA_DEVICE=$CUDA_DEVICE IB_DEV=${IB_DEV:-<auto>}"

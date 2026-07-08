@@ -202,23 +202,35 @@ static DmaBufResult try_reg_dmabuf_mr(ibv_pd* pd,
         return {true, false, false, 0, rc, "address-range"};
     }
 
-    uint64_t offset = (uint64_t)(ptr - alloc_base);
-    if (offset > alloc_size || length > alloc_size - offset) {
-        printf("[%s] allocation range mismatch addr=%p len=%zu base=%p "
-               "alloc_size=%zu offset=%llu\n",
-               label, (void*)ptr, length, (void*)alloc_base, alloc_size,
-               (unsigned long long)offset);
-        return {true, false, false, EINVAL, CUDA_SUCCESS, "address-range"};
+    bool cuda_host_pointer = rc == CUDA_SUCCESS && mem_type == CU_MEMORYTYPE_HOST;
+    CUdeviceptr export_base = alloc_base;
+    size_t export_size = alloc_size;
+    uint64_t offset = 0;
+    if (cuda_host_pointer) {
+        export_base = ptr;
+        export_size = length;
+        printf("[%s] CUDA HOST pointer: using original mapped range for "
+               "DMA-BUF export addr=%p len=%zu\n",
+               label, (void*)export_base, export_size);
+    } else {
+        offset = (uint64_t)(ptr - alloc_base);
+        if (offset > alloc_size || length > alloc_size - offset) {
+            printf("[%s] allocation range mismatch addr=%p len=%zu base=%p "
+                   "alloc_size=%zu offset=%llu\n",
+                   label, (void*)ptr, length, (void*)alloc_base, alloc_size,
+                   (unsigned long long)offset);
+            return {true, false, false, EINVAL, CUDA_SUCCESS, "address-range"};
+        }
     }
 
     int dmabuf_fd = -1;
     rc = cuMemGetHandleForAddressRange(
-        (void*)&dmabuf_fd, alloc_base, alloc_size,
+        (void*)&dmabuf_fd, export_base, export_size,
         CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
     if (rc != CUDA_SUCCESS) {
         printf("[%s] cuMemGetHandleForAddressRange DMA_BUF_FD FAIL base=%p "
                "alloc_size=%zu cuda=%s (%d)\n",
-               label, (void*)alloc_base, alloc_size, cuda_name(rc), (int)rc);
+               label, (void*)export_base, export_size, cuda_name(rc), (int)rc);
         return {true, false, false, 0, rc, "dmabuf-export"};
     }
 
@@ -236,7 +248,7 @@ static DmaBufResult try_reg_dmabuf_mr(ibv_pd* pd,
     if (mr) {
         printf("[%s] ibv_reg_dmabuf_mr OK addr=%p len=%zu base=%p "
                "alloc_size=%zu offset=%llu lkey=0x%x rkey=0x%x\n",
-               label, (void*)ptr, length, (void*)alloc_base, alloc_size,
+               label, (void*)ptr, length, (void*)export_base, export_size,
                (unsigned long long)offset, mr->lkey, mr->rkey);
         if (ibv_dereg_mr(mr) != 0) {
             fprintf(stderr, "[%s] ibv_dereg_mr failed: errno=%d %s\n", label,
@@ -247,7 +259,7 @@ static DmaBufResult try_reg_dmabuf_mr(ibv_pd* pd,
 
     printf("[%s] ibv_reg_dmabuf_mr FAIL addr=%p len=%zu base=%p "
            "alloc_size=%zu offset=%llu errno=%d %s\n",
-           label, (void*)ptr, length, (void*)alloc_base, alloc_size,
+           label, (void*)ptr, length, (void*)export_base, export_size,
            (unsigned long long)offset, saved_errno, strerror(saved_errno));
     return {true, true, false, saved_errno, CUDA_SUCCESS, "register"};
 }

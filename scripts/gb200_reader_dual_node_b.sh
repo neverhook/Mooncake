@@ -161,6 +161,7 @@ ctx = ctypes.c_void_p()
 check_cuda(cuda.cuCtxCreate_v2(ctypes.byref(ctx), 0, device.value), "cuCtxCreate_v2")
 hbm_ptr = ctypes.c_ulonglong(0)
 registered = False
+store = None
 
 try:
     check_cuda(cuda.cuMemAlloc_v2(ctypes.byref(hbm_ptr), size), "cuMemAlloc_v2")
@@ -215,11 +216,16 @@ try:
     }, flush=True)
 finally:
     try:
-        if registered:
+        if registered and store is not None:
             rc = store.unregister_buffer(hbm_ptr.value)
             if rc != 0:
                 print(f"warning: unregister_buffer failed rc={rc}", file=sys.stderr, flush=True)
     finally:
+        if store is not None:
+            rc = store.tearDownAll()
+            if rc != 0:
+                print(f"warning: tearDownAll failed rc={rc}", file=sys.stderr, flush=True)
+            store = None
         if hbm_ptr.value:
             cuda.cuMemFree_v2(hbm_ptr.value)
         if ctx.value:

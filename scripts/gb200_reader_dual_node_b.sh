@@ -38,6 +38,7 @@ export GLOBAL_SEGMENT_SIZE_MB LOCAL_BUFFER_SIZE_MB PROTOCOL CUDA_DEVICE
 
 exec sh "$REPO/scripts/gb200_env_exec.sh" "$PYTHON_BIN" - <<'PY'
 import ctypes
+import gc
 import hashlib
 import os
 import sys
@@ -70,14 +71,17 @@ cuda.cuInit.argtypes = [ctypes.c_uint]
 cuda.cuInit.restype = ctypes.c_int
 cuda.cuDeviceGet.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int]
 cuda.cuDeviceGet.restype = ctypes.c_int
-cuda.cuCtxCreate_v2.argtypes = [
+cuda.cuDevicePrimaryCtxRetain.argtypes = [
     ctypes.POINTER(ctypes.c_void_p),
-    ctypes.c_uint,
     ctypes.c_int,
 ]
-cuda.cuCtxCreate_v2.restype = ctypes.c_int
-cuda.cuCtxDestroy_v2.argtypes = [ctypes.c_void_p]
-cuda.cuCtxDestroy_v2.restype = ctypes.c_int
+cuda.cuDevicePrimaryCtxRetain.restype = ctypes.c_int
+cuda.cuDevicePrimaryCtxRelease.argtypes = [ctypes.c_int]
+cuda.cuDevicePrimaryCtxRelease.restype = ctypes.c_int
+cuda.cuCtxSetCurrent.argtypes = [ctypes.c_void_p]
+cuda.cuCtxSetCurrent.restype = ctypes.c_int
+cuda.cuCtxSynchronize.argtypes = []
+cuda.cuCtxSynchronize.restype = ctypes.c_int
 cuda.cuMemAlloc_v2.argtypes = [ctypes.POINTER(ctypes.c_ulonglong), ctypes.c_size_t]
 cuda.cuMemAlloc_v2.restype = ctypes.c_int
 cuda.cuMemFree_v2.argtypes = [ctypes.c_ulonglong]
@@ -158,7 +162,10 @@ check_cuda(cuda.cuInit(0), "cuInit")
 device = ctypes.c_int()
 check_cuda(cuda.cuDeviceGet(ctypes.byref(device), cuda_device), "cuDeviceGet")
 ctx = ctypes.c_void_p()
-check_cuda(cuda.cuCtxCreate_v2(ctypes.byref(ctx), 0, device.value), "cuCtxCreate_v2")
+# RDMA DMA-BUF registration uses CUDA primary context internally; allocate the
+# destination HBM from the same context instead of a private driver context.
+check_cuda(cuda.cuDevicePrimaryCtxRetain(ctypes.byref(ctx), device.value), "cuDevicePrimaryCtxRetain")
+check_cuda(cuda.cuCtxSetCurrent(ctx), "cuCtxSetCurrent")
 hbm_ptr = ctypes.c_ulonglong(0)
 registered = False
 store = None
@@ -201,6 +208,8 @@ try:
     if read_size != size:
         raise RuntimeError(f"get_into returned {read_size}, expected {size}")
 
+    check_cuda(cuda.cuCtxSetCurrent(ctx), "cuCtxSetCurrent after get_into")
+    check_cuda(cuda.cuCtxSynchronize(), "cuCtxSynchronize after get_into")
     host = (ctypes.c_ubyte * size)()
     check_cuda(cuda.cuMemcpyDtoH_v2(host, hbm_ptr.value, size), "cuMemcpyDtoH_v2")
     actual = hashlib.sha256(bytes(host)).hexdigest()
@@ -222,12 +231,17 @@ finally:
                 print(f"warning: unregister_buffer failed rc={rc}", file=sys.stderr, flush=True)
     finally:
         if store is not None:
-            rc = store.tearDownAll()
-            if rc != 0:
-                print(f"warning: tearDownAll failed rc={rc}", file=sys.stderr, flush=True)
+            # Python binding exposes close(), which maps to RealClient teardown.
+            close = getattr(store, "close", None)
+            if callable(close):
+                rc = close()
+                if rc != 0:
+                    print(f"warning: close failed rc={rc}", file=sys.stderr, flush=True)
             store = None
+            gc.collect()
         if hbm_ptr.value:
+            cuda.cuCtxSetCurrent(ctx)
             cuda.cuMemFree_v2(hbm_ptr.value)
         if ctx.value:
-            cuda.cuCtxDestroy_v2(ctx)
+            cuda.cuDevicePrimaryCtxRelease(device.value)
 PY

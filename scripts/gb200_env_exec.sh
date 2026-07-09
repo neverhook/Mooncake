@@ -8,7 +8,7 @@ set -eu
 REPO=${REPO:-/workspace/Mooncake}
 BUILD=${BUILD:-"$REPO/build-gb200"}
 DOMAIN=${DOMAIN:-gb200-nvl}
-RDMA_DEVICES=${RDMA_DEVICES:-auto-discovery}
+RDMA_DEVICES=${RDMA_DEVICES:-mlx5_0,mlx5_1,mlx5_4,mlx5_5}
 KEY=${KEY:-dual_nvlink_rdma_real_path}
 SIZE_MB=${SIZE_MB:-256}
 

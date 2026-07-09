@@ -812,10 +812,16 @@ int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
 
 int NvlinkTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
 #ifdef ENABLE_MULTI_PROTOCOL
-    return metadata_->removeLocalMemoryBuffer(addr, update_metadata, "nvlink");
+    int rc = metadata_->removeLocalMemoryBuffer(addr, update_metadata, "nvlink");
 #else
-    return metadata_->removeLocalMemoryBuffer(addr, update_metadata);
+    int rc = metadata_->removeLocalMemoryBuffer(addr, update_metadata);
 #endif
+    // Local transfer buffers may be usable by NVLink without being exportable
+    // or recorded in metadata; cleanup should match that registration path.
+    if (rc == ERR_ADDRESS_NOT_REGISTERED && !update_metadata) {
+        return 0;
+    }
+    return rc;
 }
 
 int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,

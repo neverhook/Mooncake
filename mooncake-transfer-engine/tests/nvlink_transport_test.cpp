@@ -105,6 +105,7 @@ struct HostNumaFabricMemoryDeleter {
 class TestableNvlinkTransport : public NvlinkTransport {
    public:
     using NvlinkTransport::install;
+    using NvlinkTransport::unregisterLocalMemory;
 };
 
 ::testing::AssertionResult copyHostToCudaVisibleMemory(void* dst,
@@ -216,6 +217,23 @@ TEST(NvlinkTransportTest, InstallPreservesExistingMultiProtocolLocalSegment) {
     EXPECT_EQ(merged_desc->rdma_server_name, "10.192.9.60:12355");
     ASSERT_EQ(merged_desc->devices.size(), 1u);
     EXPECT_EQ(merged_desc->devices[0].name, "mlx5_0");
+#endif
+}
+
+TEST(NvlinkTransportTest,
+     LocalTransferBufferUnregisterIgnoresMissingNvlinkMetadata) {
+#ifndef ENABLE_MULTI_PROTOCOL
+    GTEST_SKIP() << "ENABLE_MULTI_PROTOCOL is not compiled in";
+#else
+    auto metadata = std::make_shared<TransferMetadata>(P2PHANDSHAKE);
+    const std::string local_server_name = "dual-reader:12355";
+
+    TestableNvlinkTransport transport;
+    std::string install_name = local_server_name;
+    ASSERT_EQ(transport.install(install_name, metadata, nullptr), 0);
+
+    std::vector<char> local_buffer(4096);
+    EXPECT_EQ(transport.unregisterLocalMemory(local_buffer.data(), false), 0);
 #endif
 }
 

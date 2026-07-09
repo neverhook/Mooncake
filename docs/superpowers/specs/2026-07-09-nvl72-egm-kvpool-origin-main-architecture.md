@@ -49,6 +49,9 @@ called out three production boundaries that this spec adopts:
   failed transfer over RDMA.
 - Keep transfer decisions local and ephemeral. `selected_protocol` is a result
   of one worker-side candidate decision; it is not persistent replica metadata.
+- Preserve upstream code style and naming unless a semantic boundary genuinely
+  changes. Avoid broad renames, comment churn, or validation-only helper names
+  in production code.
 - Keep the first patch set narrow: transport capability, metadata extension,
   worker candidate selection, and validation.
 
@@ -123,12 +126,59 @@ The local provider must:
 The export is provider lifecycle work. It belongs to segment mount or memory
 pool initialization, not object read.
 
+### NUMA and export-device sharding
+
+Provider-side EGM pool allocation must preserve both CPU NUMA locality and
+fabric-route balance. A production GB200 node should not publish one large
+HOST_NUMA allocation exported through one CUDA device if the node has multiple
+NUMA domains and multiple GPUs capable of serving the fabric path.
+
+The provider should split the pool in two dimensions:
+
+1. split by CPU NUMA node, so each backing allocation is local to the CPU socket
+   and attached Grace memory that owns it
+2. split again by export device inside that NUMA domain, so fabric traffic does
+   not converge on a single GPU
+
+For example, on a GB200 node with two NUMA domains and two GPUs per NUMA domain,
+a 600 GB DRAM contribution should be modeled as four shards:
+
+| Shard | NUMA node | Export device | Size |
+|---|---:|---|---:|
+| 0 | 0 | GPU local to NUMA 0 | 150 GB |
+| 1 | 0 | other GPU local to NUMA 0 | 150 GB |
+| 2 | 1 | GPU local to NUMA 1 | 150 GB |
+| 3 | 1 | other GPU local to NUMA 1 | 150 GB |
+
+Each shard should have its own buffer descriptor or subsegment descriptor with
+`memory_kind=HOST_NUMA`, `scale_up_domain_id`, `numa_node`, export-device
+identity, base address, length, and fabric handle. Allocation, CPU page touch,
+RDMA registration, and fabric export should stay within the shard's NUMA
+domain. Cross-UPI placement is a correctness and performance smell, not merely
+a scheduler preference.
+
+Mooncake already has pieces of this model: host buffer allocation can be
+NUMA-segmented, topology code prefers same-NUMA HCAs, and the current GB200
+validation harness can choose one `MC_NVLINK_HOST_NUMA_NODE`. The missing
+production piece is explicit export-device sharding inside each NUMA domain and
+metadata that lets readers understand which export device backs a shard.
+
+The allocator should balance new objects across `(numa_node, export_device)`
+shards while preserving locality. A reader in the same scale-up domain may also
+prefer a shard whose export device is closest to the destination GPU when the
+topology layer can answer that question.
+
 ### Metadata extensions
 
 Extend `TransferMetadata::BufferDesc` minimally:
 
 - `memory_kind`: empty for legacy, `HOST_NUMA` for EGM pool buffers
 - `scale_up_domain_id`: configured NVL72 scale-up domain id
+- `numa_node`: provider-local NUMA node for HOST_NUMA shards
+- `export_device_id` or `export_device_pci_bus_id`: CUDA device that exported
+  the fabric handle. Serialized metadata should prefer a stable identity such
+  as PCI bus id; local CUDA ordinal can remain a runtime convenience.
+- `shard_id` or descriptor generation when needed for cache invalidation
 - existing `shm_name`: serialized fabric handle for `nvlink`
 
 The existing `protocol` field remains transport-specific. A dual-registered
@@ -213,6 +263,25 @@ The candidate helper should return an explicit reason for rejecting NVLink, for
 example domain mismatch, destination is not HBM, remote memory is not
 `HOST_NUMA`, mapping prewarm failed, or transport is disabled. These reasons
 are required for debugging and for deciding whether RDMA fallback is expected.
+
+### H2H and host-destination reads
+
+Mooncake has host-destination read paths: `get_into` can target host memory, and
+the current store code distinguishes device destinations from host destinations
+before selecting an EGM candidate. That boundary should remain explicit in the
+production design.
+
+The first EGM fast path is remote HOST_NUMA DRAM to local HBM. For H2H reads
+such as remote HOST_NUMA DRAM to local host memory, the selector should not
+choose `nvlink` by default. It should choose RDMA when the remote buffer
+advertises RDMA, or the existing CPU/host fallback path when RDMA is not
+available.
+
+Do not treat CPU visibility of a mapped fabric range as sufficient proof that
+H2H over NVLink is a supported fast path. If a future implementation needs
+EGM-backed H2H, add an explicit capability such as `cpu_accessible` or
+`egm_host_visible`, define the copy primitive, and add separate tests for host
+destination behavior. It should not reuse the HBM-only selector rule.
 
 ### Transport submission
 
@@ -328,6 +397,9 @@ Performance reports must distinguish:
 - HOST_NUMA fabric allocation grants CPU and GPU access.
 - `NvlinkTransport` exports HOST_NUMA fabric metadata.
 - imported mapping cleanup uses local mapped base and length.
+- provider EGM pool sharding creates one descriptor per
+  `(numa_node, export_device)` shard.
+- shard metadata carries NUMA node and stable export-device identity.
 - scale-up-domain mismatch rejects NVLink before import.
 - explicit prewarm populates mapping cache and subsequent relocate is cache-only.
 
@@ -336,6 +408,8 @@ Performance reports must distinguish:
 - same-domain HOST_NUMA + HBM destination selects `nvlink`.
 - different-domain HOST_NUMA + HBM destination selects `rdma`.
 - non-HBM destination does not incorrectly select NVLink EGM.
+- H2H host-destination reads select RDMA or existing host fallback, not the
+  HBM-only EGM path.
 - RDMA-only compatibility is unchanged.
 - existing `SelectBestReplica` behavior for local memory, NOF, LOCAL_DISK, and
   DISK remains unchanged.
@@ -346,6 +420,9 @@ Performance reports must distinguish:
 - dual-node same-domain: selected `nvlink`, warm reads faster than cold reads.
 - dual-node different-domain: selected `rdma`.
 - RDMA backend RNIC allowlist avoids cross-plane connection failures.
+- NUMA/export-device sharding: a 600 GB GB200 node contribution is published as
+  four 150 GB local shards on a two-NUMA, four-GPU node, with no cross-UPI page
+  placement in the expected steady state.
 - cleanup emits no CUDA unmap/address-free errors.
 
 ## Migration From Current Branch
@@ -365,18 +442,24 @@ Rework before production:
 - avoid baking validation-only scripts into production APIs
 - move EGM remote import/map to explicit prewarm/lifecycle APIs
 - keep dual-protocol fallback at selector or higher retry layer
+- replace single-node HOST_NUMA validation knobs with production NUMA and
+  export-device shard metadata
 - reduce branch delta by starting from `origin/main` and landing the feature in
   small slices
 
 ## Recommended Implementation Slices
 
-1. `NvlinkTransport` HOST_NUMA metadata and cleanup hardening.
+1. `NvlinkTransport` HOST_NUMA metadata, cleanup hardening, and stable
+   export-device identity.
 2. Explicit NVLink remote mapping prewarm/cache API.
-3. Minimal metadata fields: `memory_kind` and `scale_up_domain_id`.
-4. Store candidate selector extension with selected protocol output.
-5. Dual-protocol EGM/RDMA mount path.
-6. GB200 validation scripts and docs.
-7. Production metrics for cold/warm transfer phases.
+3. Provider EGM shard allocator: split by NUMA node and export device.
+4. Minimal metadata fields: `memory_kind`, `scale_up_domain_id`, `numa_node`,
+   and export-device identity.
+5. Store candidate selector extension with selected protocol output and H2H
+   rejection reasons.
+6. Dual-protocol EGM/RDMA mount path.
+7. GB200 validation scripts and docs.
+8. Production metrics for cold/warm transfer phases.
 
 This ordering proves the EGM transport premise before changing broad Store
 selection behavior, and it keeps RDMA fallback isolated from NVLink transport

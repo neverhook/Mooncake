@@ -31,10 +31,13 @@ GLOBAL_SEGMENT_SIZE_MB=${GLOBAL_SEGMENT_SIZE_MB:-0}
 LOCAL_BUFFER_SIZE_MB=${LOCAL_BUFFER_SIZE_MB:-0}
 PROTOCOL=${PROTOCOL:-nvlink,rdma}
 CUDA_DEVICE=${CUDA_DEVICE:-0}
+GET_WARMUP=${GET_WARMUP:-0}
+GET_REPEAT=${GET_REPEAT:-1}
 PYTHON_BIN=${PYTHON:-python3}
 
 export REPO NODE_B_IP TRANSFER_PORT LOCAL_HOSTNAME SIZE_MB
 export GLOBAL_SEGMENT_SIZE_MB LOCAL_BUFFER_SIZE_MB PROTOCOL CUDA_DEVICE
+export GET_WARMUP GET_REPEAT
 
 exec sh "$REPO/scripts/gb200_env_exec.sh" "$PYTHON_BIN" - <<'PY'
 import ctypes
@@ -123,6 +126,22 @@ def timed_call(name, fn, *args):
         mark_latency(name, start_ns)
 
 
+def mib_per_sec(byte_count, elapsed_ms):
+    if elapsed_ms <= 0:
+        return None
+    return (byte_count / MB) / (elapsed_ms / 1000)
+
+
+def summarize_ms(values):
+    if not values:
+        return {}
+    return {
+        "min_ms": min(values),
+        "max_ms": max(values),
+        "avg_ms": sum(values) / len(values),
+    }
+
+
 def expected_digest(size):
     pattern = bytes(((i * 131 + 17) & 0xFF) for i in range(256))
     chunk = pattern * 4096
@@ -165,6 +184,12 @@ protocol = os.environ.get("PROTOCOL", "nvlink,rdma")
 rdma_devices = os.environ.get("RDMA_DEVICES", "auto-discovery")
 expected_path = os.environ.get("EXPECTED_PATH", "")
 cuda_device = getenv_int("CUDA_DEVICE", 0)
+get_warmup = getenv_int("GET_WARMUP", 0)
+get_repeat = getenv_int("GET_REPEAT", 1)
+if get_warmup < 0:
+    raise RuntimeError("GET_WARMUP must be >= 0")
+if get_repeat < 1:
+    raise RuntimeError("GET_REPEAT must be >= 1")
 
 print("reader_config", {
     "local_hostname": local_hostname,
@@ -176,6 +201,8 @@ print("reader_config", {
     "cuda_device": cuda_device,
     "expected_path": expected_path,
     "scale_up_domain_id": os.environ.get("MC_NVLINK_SCALE_UP_DOMAIN_ID", ""),
+    "get_warmup": get_warmup,
+    "get_repeat": get_repeat,
 }, flush=True)
 
 check_cuda(timed_call("cuda_init_ms", cuda.cuInit, 0), "cuInit")
@@ -201,6 +228,8 @@ hbm_ptr = ctypes.c_ulonglong(0)
 registered = False
 store = None
 selected_protocol = ""
+warmup_get_into_ms = []
+measured_get_into_ms = []
 
 try:
     check_cuda(
@@ -244,11 +273,43 @@ try:
         raise RuntimeError(f"register_buffer failed rc={rc}")
     registered = True
 
-    get_into_start_ns = time.perf_counter_ns()
-    read_size = store.get_into(key, hbm_ptr.value, size)
-    mark_latency("get_into_ms", get_into_start_ns)
-    if read_size != size:
-        raise RuntimeError(f"get_into returned {read_size}, expected {size}")
+    def run_get_into(phase, iteration):
+        get_into_start_ns = time.perf_counter_ns()
+        read_size = store.get_into(key, hbm_ptr.value, size)
+        get_into_ms = (time.perf_counter_ns() - get_into_start_ns) / 1_000_000
+        if read_size != size:
+            raise RuntimeError(
+                f"{phase} get_into returned {read_size}, expected {size}"
+            )
+        transfer_mib_s = mib_per_sec(size, get_into_ms)
+        print("reader_iteration_latency", {
+            "phase": phase,
+            "iteration": iteration,
+            "selected_protocol": selected_protocol,
+            "bytes": size,
+            "get_into_ms": round(get_into_ms, 3),
+            "transfer_mib_s": (
+                None if transfer_mib_s is None else round(transfer_mib_s, 2)
+            ),
+        }, flush=True)
+        return get_into_ms
+
+    for iteration in range(get_warmup):
+        warmup_get_into_ms.append(run_get_into("warmup", iteration))
+
+    for iteration in range(get_repeat):
+        measured_get_into_ms.append(run_get_into("measured", iteration))
+
+    timings_ms["get_into_ms"] = measured_get_into_ms[0]
+    measured_summary = summarize_ms(measured_get_into_ms)
+    warmup_summary = summarize_ms(warmup_get_into_ms)
+    if warmup_get_into_ms:
+        timings_ms["cold_get_into_ms"] = warmup_get_into_ms[0]
+    else:
+        timings_ms["cold_get_into_ms"] = measured_get_into_ms[0]
+    timings_ms["measured_get_into_avg_ms"] = measured_summary["avg_ms"]
+    timings_ms["measured_get_into_min_ms"] = measured_summary["min_ms"]
+    timings_ms["measured_get_into_max_ms"] = measured_summary["max_ms"]
 
     check_cuda(
         timed_call("cuda_ctx_reset_current_ms", cuda.cuCtxSetCurrent, ctx),
@@ -271,10 +332,7 @@ try:
     if actual != expected:
         raise RuntimeError(f"payload sha256 mismatch: expected={expected} actual={actual}")
 
-    transfer_ms = timings_ms.get("get_into_ms", 0)
-    transfer_mib_s = None
-    if transfer_ms > 0:
-        transfer_mib_s = (size / MB) / (transfer_ms / 1000)
+    transfer_mib_s = mib_per_sec(size, measured_summary["avg_ms"])
     print("reader_ok", {
         "key": key,
         "bytes": size,
@@ -285,9 +343,24 @@ try:
     print("reader_latency", {
         "selected_protocol": selected_protocol,
         "bytes": size,
+        "warmup_reads": get_warmup,
+        "measured_reads": get_repeat,
         "transfer_mib_s": (
             None if transfer_mib_s is None else round(transfer_mib_s, 2)
         ),
+        "cold_get_into_ms": round(timings_ms["cold_get_into_ms"], 3),
+        "warmup_get_into_ms": [
+            round(value, 3) for value in warmup_get_into_ms
+        ],
+        "measured_get_into_ms": [
+            round(value, 3) for value in measured_get_into_ms
+        ],
+        "measured_get_into_summary": {
+            name: round(value, 3) for name, value in measured_summary.items()
+        },
+        "warmup_get_into_summary": {
+            name: round(value, 3) for name, value in warmup_summary.items()
+        },
         "latency_ms": {
             name: round(value, 3) for name, value in timings_ms.items()
         },

@@ -42,6 +42,7 @@ import gc
 import hashlib
 import os
 import sys
+import time
 
 try:
     from mooncake.store import MooncakeDistributedStore
@@ -106,6 +107,22 @@ def check_cuda(rc, what):
         raise RuntimeError(f"{what} failed: {cuda_name(rc)} ({rc})")
 
 
+reader_start_ns = time.perf_counter_ns()
+timings_ms = {}
+
+
+def mark_latency(name, start_ns):
+    timings_ms[name] = (time.perf_counter_ns() - start_ns) / 1_000_000
+
+
+def timed_call(name, fn, *args):
+    start_ns = time.perf_counter_ns()
+    try:
+        return fn(*args)
+    finally:
+        mark_latency(name, start_ns)
+
+
 def expected_digest(size):
     pattern = bytes(((i * 131 + 17) & 0xFF) for i in range(256))
     chunk = pattern * 4096
@@ -115,7 +132,10 @@ def expected_digest(size):
         digest.update(chunk)
         remaining -= len(chunk)
     if remaining:
-        digest.update((pattern * (remaining // len(pattern))) + pattern[: remaining % len(pattern)])
+        digest.update(
+            (pattern * (remaining // len(pattern))) +
+            pattern[: remaining % len(pattern)]
+        )
     return digest.hexdigest()
 
 
@@ -158,23 +178,40 @@ print("reader_config", {
     "scale_up_domain_id": os.environ.get("MC_NVLINK_SCALE_UP_DOMAIN_ID", ""),
 }, flush=True)
 
-check_cuda(cuda.cuInit(0), "cuInit")
+check_cuda(timed_call("cuda_init_ms", cuda.cuInit, 0), "cuInit")
 device = ctypes.c_int()
-check_cuda(cuda.cuDeviceGet(ctypes.byref(device), cuda_device), "cuDeviceGet")
+check_cuda(
+    timed_call("cuda_device_get_ms", cuda.cuDeviceGet,
+               ctypes.byref(device), cuda_device),
+    "cuDeviceGet",
+)
 ctx = ctypes.c_void_p()
 # RDMA DMA-BUF registration uses CUDA primary context internally; allocate the
 # destination HBM from the same context instead of a private driver context.
-check_cuda(cuda.cuDevicePrimaryCtxRetain(ctypes.byref(ctx), device.value), "cuDevicePrimaryCtxRetain")
-check_cuda(cuda.cuCtxSetCurrent(ctx), "cuCtxSetCurrent")
+check_cuda(
+    timed_call("cuda_primary_ctx_retain_ms", cuda.cuDevicePrimaryCtxRetain,
+               ctypes.byref(ctx), device.value),
+    "cuDevicePrimaryCtxRetain",
+)
+check_cuda(
+    timed_call("cuda_ctx_set_current_ms", cuda.cuCtxSetCurrent, ctx),
+    "cuCtxSetCurrent",
+)
 hbm_ptr = ctypes.c_ulonglong(0)
 registered = False
 store = None
+selected_protocol = ""
 
 try:
-    check_cuda(cuda.cuMemAlloc_v2(ctypes.byref(hbm_ptr), size), "cuMemAlloc_v2")
+    check_cuda(
+        timed_call("cuda_mem_alloc_ms", cuda.cuMemAlloc_v2,
+                   ctypes.byref(hbm_ptr), size),
+        "cuMemAlloc_v2",
+    )
     print("reader_hbm_alloc", {"ptr": hex(hbm_ptr.value), "bytes": size}, flush=True)
 
     store = MooncakeDistributedStore()
+    setup_start_ns = time.perf_counter_ns()
     rc = store.setup(
         local_hostname,
         metadata_server,
@@ -184,6 +221,7 @@ try:
         rdma_devices,
         master_server,
     )
+    mark_latency("setup_ms", setup_start_ns)
     if rc != 0:
         raise RuntimeError(f"reader setup failed rc={rc}")
 
@@ -199,49 +237,120 @@ try:
             f"selected protocol mismatch: expected={expected_path} actual={selected_protocol}"
         )
 
+    register_start_ns = time.perf_counter_ns()
     rc = store.register_buffer(hbm_ptr.value, size)
+    mark_latency("register_buffer_ms", register_start_ns)
     if rc != 0:
         raise RuntimeError(f"register_buffer failed rc={rc}")
     registered = True
 
+    get_into_start_ns = time.perf_counter_ns()
     read_size = store.get_into(key, hbm_ptr.value, size)
+    mark_latency("get_into_ms", get_into_start_ns)
     if read_size != size:
         raise RuntimeError(f"get_into returned {read_size}, expected {size}")
 
-    check_cuda(cuda.cuCtxSetCurrent(ctx), "cuCtxSetCurrent after get_into")
-    check_cuda(cuda.cuCtxSynchronize(), "cuCtxSynchronize after get_into")
+    check_cuda(
+        timed_call("cuda_ctx_reset_current_ms", cuda.cuCtxSetCurrent, ctx),
+        "cuCtxSetCurrent after get_into",
+    )
+    check_cuda(
+        timed_call("cuda_sync_ms", cuda.cuCtxSynchronize),
+        "cuCtxSynchronize after get_into",
+    )
     host = (ctypes.c_ubyte * size)()
-    check_cuda(cuda.cuMemcpyDtoH_v2(host, hbm_ptr.value, size), "cuMemcpyDtoH_v2")
+    check_cuda(
+        timed_call("dtoh_ms", cuda.cuMemcpyDtoH_v2,
+                   host, hbm_ptr.value, size),
+        "cuMemcpyDtoH_v2",
+    )
+    hash_start_ns = time.perf_counter_ns()
     actual = hashlib.sha256(bytes(host)).hexdigest()
     expected = expected_digest(size)
+    mark_latency("verify_hash_ms", hash_start_ns)
     if actual != expected:
         raise RuntimeError(f"payload sha256 mismatch: expected={expected} actual={actual}")
 
+    transfer_ms = timings_ms.get("get_into_ms", 0)
+    transfer_mib_s = None
+    if transfer_ms > 0:
+        transfer_mib_s = (size / MB) / (transfer_ms / 1000)
     print("reader_ok", {
         "key": key,
         "bytes": size,
         "selected_protocol": selected_protocol,
         "sha256": actual,
     }, flush=True)
+    timings_ms["total_ms"] = (time.perf_counter_ns() - reader_start_ns) / 1_000_000
+    print("reader_latency", {
+        "selected_protocol": selected_protocol,
+        "bytes": size,
+        "transfer_mib_s": (
+            None if transfer_mib_s is None else round(transfer_mib_s, 2)
+        ),
+        "latency_ms": {
+            name: round(value, 3) for name, value in timings_ms.items()
+        },
+    }, flush=True)
 finally:
+    cleanup_start_ns = time.perf_counter_ns()
     try:
         if registered and store is not None:
+            timed_call("cleanup_ctx_set_current_before_unregister_ms",
+                       cuda.cuCtxSetCurrent, ctx)
+            unregister_start_ns = time.perf_counter_ns()
             rc = store.unregister_buffer(hbm_ptr.value)
+            mark_latency("unregister_buffer_ms", unregister_start_ns)
             if rc != 0:
-                print(f"warning: unregister_buffer failed rc={rc}", file=sys.stderr, flush=True)
+                print(
+                    f"warning: unregister_buffer failed rc={rc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
     finally:
         if store is not None:
             # Python binding exposes close(), which maps to RealClient teardown.
             close = getattr(store, "close", None)
             if callable(close):
+                timed_call("cleanup_ctx_set_current_before_close_ms",
+                           cuda.cuCtxSetCurrent, ctx)
+                close_start_ns = time.perf_counter_ns()
                 rc = close()
+                mark_latency("close_ms", close_start_ns)
                 if rc != 0:
-                    print(f"warning: close failed rc={rc}", file=sys.stderr, flush=True)
+                    print(
+                        f"warning: close failed rc={rc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
             store = None
             gc.collect()
         if hbm_ptr.value:
-            cuda.cuCtxSetCurrent(ctx)
-            cuda.cuMemFree_v2(hbm_ptr.value)
+            timed_call("cleanup_ctx_set_current_before_free_ms",
+                       cuda.cuCtxSetCurrent, ctx)
+            timed_call("cuda_mem_free_ms", cuda.cuMemFree_v2, hbm_ptr.value)
         if ctx.value:
-            cuda.cuDevicePrimaryCtxRelease(device.value)
+            timed_call("cuda_primary_ctx_release_ms",
+                       cuda.cuDevicePrimaryCtxRelease, device.value)
+        mark_latency("cleanup_total_ms", cleanup_start_ns)
+        timings_ms["total_with_cleanup_ms"] = (
+            time.perf_counter_ns() - reader_start_ns
+        ) / 1_000_000
+        print("reader_cleanup_latency", {
+            "selected_protocol": selected_protocol,
+            "bytes": size,
+            "latency_ms": {
+                name: round(value, 3)
+                for name, value in timings_ms.items()
+                if name.startswith("cleanup_") or
+                name in (
+                    "unregister_buffer_ms",
+                    "close_ms",
+                    "cuda_mem_free_ms",
+                    "cuda_primary_ctx_release_ms",
+                    "cleanup_total_ms",
+                    "total_with_cleanup_ms",
+                )
+            },
+        }, flush=True)
 PY

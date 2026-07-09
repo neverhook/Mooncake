@@ -349,6 +349,21 @@ static void freeVmmMappedMemory(void *ptr) {
     cuMemRelease(handle);
 }
 
+static void freeImportedVmmMapping(void *ptr, size_t size) {
+    if (!ptr || size == 0) return;
+
+    auto unmap_result = cuMemUnmap((CUdeviceptr)ptr, size);
+    if (unmap_result != CUDA_SUCCESS) {
+        LOG(ERROR) << "NvlinkTransport: cuMemUnmap failed: "
+                   << unmap_result;
+    }
+    auto free_result = cuMemAddressFree((CUdeviceptr)ptr, size);
+    if (free_result != CUDA_SUCCESS) {
+        LOG(ERROR) << "NvlinkTransport: cuMemAddressFree failed: "
+                   << free_result;
+    }
+}
+
 static bool isHostNumaAllocation(CUmemGenericAllocationHandle handle) {
 #ifdef USE_CUDA
     CUmemAllocationProp prop = {};
@@ -447,7 +462,8 @@ NvlinkTransport::NvlinkTransport() : use_fabric_mem_(supportFabricMem()) {}
 NvlinkTransport::~NvlinkTransport() {
     if (use_fabric_mem_) {
         for (auto &entry : remap_entries_) {
-            freeVmmMappedMemory(entry.second.shm_addr);
+            freeImportedVmmMapping(entry.second.shm_addr,
+                                   entry.second.length);
         }
     } else {
         for (auto &entry : remap_entries_) {

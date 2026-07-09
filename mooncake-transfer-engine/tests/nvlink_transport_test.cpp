@@ -102,6 +102,11 @@ struct HostNumaFabricMemoryDeleter {
     }
 };
 
+class TestableNvlinkTransport : public NvlinkTransport {
+   public:
+    using NvlinkTransport::install;
+};
+
 ::testing::AssertionResult copyHostToCudaVisibleMemory(void* dst,
                                                        const void* src,
                                                        size_t length) {
@@ -200,7 +205,7 @@ TEST(NvlinkTransportTest, InstallPreservesExistingMultiProtocolLocalSegment) {
                                         std::move(rdma_desc)),
               0);
 
-    NvlinkTransport transport;
+    TestableNvlinkTransport transport;
     std::string install_name = local_server_name;
     ASSERT_EQ(transport.install(install_name, metadata, nullptr), 0);
 

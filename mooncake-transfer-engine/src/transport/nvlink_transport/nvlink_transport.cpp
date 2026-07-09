@@ -25,6 +25,7 @@
 #include <iomanip>
 #include <limits>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "common.h"
@@ -77,6 +78,28 @@ struct CudaEventNVLinkRAII {
 };
 
 static thread_local CudaEventNVLinkRAII tl_nvlink_sync_event;
+
+bool hasProtocol(const std::string &protocols, const std::string &protocol) {
+    size_t start = 0;
+    while (start <= protocols.size()) {
+        const size_t end = protocols.find(',', start);
+        const std::string token =
+            protocols.substr(start, end == std::string::npos
+                                        ? std::string::npos
+                                        : end - start);
+        if (token == protocol) return true;
+        if (end == std::string::npos) break;
+        start = end + 1;
+    }
+    return false;
+}
+
+void appendProtocolIfMissing(std::string &protocols,
+                             const std::string &protocol) {
+    if (hasProtocol(protocols, protocol)) return;
+    if (!protocols.empty()) protocols += ",";
+    protocols += protocol;
+}
 
 static std::vector<CUmemAccessDesc> buildCudaDeviceAccessDescs(
     int device_count) {
@@ -440,10 +463,19 @@ int NvlinkTransport::install(std::string &local_server_name,
     metadata_ = metadata;
     local_server_name_ = local_server_name;
 
+#ifdef ENABLE_MULTI_PROTOCOL
+    auto desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID, false);
+    if (!desc) desc = std::make_shared<SegmentDesc>();
+#else
     auto desc = std::make_shared<SegmentDesc>();
+#endif
     if (!desc) return ERR_MEMORY;
     desc->name = local_server_name_;
+#ifdef ENABLE_MULTI_PROTOCOL
+    appendProtocolIfMissing(desc->protocol, "nvlink");
+#else
     desc->protocol = "nvlink";
+#endif
     metadata_->addLocalSegment(LOCAL_SEGMENT_ID, local_server_name_,
                                std::move(desc));
     return 0;

@@ -177,6 +177,43 @@ struct HostNumaFabricMemoryDeleter {
 
 }  // namespace
 
+TEST(NvlinkTransportTest, InstallPreservesExistingMultiProtocolLocalSegment) {
+#ifndef ENABLE_MULTI_PROTOCOL
+    GTEST_SKIP() << "ENABLE_MULTI_PROTOCOL is not compiled in";
+#else
+    auto metadata = std::make_shared<TransferMetadata>(P2PHANDSHAKE);
+    const std::string local_server_name = "dual-provider:12355";
+
+    auto rdma_desc = std::make_shared<TransferMetadata::SegmentDesc>();
+    ASSERT_NE(rdma_desc, nullptr);
+    rdma_desc->name = local_server_name;
+    rdma_desc->protocol = "rdma";
+    rdma_desc->rdma_server_name = "10.192.9.60:12355";
+
+    TransferMetadata::DeviceDesc device;
+    device.name = "mlx5_0";
+    device.lid = 1;
+    device.gid = "0000:0000:0000:0000:0000:ffff:0a00:0001";
+    rdma_desc->devices.push_back(device);
+
+    ASSERT_EQ(metadata->addLocalSegment(LOCAL_SEGMENT_ID, local_server_name,
+                                        std::move(rdma_desc)),
+              0);
+
+    NvlinkTransport transport;
+    std::string install_name = local_server_name;
+    ASSERT_EQ(transport.install(install_name, metadata, nullptr), 0);
+
+    auto merged_desc = metadata->getSegmentDescByID(LOCAL_SEGMENT_ID, false);
+    ASSERT_NE(merged_desc, nullptr);
+    EXPECT_EQ(merged_desc->name, local_server_name);
+    EXPECT_EQ(merged_desc->protocol, "rdma,nvlink");
+    EXPECT_EQ(merged_desc->rdma_server_name, "10.192.9.60:12355");
+    ASSERT_EQ(merged_desc->devices.size(), 1u);
+    EXPECT_EQ(merged_desc->devices[0].name, "mlx5_0");
+#endif
+}
+
 TEST(NvlinkTransportTest, HostNumaFabricRegistrationMetadata) {
 #if !defined(USE_CUDA) || !defined(USE_MNNVL)
     GTEST_SKIP() << "CUDA MNNVL support is not compiled in";

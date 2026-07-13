@@ -72,6 +72,9 @@ class NvlinkVmmAllocation {
         std::function<CUresult(CUmemGenericAllocationHandle)> mem_release;
         std::function<CUresult(CUmemGenericAllocationHandle*, void*)>
             mem_retain_allocation_handle;
+        std::function<CUresult(CUmemAllocationProp*,
+                               CUmemGenericAllocationHandle)>
+            mem_get_allocation_properties_from_handle;
         std::function<CUresult(CUdeviceptr*, size_t*, CUdeviceptr)>
             mem_get_address_range;
         std::function<CUresult(void*, CUmemGenericAllocationHandle,

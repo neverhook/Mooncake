@@ -518,6 +518,10 @@ NvlinkVmmAllocation::DriverApi NvlinkVmmAllocation::ProductionDriverApi() {
                                           void* ptr) {
         return cuMemRetainAllocationHandle(handle, ptr);
     };
+    api.mem_get_allocation_properties_from_handle =
+        [](CUmemAllocationProp* prop, CUmemGenericAllocationHandle handle) {
+            return cuMemGetAllocationPropertiesFromHandle(prop, handle);
+        };
     api.mem_get_address_range = [](CUdeviceptr* base, size_t* size,
                                    CUdeviceptr ptr) {
         return cuMemGetAddressRange(base, size, ptr);
@@ -1576,6 +1580,7 @@ int NvlinkTransport::registerLocalMemory(void* addr, size_t length,
     } else {
 #if defined(USE_MNNVL) && defined(USE_CUDA)
         if (!fabric_driver_api_.mem_retain_allocation_handle ||
+            !fabric_driver_api_.mem_get_allocation_properties_from_handle ||
             !fabric_driver_api_.mem_get_address_range ||
             !fabric_driver_api_.mem_export_to_shareable_handle ||
             !fabric_driver_api_.mem_release) {
@@ -1605,15 +1610,51 @@ int NvlinkTransport::registerLocalMemory(void* addr, size_t length,
         registration.retained_handle_owned = true;
         registration.retained_handle = static_cast<uint64_t>(handle);
 
+        CUmemAllocationProp allocation_prop = {};
+        result = fabric_driver_api_.mem_get_allocation_properties_from_handle(
+            &allocation_prop, handle);
+        if (result != CUDA_SUCCESS) {
+            LOG(ERROR) << "NvlinkTransport: "
+                          "cuMemGetAllocationPropertiesFromHandle failed: "
+                       << result;
+            fabric_driver_api_.mem_release(handle);
+            return ERR_MEMORY;
+        }
+        const bool is_host_numa =
+            allocation_prop.location.type == CU_MEM_LOCATION_TYPE_HOST_NUMA;
+
         CUdeviceptr real_address = 0;
         size_t real_size = 0;
         result = fabric_driver_api_.mem_get_address_range(
             &real_address, &real_size, reinterpret_cast<CUdeviceptr>(addr));
         if (result != CUDA_SUCCESS) {
-            LOG(ERROR) << "NvlinkTransport: cuMemGetAddressRange failed: "
-                       << result;
-            fabric_driver_api_.mem_release(handle);
-            return ERR_MEMORY;
+            if (!is_host_numa) {
+                LOG(ERROR) << "NvlinkTransport: cuMemGetAddressRange failed: "
+                           << result;
+                fabric_driver_api_.mem_release(handle);
+                return ERR_MEMORY;
+            }
+
+            // CUDA's legacy address-range query may reject HOST_NUMA VMM
+            // mappings even though retaining and exporting their allocation
+            // handle is supported. Store registers the exact base and aligned
+            // length owned by NvlinkVmmAllocation, so preserve that complete
+            // mapping instead of guessing a page size.
+            LOG(WARNING) << "NvlinkTransport: cuMemGetAddressRange failed for "
+                            "HOST_NUMA VMM allocation: "
+                         << result
+                         << "; using exact registered mapping addr=" << addr
+                         << " length=" << length;
+            real_address = reinterpret_cast<CUdeviceptr>(addr);
+            real_size = length;
+        } else if (real_address == 0 && is_host_numa) {
+            LOG(WARNING)
+                << "NvlinkTransport: cuMemGetAddressRange returned a null "
+                   "base for HOST_NUMA VMM allocation; using exact registered "
+                   "mapping addr="
+                << addr << " length=" << length;
+            real_address = reinterpret_cast<CUdeviceptr>(addr);
+            real_size = length;
         }
         const uint64_t requested = reinterpret_cast<uint64_t>(addr);
         const uint64_t real = static_cast<uint64_t>(real_address);

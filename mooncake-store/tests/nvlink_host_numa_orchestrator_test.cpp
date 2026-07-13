@@ -90,8 +90,9 @@ class FakeOperations final : public NvlinkHostNumaOperations {
         const size_t id = local_allocation == nullptr
                               ? 0
                               : AllocationId(local_allocation->base());
-        (void)Record(Operation::kInstallAllocator, id,
-                     configured_local_length != 0, "allocator");
+        const bool fail = Record(Operation::kInstallAllocator, id,
+                                 configured_local_length != 0, "allocator");
+        if (fail) return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         allocator_installed_ = true;
         return {};
     }
@@ -391,6 +392,29 @@ TEST(NvlinkHostNumaOrchestratorTest,
     const size_t destroy = operations.EventIndex(Operation::kDestroy);
     EXPECT_LT(unregister, release);
     EXPECT_LT(release, destroy);
+    ExpectNoPublishedOrOwnedState(operations, state);
+}
+
+TEST(NvlinkHostNumaOrchestratorTest,
+     AllocatorViewFailureDestroysOwnersWithoutPublishing) {
+    FakeOperations operations;
+    operations.Fail(Operation::kInstallAllocator, {1});
+    State state;
+
+    auto setup = RunSetup(operations, state, PlanWithChunks(2), 4096);
+    ASSERT_FALSE(setup);
+    EXPECT_EQ(setup.error().error, ErrorCode::INTERNAL_ERROR);
+    EXPECT_EQ(setup.error().stage,
+              NvlinkHostNumaOrchestrationStage::kRegistration);
+    EXPECT_FALSE(operations.allocator_installed());
+    EXPECT_FALSE(state.allocator_installed);
+    EXPECT_EQ(operations.Count(Operation::kRegister), 0U);
+    EXPECT_EQ(operations.Count(Operation::kMount), 0U);
+    EXPECT_EQ(operations.live_allocations().size(), 3U);
+
+    ASSERT_TRUE(Cleanup(operations, state));
+    EXPECT_EQ(operations.Count(Operation::kReleaseAllocator), 0U);
+    EXPECT_EQ(operations.Count(Operation::kDestroy), 3U);
     ExpectNoPublishedOrOwnedState(operations, state);
 }
 

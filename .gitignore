@@ -209,3 +209,6 @@ core_*
 # MacOS
 .DS_Store
 .envrc
+
+# Local GB200 cluster validation configuration
+/gb200.conf

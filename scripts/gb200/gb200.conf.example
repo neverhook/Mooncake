@@ -1,0 +1,46 @@
+# Copy this file to the same absolute path on both GB200 nodes and edit the
+# three REQUIRED values.  Values containing spaces must remain quoted.
+
+# REQUIRED: Node A runs Master + HOST_NUMA Provider; Node B runs HBM Consumers.
+NODE_A_IP="CHANGE_ME"
+NODE_B_IP="CHANGE_ME"
+RUN_ID="gb200-CHANGE_ME"
+
+# Build and result locations. REPO_ROOT defaults to the checkout containing
+# gb200.sh, so normally only BUILD_DIR needs to match the build command.
+BUILD_DIR="/workspace/Mooncake/build-nvlink-host-numa"
+RESULT_ROOT="/tmp/mooncake-gb200"
+
+# Control-plane and process endpoints.
+MASTER_RPC_PORT=50051
+MASTER_ADMIN_PORT=9003
+METADATA_PORT=8079
+PROVIDER_PORT=12345
+CONSUMER_PORT_BASE=12400
+
+# HOST_NUMA pool and validation settings.
+GLOBAL_SEGMENT_SIZE="600 GB"
+LOCAL_BUFFER_SIZE="0"
+HOST_NUMA_NODES="auto"
+MC_MAX_MR_SIZE_BYTES=161061273600
+MC_IMEX_DAEMON_EXTERNAL=0
+MC_CUDART_LIBRARY=""
+
+# Consumer/benchmark defaults.
+DEVICES="0,1,2,3"
+PAYLOAD_SIZES="4096,1048576,16777216"
+ITERATIONS=4
+SINGLE_PAYLOAD_SIZE=16777216
+
+# Build and process wait policy.
+RUN_HARDWARE_TESTS=1
+SKIP_PREFLIGHT=0
+BUILD_JOBS=""
+CMAKE_EXTRA_ARGS=""
+MASTER_START_TIMEOUT_SEC=30
+PROVIDER_READINESS_TIMEOUT_SEC=120
+PROVIDER_DIAGNOSTIC_DELAY_SEC=5
+
+# Add nonstandard system library paths here. Inherited PYTHONPATH and
+# LD_LIBRARY_PATH are deliberately ignored to prevent stale-build loading.
+EXTRA_LD_LIBRARY_PATH=""

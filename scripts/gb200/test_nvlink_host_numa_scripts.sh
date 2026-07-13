@@ -5,11 +5,68 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 preflight="${repo_root}/scripts/gb200/nvlink_host_numa_preflight.sh"
 build_script="${repo_root}/scripts/gb200/nvlink_host_numa_build.sh"
+wrapper="${repo_root}/scripts/gb200/gb200.sh"
+config_example="${repo_root}/scripts/gb200/gb200.conf.example"
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 
 bash -n "$preflight"
 bash -n "$build_script"
+bash -n "$wrapper"
+"$wrapper" --help | grep -Fq 'print-config'
+
+config="${tmp_dir}/gb200.conf"
+sed \
+  -e 's/NODE_A_IP="CHANGE_ME"/NODE_A_IP="192.0.2.10"/' \
+  -e 's/NODE_B_IP="CHANGE_ME"/NODE_B_IP="192.0.2.11"/' \
+  -e 's/RUN_ID="gb200-CHANGE_ME"/RUN_ID="gb200-script-test"/' \
+  -e "s|BUILD_DIR=\"/workspace/Mooncake/build-nvlink-host-numa\"|BUILD_DIR=\"${tmp_dir}/chosen-build\"|" \
+  "$config_example" >"$config"
+
+resolved="${tmp_dir}/resolved.log"
+env NODE_A_IP=bad NODE_B_IP=bad RUN_ID=bad BUILD_DIR=/bad \
+  PYTHONPATH=/bad LD_LIBRARY_PATH=/bad \
+  "$wrapper" --config "$config" print-config >"$resolved"
+grep -Fq 'NODE_A_IP=192.0.2.10' "$resolved"
+grep -Fq 'NODE_B_IP=192.0.2.11' "$resolved"
+grep -Fq 'RUN_ID=gb200-script-test' "$resolved"
+grep -Fq "BUILD_DIR=${tmp_dir}/chosen-build" "$resolved"
+grep -Fq 'METADATA_SERVER=http://192.0.2.10:8079/metadata' "$resolved"
+grep -Fq 'MASTER_ADMIN_URL=http://192.0.2.10:9003' "$resolved"
+grep -Fq 'CONSUMER_HOSTNAME_PREFIX=192.0.2.11:1240' "$resolved"
+grep -Fq 'MC_FORCE_MNNVL=1' "$resolved"
+if grep -Fq '/bad' "$resolved"; then
+  printf 'wrapper inherited an ad-hoc shell environment variable\n' >&2
+  exit 1
+fi
+
+diagnostic_config="${tmp_dir}/diagnostic.conf"
+sed \
+  -e 's/NODE_A_IP="192.0.2.10"/NODE_A_IP="127.0.0.1"/' \
+  -e 's/MASTER_RPC_PORT=50051/MASTER_RPC_PORT=65430/' \
+  -e 's/MASTER_ADMIN_PORT=9003/MASTER_ADMIN_PORT=65431/' \
+  -e 's/METADATA_PORT=8079/METADATA_PORT=65432/' \
+  "$config" >"$diagnostic_config"
+diagnostic_log="${tmp_dir}/diagnostic.log"
+env -u ADMIN_URL -u MASTER_ADMIN_URL -u NODE_A_IP \
+  "$wrapper" --config "$diagnostic_config" diagnose >"$diagnostic_log" 2>&1
+grep -Fq 'GET http://127.0.0.1:65431/get_all_segments' "$diagnostic_log"
+grep -Fq 'GET http://127.0.0.1:65431/get_segments_detail' "$diagnostic_log"
+grep -Fq 'GET http://127.0.0.1:65431/query_segment?segment=127.0.0.1:12345' \
+  "$diagnostic_log"
+grep -Fq 'GET http://127.0.0.1:65431/query_segment?segment=127.0.0.1%3A12345' \
+  "$diagnostic_log"
+if grep -Eq 'No host part|failed to set query|Could not parse the URL' "$diagnostic_log"; then
+  printf 'diagnostics still depend on missing shell URL variables\n' >&2
+  exit 1
+fi
+
+placeholder_log="${tmp_dir}/placeholder.log"
+if "$wrapper" --config "$config_example" print-config >"$placeholder_log" 2>&1; then
+  printf 'wrapper unexpectedly accepted an unedited example config\n' >&2
+  exit 1
+fi
+grep -Eq 'NODE_[AB]_IP still contains CHANGE_ME' "$placeholder_log"
 
 non_strict_missing_log="${tmp_dir}/non-strict-missing-probe.log"
 if ! env -u MC_MNNVL_FABRIC_PROBE MC_REQUIRE_MNNVL_FABRIC=0 \

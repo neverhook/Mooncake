@@ -33,6 +33,11 @@ RUN_HARDWARE_TESTS=1 \
 scripts/gb200/nvlink_host_numa_build.sh
 ```
 
+The Fabric probe tests every online NUMA node discovered from the visible GPUs.
+Set `MC_NVLINK_HOST_NUMA_TEST_NODES=0,1` to override that discovery explicitly;
+the single-node `MC_NVLINK_HOST_NUMA_TEST_NODE` override remains available for
+focused diagnosis.
+
 Without `RUN_HARDWARE_TESTS=1`, the build script runs only the required unit
 label. JUnit files are written under `BUILD_DIR`; required hardware/RDMA suites
 must contain testcases and must report zero skipped tests.

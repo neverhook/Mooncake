@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <set>
@@ -41,6 +42,90 @@
 #include "transport/transport.h"
 
 namespace mooncake {
+
+#if defined(USE_MNNVL) && defined(USE_CUDA)
+struct FabricImportAudit {
+    std::atomic<bool> fail_next_map{true};
+    std::atomic<int> import_calls{0};
+    std::atomic<int> injected_map_failures{0};
+    std::atomic<int> live_handles{0};
+    std::atomic<int> live_reserved_ranges{0};
+    std::atomic<int> live_mappings{0};
+};
+
+class NvlinkTransportTestPeer {
+   public:
+    static void InstallOneShotMapFailure(
+        NvlinkTransport& transport,
+        const std::shared_ptr<FabricImportAudit>& audit) {
+        auto api = transport.fabric_driver_api_;
+        auto original_import = api.mem_import_from_shareable_handle;
+        auto original_reserve = api.mem_address_reserve;
+        auto original_map = api.mem_map;
+        auto original_unmap = api.mem_unmap;
+        auto original_free = api.mem_address_free;
+        auto original_release = api.mem_release;
+
+        api.mem_import_from_shareable_handle =
+            [audit, original_import](CUmemGenericAllocationHandle* handle,
+                                     void* shareable,
+                                     CUmemAllocationHandleType type) {
+                ++audit->import_calls;
+                const CUresult result =
+                    original_import(handle, shareable, type);
+                if (result == CUDA_SUCCESS) ++audit->live_handles;
+                return result;
+            };
+        api.mem_address_reserve =
+            [audit, original_reserve](CUdeviceptr* address, size_t size,
+                                      size_t alignment, CUdeviceptr requested,
+                                      unsigned long long flags) {
+                const CUresult result = original_reserve(
+                    address, size, alignment, requested, flags);
+                if (result == CUDA_SUCCESS) ++audit->live_reserved_ranges;
+                return result;
+            };
+        api.mem_map =
+            [audit, original_map](CUdeviceptr address, size_t size,
+                                  size_t offset,
+                                  CUmemGenericAllocationHandle handle,
+                                  unsigned long long flags) {
+                if (audit->fail_next_map.exchange(false)) {
+                    ++audit->injected_map_failures;
+                    return CUDA_ERROR_INVALID_VALUE;
+                }
+                const CUresult result =
+                    original_map(address, size, offset, handle, flags);
+                if (result == CUDA_SUCCESS) ++audit->live_mappings;
+                return result;
+            };
+        api.mem_unmap = [audit, original_unmap](CUdeviceptr address,
+                                                size_t size) {
+            const CUresult result = original_unmap(address, size);
+            if (result == CUDA_SUCCESS) --audit->live_mappings;
+            return result;
+        };
+        api.mem_address_free =
+            [audit, original_free](CUdeviceptr address, size_t size) {
+                const CUresult result = original_free(address, size);
+                if (result == CUDA_SUCCESS) --audit->live_reserved_ranges;
+                return result;
+            };
+        api.mem_release =
+            [audit, original_release](CUmemGenericAllocationHandle handle) {
+                const CUresult result = original_release(handle);
+                if (result == CUDA_SUCCESS) --audit->live_handles;
+                return result;
+            };
+        transport.fabric_driver_api_ = std::move(api);
+    }
+
+    static size_t MappingCount(const NvlinkTransport& transport) {
+        return transport.remap_entries_.size();
+    }
+};
+#endif
+
 namespace {
 
 constexpr size_t kTransferBytes = 1U << 20;
@@ -48,7 +133,7 @@ constexpr auto kTransferTimeout = std::chrono::seconds(30);
 
 struct HardwareSelection {
     std::vector<int> devices;
-    int numa_node = -1;
+    std::vector<int> numa_nodes;
     std::string source;
 };
 
@@ -78,6 +163,34 @@ bool ParseNonNegativeInt(const std::string& text, int& value) {
     } catch (...) {
         return false;
     }
+}
+
+bool ParseNumaNodeList(const std::string& text, std::vector<int>& nodes,
+                       std::string& error) {
+    if (text.empty()) {
+        error = "NUMA node list must not be empty";
+        return false;
+    }
+
+    std::set<int> unique_nodes;
+    std::stringstream input(text);
+    std::string token;
+    while (std::getline(input, token, ',')) {
+        int node = -1;
+        if (!ParseNonNegativeInt(token, node)) {
+            error =
+                "NUMA node list must contain comma-separated "
+                "non-negative integers";
+            return false;
+        }
+        unique_nodes.insert(node);
+    }
+    if (unique_nodes.empty()) {
+        error = "NUMA node list must contain at least one node";
+        return false;
+    }
+    nodes.assign(unique_nodes.begin(), unique_nodes.end());
+    return true;
 }
 
 bool IsOnlineNumaNode(int node, std::string& error) {
@@ -146,15 +259,37 @@ bool SelectHardware(HardwareSelection& selection, std::string& error) {
     for (int device = 0; device < device_count; ++device)
         selection.devices.push_back(device);
 
+    const char* override_nodes = std::getenv("MC_NVLINK_HOST_NUMA_TEST_NODES");
     const char* override_node = std::getenv("MC_NVLINK_HOST_NUMA_TEST_NODE");
-    if (override_node != nullptr && *override_node != '\0') {
-        if (!ParseNonNegativeInt(override_node, selection.numa_node)) {
+    const bool has_node_list =
+        override_nodes != nullptr && *override_nodes != '\0';
+    const bool has_single_node =
+        override_node != nullptr && *override_node != '\0';
+    if (has_node_list && has_single_node) {
+        error =
+            "set only one of MC_NVLINK_HOST_NUMA_TEST_NODES and "
+            "MC_NVLINK_HOST_NUMA_TEST_NODE";
+        return false;
+    }
+    if (has_node_list) {
+        if (!ParseNumaNodeList(override_nodes, selection.numa_nodes, error))
+            return false;
+        for (int node : selection.numa_nodes) {
+            if (!IsOnlineNumaNode(node, error)) return false;
+        }
+        selection.source = "MC_NVLINK_HOST_NUMA_TEST_NODES";
+        return true;
+    }
+    if (has_single_node) {
+        int node = -1;
+        if (!ParseNonNegativeInt(override_node, node)) {
             error =
                 "MC_NVLINK_HOST_NUMA_TEST_NODE must be a non-negative "
                 "integer";
             return false;
         }
-        if (!IsOnlineNumaNode(selection.numa_node, error)) return false;
+        if (!IsOnlineNumaNode(node, error)) return false;
+        selection.numa_nodes = {node};
         selection.source = "MC_NVLINK_HOST_NUMA_TEST_NODE";
         return true;
     }
@@ -169,7 +304,7 @@ bool SelectHardware(HardwareSelection& selection, std::string& error) {
         error = "visible GPU PCI sysfs discovery produced no online NUMA node";
         return false;
     }
-    selection.numa_node = *gpu_nodes.begin();
+    selection.numa_nodes.assign(gpu_nodes.begin(), gpu_nodes.end());
     selection.source = "visible GPU PCI sysfs";
     return true;
 }
@@ -413,156 +548,181 @@ TEST(NvlinkHostNumaFabricTest, CpuAllVisibleGpusAndColdWarmFabricPath) {
             "Fabric capability prerequisite failed: " + capability.ToString());
     }
 
-    NvlinkVmmAllocation::Options options;
-    options.location_type = NvlinkVmmAllocation::LocationType::HOST_NUMA;
-    options.location_id = hardware.numa_node;
-    options.requested_length = kTransferBytes;
-    options.fabric_exportable = true;
-
-    auto server = std::make_unique<TransferEngine>(false);
-    ASSERT_EQ(server->init(P2PHANDSHAKE, "127.0.0.1:0", "127.0.0.1", 0), 0);
-    ASSERT_NE(server->installTransport("nvlink", nullptr), nullptr);
-
-    std::unique_ptr<NvlinkVmmAllocation> allocation;
-    Status allocation_status = NvlinkVmmAllocation::Create(options, allocation);
-    if (!allocation_status.ok()) {
-        REQUIRE_FABRIC_OR_SKIP(
-            strict, "HOST_NUMA Fabric VMM allocation prerequisite failed on " +
-                        hardware.source + ": " + allocation_status.ToString());
+    ASSERT_FALSE(hardware.numa_nodes.empty());
+    std::ostringstream selected_nodes;
+    for (size_t index = 0; index < hardware.numa_nodes.size(); ++index) {
+        if (index != 0) selected_nodes << ',';
+        selected_nodes << hardware.numa_nodes[index];
     }
-    ASSERT_NE(allocation, nullptr);
-    ASSERT_NE(allocation->base(), nullptr);
-    ASSERT_GE(allocation->length(), kTransferBytes);
-    ASSERT_EQ(allocation->location_type(),
-              NvlinkVmmAllocation::LocationType::HOST_NUMA);
-    ASSERT_EQ(allocation->location_id(), hardware.numa_node);
-    ASSERT_TRUE(allocation->fabric_exportable());
-    ::testing::Test::RecordProperty("host_numa_node",
-                                    std::to_string(hardware.numa_node));
+    ::testing::Test::RecordProperty("host_numa_nodes", selected_nodes.str());
     ::testing::Test::RecordProperty("visible_gpu_count",
                                     std::to_string(hardware.devices.size()));
     ::testing::Test::RecordProperty("numa_selection_source", hardware.source);
 
-    auto* host_numa = static_cast<unsigned char*>(allocation->base());
-    const auto cpu_pattern = MakePattern(kTransferBytes, 0x21U);
-    std::copy(cpu_pattern.begin(), cpu_pattern.end(), host_numa);
-    ASSERT_TRUE(MatchesPattern(host_numa, cpu_pattern));
+    for (int numa_node : hardware.numa_nodes) {
+        SCOPED_TRACE("HOST_NUMA node " + std::to_string(numa_node));
 
-    RegisteredMemory server_registration(*server, allocation->base());
-    const int registration_result = server_registration.Register(
-        allocation->length(), "cpu:numa" + std::to_string(hardware.numa_node),
-        true);
-    if (registration_result != 0) {
-        REQUIRE_FABRIC_OR_SKIP(
-            strict,
-            "Fabric export/IMEX prerequisite failed during NVLink registration"
-            " (rc=" +
-                std::to_string(registration_result) + ")");
-    }
+        NvlinkVmmAllocation::Options options;
+        options.location_type = NvlinkVmmAllocation::LocationType::HOST_NUMA;
+        options.location_id = numa_node;
+        options.requested_length = kTransferBytes;
+        options.fabric_exportable = true;
 
-    auto local_desc =
-        server->getMetadata()->getSegmentDescByID(LOCAL_SEGMENT_ID, false);
-    ASSERT_NE(local_desc, nullptr);
-    bool exported = false;
-    for (const auto& buffer : local_desc->buffers) {
-        if (buffer.addr == reinterpret_cast<uint64_t>(allocation->base()) &&
-            buffer.length == allocation->length()) {
-            exported = !buffer.shm_name.empty();
-            break;
+        auto server = std::make_unique<TransferEngine>(false);
+        ASSERT_EQ(server->init(P2PHANDSHAKE, "127.0.0.1:0", "127.0.0.1", 0), 0);
+        ASSERT_NE(server->installTransport("nvlink", nullptr), nullptr);
+
+        std::unique_ptr<NvlinkVmmAllocation> allocation;
+        Status allocation_status =
+            NvlinkVmmAllocation::Create(options, allocation);
+        if (!allocation_status.ok()) {
+            REQUIRE_FABRIC_OR_SKIP(
+                strict,
+                "HOST_NUMA Fabric VMM allocation prerequisite failed on " +
+                    hardware.source + ": " + allocation_status.ToString());
         }
-    }
-    ASSERT_TRUE(exported)
-        << "remote registration must publish one serialized Fabric handle";
+        ASSERT_NE(allocation, nullptr);
+        ASSERT_NE(allocation->base(), nullptr);
+        ASSERT_GE(allocation->length(), kTransferBytes);
+        ASSERT_EQ(allocation->location_type(),
+                  NvlinkVmmAllocation::LocationType::HOST_NUMA);
+        ASSERT_EQ(allocation->location_id(), numa_node);
+        ASSERT_TRUE(allocation->fabric_exportable());
+
+        auto* host_numa = static_cast<unsigned char*>(allocation->base());
+        const auto cpu_pattern = MakePattern(kTransferBytes, 0x21U);
+        std::copy(cpu_pattern.begin(), cpu_pattern.end(), host_numa);
+        ASSERT_TRUE(MatchesPattern(host_numa, cpu_pattern));
+
+        RegisteredMemory server_registration(*server, allocation->base());
+        const int registration_result = server_registration.Register(
+            allocation->length(), "cpu:numa" + std::to_string(numa_node), true);
+        if (registration_result != 0) {
+            REQUIRE_FABRIC_OR_SKIP(strict,
+                                   "Fabric export/IMEX prerequisite failed "
+                                   "during NVLink registration"
+                                   " (rc=" +
+                                       std::to_string(registration_result) +
+                                       ")");
+        }
+
+        auto local_desc =
+            server->getMetadata()->getSegmentDescByID(LOCAL_SEGMENT_ID, false);
+        ASSERT_NE(local_desc, nullptr);
+        bool exported = false;
+        for (const auto& buffer : local_desc->buffers) {
+            if (buffer.addr == reinterpret_cast<uint64_t>(allocation->base()) &&
+                buffer.length == allocation->length()) {
+                exported = !buffer.shm_name.empty();
+                break;
+            }
+        }
+        ASSERT_TRUE(exported)
+            << "remote registration must publish one serialized Fabric handle";
 
     auto client = std::make_unique<TransferEngine>(false);
     ASSERT_EQ(client->init(P2PHANDSHAKE, "127.0.0.1:0", "127.0.0.1", 0), 0);
     ASSERT_NE(client->installTransport("nvlink", nullptr), nullptr);
+    auto* client_nvlink =
+        dynamic_cast<NvlinkTransport*>(client->getTransport("nvlink"));
+    ASSERT_NE(client_nvlink, nullptr);
+    auto import_audit = std::make_shared<FabricImportAudit>();
+    NvlinkTransportTestPeer::InstallOneShotMapFailure(*client_nvlink,
+                                                      import_audit);
     const SegmentID provider_segment =
         client->openSegment(server->getLocalIpAndPort());
-    ASSERT_NE(provider_segment, static_cast<SegmentID>(-1));
+        ASSERT_NE(provider_segment, static_cast<SegmentID>(-1));
 
-    bool cold_transfer_completed = false;
-    for (int device : hardware.devices) {
-        SCOPED_TRACE("visible CUDA device " + std::to_string(device));
-        ScopedCudaDevice current(device);
-        ASSERT_EQ(current.result(), cudaSuccess)
-            << cudaGetErrorString(current.result());
+        bool cold_transfer_completed = false;
+        for (int device : hardware.devices) {
+            SCOPED_TRACE("visible CUDA device " + std::to_string(device));
+            ScopedCudaDevice current(device);
+            ASSERT_EQ(current.result(), cudaSuccess)
+                << cudaGetErrorString(current.result());
 
-        CudaBuffer hbm(device);
-        ASSERT_EQ(hbm.Allocate(kTransferBytes), cudaSuccess);
-        ASSERT_NE(hbm.get(), nullptr);
+            CudaBuffer hbm(device);
+            ASSERT_EQ(hbm.Allocate(kTransferBytes), cudaSuccess);
+            ASSERT_NE(hbm.get(), nullptr);
 
-        RegisteredMemory client_registration(*client, hbm.get());
-        ASSERT_EQ(client_registration.Register(
-                      kTransferBytes, "cuda:" + std::to_string(device), false),
-                  0);
+            RegisteredMemory client_registration(*client, hbm.get());
+            ASSERT_EQ(
+                client_registration.Register(
+                    kTransferBytes, "cuda:" + std::to_string(device), false),
+                0);
 
-        // Direct copies prove that the owning CPU and every visible GPU have
-        // read/write access to the HOST_NUMA mapping.
-        const auto direct_to_hbm = MakePattern(kTransferBytes, 0x40U + device);
-        std::copy(direct_to_hbm.begin(), direct_to_hbm.end(), host_numa);
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        ASSERT_EQ(
-            cudaMemcpy(hbm.get(), host_numa, kTransferBytes, cudaMemcpyDefault),
-            cudaSuccess);
-        std::vector<unsigned char> observed(kTransferBytes);
-        ASSERT_EQ(cudaMemcpy(observed.data(), hbm.get(), kTransferBytes,
-                             cudaMemcpyDeviceToHost),
-                  cudaSuccess);
-        ASSERT_TRUE(MatchesPattern(observed.data(), direct_to_hbm));
+            // Direct copies prove that the owning CPU and every visible GPU
+            // have read/write access to the HOST_NUMA mapping.
+            const auto direct_to_hbm =
+                MakePattern(kTransferBytes, 0x40U + device);
+            std::copy(direct_to_hbm.begin(), direct_to_hbm.end(), host_numa);
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            ASSERT_EQ(cudaMemcpy(hbm.get(), host_numa, kTransferBytes,
+                                 cudaMemcpyDefault),
+                      cudaSuccess);
+            std::vector<unsigned char> observed(kTransferBytes);
+            ASSERT_EQ(cudaMemcpy(observed.data(), hbm.get(), kTransferBytes,
+                                 cudaMemcpyDeviceToHost),
+                      cudaSuccess);
+            ASSERT_TRUE(MatchesPattern(observed.data(), direct_to_hbm));
 
-        const auto direct_to_dram = MakePattern(kTransferBytes, 0x60U + device);
-        ASSERT_EQ(cudaMemcpy(hbm.get(), direct_to_dram.data(), kTransferBytes,
-                             cudaMemcpyHostToDevice),
-                  cudaSuccess);
-        ASSERT_EQ(
-            cudaMemcpy(host_numa, hbm.get(), kTransferBytes, cudaMemcpyDefault),
-            cudaSuccess);
-        ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
-        ASSERT_TRUE(MatchesPattern(host_numa, direct_to_dram));
+            const auto direct_to_dram =
+                MakePattern(kTransferBytes, 0x60U + device);
+            ASSERT_EQ(cudaMemcpy(hbm.get(), direct_to_dram.data(),
+                                 kTransferBytes, cudaMemcpyHostToDevice),
+                      cudaSuccess);
+            ASSERT_EQ(cudaMemcpy(host_numa, hbm.get(), kTransferBytes,
+                                 cudaMemcpyDefault),
+                      cudaSuccess);
+            ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+            ASSERT_TRUE(MatchesPattern(host_numa, direct_to_dram));
 
-        const auto write_pattern = MakePattern(kTransferBytes, 0x80U + device);
-        ASSERT_EQ(cudaMemcpy(hbm.get(), write_pattern.data(), kTransferBytes,
-                             cudaMemcpyHostToDevice),
-                  cudaSuccess);
-        const std::string write_error =
-            RunTransfer(*client, TransferRequest::WRITE, hbm.get(),
-                        provider_segment, allocation->base(), kTransferBytes);
-        if (!cold_transfer_completed && !write_error.empty()) {
-            REQUIRE_FABRIC_OR_SKIP(
-                strict, "cold Fabric import/map/copy prerequisite failed: " +
-                            write_error);
+            const auto write_pattern =
+                MakePattern(kTransferBytes, 0x80U + device);
+            ASSERT_EQ(cudaMemcpy(hbm.get(), write_pattern.data(),
+                                 kTransferBytes, cudaMemcpyHostToDevice),
+                      cudaSuccess);
+            const std::string write_error = RunTransfer(
+                *client, TransferRequest::WRITE, hbm.get(), provider_segment,
+                allocation->base(), kTransferBytes);
+            if (!cold_transfer_completed && !write_error.empty()) {
+                REQUIRE_FABRIC_OR_SKIP(
+                    strict,
+                    "cold Fabric import/map/copy prerequisite failed: " +
+                        write_error);
+            }
+            ASSERT_TRUE(write_error.empty()) << write_error;
+            cold_transfer_completed = true;
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            ASSERT_TRUE(MatchesPattern(host_numa, write_pattern));
+
+            // The next request uses the same Consumer engine, segment, and
+            // remote BufferDesc. It therefore exercises the warm mapping-cache
+            // path.
+            const auto read_pattern =
+                MakePattern(kTransferBytes, 0xa0U + device);
+            std::copy(read_pattern.begin(), read_pattern.end(), host_numa);
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            const std::string read_error = RunTransfer(
+                *client, TransferRequest::READ, hbm.get(), provider_segment,
+                allocation->base(), kTransferBytes);
+            ASSERT_TRUE(read_error.empty()) << read_error;
+            ASSERT_EQ(cudaMemcpy(observed.data(), hbm.get(), kTransferBytes,
+                                 cudaMemcpyDeviceToHost),
+                      cudaSuccess);
+            ASSERT_TRUE(MatchesPattern(observed.data(), read_pattern));
+
+            ASSERT_EQ(client_registration.Reset(), 0);
+            ASSERT_EQ(hbm.Reset(), cudaSuccess);
         }
-        ASSERT_TRUE(write_error.empty()) << write_error;
-        cold_transfer_completed = true;
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        ASSERT_TRUE(MatchesPattern(host_numa, write_pattern));
+        ASSERT_TRUE(cold_transfer_completed);
 
-        // The next request uses the same Consumer engine, segment, and remote
-        // BufferDesc. It therefore exercises the warm mapping-cache path.
-        const auto read_pattern = MakePattern(kTransferBytes, 0xa0U + device);
-        std::copy(read_pattern.begin(), read_pattern.end(), host_numa);
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        const std::string read_error =
-            RunTransfer(*client, TransferRequest::READ, hbm.get(),
-                        provider_segment, allocation->base(), kTransferBytes);
-        ASSERT_TRUE(read_error.empty()) << read_error;
-        ASSERT_EQ(cudaMemcpy(observed.data(), hbm.get(), kTransferBytes,
-                             cudaMemcpyDeviceToHost),
-                  cudaSuccess);
-        ASSERT_TRUE(MatchesPattern(observed.data(), read_pattern));
-
-        ASSERT_EQ(client_registration.Reset(), 0);
-        ASSERT_EQ(hbm.Reset(), cudaSuccess);
+        // Destroy the Consumer first so imported mappings are unmapped before
+        // the Provider unregisters and releases the owning VMM allocation.
+        client.reset();
+        ASSERT_EQ(server_registration.Reset(), 0);
+        allocation.reset();
+        server.reset();
     }
-    ASSERT_TRUE(cold_transfer_completed);
-
-    // Destroy the Consumer first so imported mappings are unmapped before the
-    // Provider unregisters and releases the owning VMM allocation.
-    client.reset();
-    ASSERT_EQ(server_registration.Reset(), 0);
-    allocation.reset();
-    server.reset();
 }
 
 #undef REQUIRE_FABRIC_OR_SKIP

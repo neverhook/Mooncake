@@ -4,6 +4,9 @@ import argparse
 import contextlib
 import hashlib
 import json
+import os
+import pathlib
+import re
 import time
 import uuid
 
@@ -36,6 +39,36 @@ def at_least_two(value: str) -> int:
     if number < 2:
         raise argparse.ArgumentTypeError("value must be at least two")
     return number
+
+
+def safe_identifier(value: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", value):
+        raise argparse.ArgumentTypeError(
+            "value may contain only letters, digits, dot, underscore, and dash"
+        )
+    return value
+
+
+def process_context(torch, args: argparse.Namespace) -> dict[str, object]:
+    status: dict[str, str] = {}
+    try:
+        for line in pathlib.Path("/proc/self/status").read_text().splitlines():
+            name, separator, value = line.partition(":")
+            if separator and name in {"Cpus_allowed_list", "Mems_allowed_list"}:
+                status[name] = value.strip()
+    except OSError:
+        pass
+    return {
+        "event": "consumer_context",
+        "run_id": args.run_id,
+        "pid": os.getpid(),
+        "device": args.device,
+        "device_name": torch.cuda.get_device_name(args.device),
+        "torch_version": str(torch.__version__),
+        "torch_cuda_version": str(torch.version.cuda),
+        "cpus_allowed_list": status.get("Cpus_allowed_list", "unknown"),
+        "mems_allowed_list": status.get("Mems_allowed_list", "unknown"),
+    }
 
 
 @contextlib.contextmanager
@@ -71,7 +104,6 @@ def registered_buffers(store, buffers):
 
 
 def run_iterations(consumer, torch, args: argparse.Namespace) -> None:
-    run_id = uuid.uuid4().hex
     for iteration in range(args.iterations):
         generator = torch.Generator(device=f"cuda:{args.device}")
         generator.manual_seed((args.device + 1) * 1_000_003 + iteration)
@@ -93,7 +125,7 @@ def run_iterations(consumer, torch, args: argparse.Namespace) -> None:
             (destination_ptr, args.payload_size, "destination"),
         )
         with registered_buffers(consumer, buffers):
-            key = f"{args.key_prefix}-{run_id}-gpu{args.device}-{iteration}"
+            key = f"{args.key_prefix}-{args.run_id}-gpu{args.device}-{iteration}"
             before_put = consumer_metrics(consumer.serialize_metrics())
             put_started = time.perf_counter_ns()
             put_result = consumer.put_from(key, source_ptr, args.payload_size)
@@ -127,6 +159,7 @@ def run_iterations(consumer, torch, args: argparse.Namespace) -> None:
                 json.dumps(
                     {
                         "event": "result",
+                        "run_id": args.run_id,
                         "device": args.device,
                         "iteration": iteration,
                         "cache_phase": classify_cache_phase(
@@ -156,6 +189,7 @@ def main() -> int:
     parser.add_argument("--payload-size", type=positive_int, default=16 * 1024 * 1024)
     parser.add_argument("--iterations", type=at_least_two, default=2)
     parser.add_argument("--key-prefix", default="nvlink-host-numa")
+    parser.add_argument("--run-id", type=safe_identifier, default=uuid.uuid4().hex)
     args = parser.parse_args()
 
     import torch
@@ -184,6 +218,7 @@ def main() -> int:
             )
             exit_code = int(setup_result) if int(setup_result) > 0 else 2
         else:
+            print(json.dumps(process_context(torch, args), sort_keys=True), flush=True)
             run_iterations(consumer, torch, args)
     except BaseException:
         active_error = True

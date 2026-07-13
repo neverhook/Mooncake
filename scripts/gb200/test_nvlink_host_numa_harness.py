@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 
 import http.server
+import json
 import threading
 import unittest
 import urllib.parse
 
 import nvlink_host_numa_provider as provider
+import nvlink_host_numa_bench as bench
 from nvlink_host_numa_metrics import (
     classify_cache_phase,
     consumer_delta,
@@ -65,6 +67,38 @@ class _AdminHandler(http.server.BaseHTTPRequestHandler):
 
 
 class HarnessTest(unittest.TestCase):
+    def test_bench_uses_counter_derived_phase(self):
+        record = {
+            "event": "result",
+            "run_id": "run-1",
+            "device": 0,
+            "iteration": 0,
+            "bytes": 4096,
+            "cache_phase": "mixed",
+            "put_cache_delta": {
+                "hit": 0,
+                "miss": 1,
+                "lazy_imports": 1,
+                "lazy_import_duration_us": 11,
+            },
+            "get_cache_delta": {
+                "hit": 1,
+                "miss": 0,
+                "lazy_imports": 0,
+                "lazy_import_duration_us": 0,
+            },
+            "put_latency_ns": 100,
+            "get_latency_ns": 100,
+            "put_gib_s": 1.0,
+            "get_gib_s": 1.0,
+        }
+        parsed = bench.result_records(json.dumps(record), 0, 4096, 1, "run-1")
+        self.assertEqual(parsed, [record])
+
+        record["cache_phase"] = "cold"
+        with self.assertRaisesRegex(RuntimeError, "invalid cache phase"):
+            bench.result_records(json.dumps(record), 0, 4096, 1, "run-1")
+
     def test_provider_capacity_requires_exact_per_node_sum(self):
         capacity = provider_capacity(PROVIDER_METRICS)
         self.assertEqual(capacity.requested_bytes, 600)

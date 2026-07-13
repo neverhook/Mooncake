@@ -10,6 +10,7 @@ import signal
 import time
 import urllib.parse
 import urllib.request
+import uuid
 
 from nvlink_host_numa_metrics import provider_capacity
 
@@ -57,6 +58,14 @@ def nonnegative_float(value: str) -> float:
     if not math.isfinite(number) or number < 0:
         raise argparse.ArgumentTypeError("value must be greater than or equal to zero")
     return number
+
+
+def safe_identifier(value: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", value):
+        raise argparse.ArgumentTypeError(
+            "value may contain only letters, digits, dot, underscore, and dash"
+        )
+    return value
 
 
 def redact(config: dict[str, str]) -> dict[str, str]:
@@ -170,7 +179,11 @@ def wait_for_readiness(
                 ) from last_error
             print(
                 json.dumps(
-                    {"event": "readiness_pending", "error": str(exc)},
+                    {
+                        "event": "readiness_pending",
+                        "run_id": args.run_id,
+                        "error": str(exc),
+                    },
                     sort_keys=True,
                 ),
                 flush=True,
@@ -182,6 +195,7 @@ def serve(args: argparse.Namespace, provider, requested_bytes: int) -> int:
     publication = wait_for_readiness(provider, args, requested_bytes)
     status: dict[str, object] = {
         "event": "ready",
+        "run_id": args.run_id,
         "requested_capacity_bytes": requested_bytes,
         "local_hostname": args.local_hostname,
         **publication,
@@ -213,6 +227,7 @@ def serve(args: argparse.Namespace, provider, requested_bytes: int) -> int:
                     json.dumps(
                         {
                             "event": "capacity_metrics",
+                            "run_id": args.run_id,
                             "requested_capacity_bytes": capacity.requested_bytes,
                             "effective_capacity_bytes": capacity.effective_bytes,
                             "chunk_count": capacity.chunk_count,
@@ -246,6 +261,7 @@ def main() -> int:
     parser.add_argument("--nodes", default="auto")
     parser.add_argument("--metrics-url", default="", help=argparse.SUPPRESS)
     parser.add_argument("--ready-file", default="")
+    parser.add_argument("--run-id", type=safe_identifier, default=uuid.uuid4().hex)
     parser.add_argument("--metrics-interval-sec", type=positive_float, default=10.0)
     parser.add_argument("--readiness-timeout-sec", type=positive_float, default=30.0)
     parser.add_argument("--readiness-retry-sec", type=positive_float, default=0.5)
@@ -269,7 +285,10 @@ def main() -> int:
         "nvlink_host_numa_nodes": args.nodes,
     }
     print(
-        json.dumps({"event": "config", "config": redact(config)}, sort_keys=True),
+        json.dumps(
+            {"event": "config", "run_id": args.run_id, "config": redact(config)},
+            sort_keys=True,
+        ),
         flush=True,
     )
 

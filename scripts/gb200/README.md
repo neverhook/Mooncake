@@ -35,6 +35,11 @@ RUN_HARDWARE_TESTS=1 \
 scripts/gb200/nvlink_host_numa_build.sh
 ```
 
+Torch is not a build prerequisite. The Provider and all parser/mock gates run
+without it. Only the HBM Consumer needs a CUDA-enabled Torch wheel; install an
+internally approved, driver-compatible wheel into the workspace venv before
+the data-plane step if the base image must remain unchanged.
+
 The Fabric probe tests every online NUMA node discovered from the visible GPUs.
 Set `MC_NVLINK_HOST_NUMA_TEST_NODES=0,1` to override that discovery explicitly;
 the single-node `MC_NVLINK_HOST_NUMA_TEST_NODE` override remains available for
@@ -53,6 +58,7 @@ daemon.
 The ConfigDict size parser accepts `GB`, not `GiB`:
 
 ```bash
+RUN_ID="gb200-$(date -u +%Y%m%dT%H%M%SZ)"
 MC_MAX_MR_SIZE=$((150*1024*1024*1024)) \
 python3 scripts/gb200/nvlink_host_numa_provider.py \
   --local-hostname "${NODE_A_IP}:12345" \
@@ -61,6 +67,7 @@ python3 scripts/gb200/nvlink_host_numa_provider.py \
   --master-admin-url "http://${NODE_A_IP}:9003" \
   --global-segment-size "600 GB" \
   --nodes auto \
+  --run-id "${RUN_ID}" \
   --ready-file /tmp/mooncake-host-numa.ready
 ```
 
@@ -105,8 +112,14 @@ python3 scripts/gb200/nvlink_host_numa_bench.py \
   --local-hostname-prefix "${NODE_B_IP}:1240" \
   --metadata-server "http://${NODE_A_IP}:8080/metadata" \
   --master-server "${NODE_A_IP}:50051" \
+  --run-id "${RUN_ID}" \
   --devices 0,1,2,3 --iterations 4
 ```
+
+Use the same explicit `RUN_ID` on both nodes. Consumer context records include
+the PID, Torch/CUDA versions, GPU name, and Linux CPU/NUMA affinity; summaries
+are split by counter-derived cache phase and include mapping hit ratio and cold
+import latency.
 
 Record topology, driver/toolkit/IMEX versions, CTest XML, Provider metrics, and
 the JSON result stream. Hardware results are `PASS`, `FAIL`, or `NOT RUN`; a

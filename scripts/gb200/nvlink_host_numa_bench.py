@@ -5,9 +5,22 @@ import concurrent.futures
 import json
 import math
 import pathlib
+import re
 import statistics
 import subprocess
 import sys
+import uuid
+
+
+CACHE_DELTA_FIELDS = ("hit", "miss", "lazy_imports", "lazy_import_duration_us")
+
+
+def safe_identifier(value: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", value):
+        raise argparse.ArgumentTypeError(
+            "value may contain only letters, digits, dot, underscore, and dash"
+        )
+    return value
 
 
 def percentile(values: list[float], quantile: float) -> float:
@@ -49,8 +62,45 @@ def run_consumer(command: list[str]) -> subprocess.CompletedProcess[str]:
     )
 
 
+def require_cache_delta(
+    record: dict[str, object], operation: str, device: int
+) -> dict[str, int]:
+    raw = record.get(f"{operation}_cache_delta")
+    if not isinstance(raw, dict):
+        raise RuntimeError(
+            f"consumer GPU {device} omitted {operation} cache delta: {record!r}"
+        )
+    parsed: dict[str, int] = {}
+    for field in CACHE_DELTA_FIELDS:
+        value = raw.get(field)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise RuntimeError(
+                f"consumer GPU {device} emitted invalid {operation} "
+                f"cache delta {field}: {record!r}"
+            )
+        parsed[field] = value
+    if parsed["miss"] != parsed["lazy_imports"]:
+        raise RuntimeError(
+            f"consumer GPU {device} emitted mismatched {operation} "
+            f"mapping misses/imports: {record!r}"
+        )
+    return parsed
+
+
+def classify_cache_delta(*deltas: dict[str, int]) -> str:
+    hits = sum(delta["hit"] for delta in deltas)
+    misses = sum(delta["miss"] for delta in deltas)
+    if hits > 0 and misses > 0:
+        return "mixed"
+    if misses > 0:
+        return "cold"
+    if hits > 0:
+        return "warm"
+    return "none"
+
+
 def result_records(
-    stdout: str, device: int, payload_size: int, iterations: int
+    stdout: str, device: int, payload_size: int, iterations: int, run_id: str
 ) -> list[dict[str, object]]:
     records = []
     for line in stdout.splitlines():
@@ -69,16 +119,31 @@ def result_records(
             f"expected={sorted(expected_iterations)!r}"
         )
     for record in records:
-        if record.get("device") != device or record.get("bytes") != payload_size:
+        if (
+            record.get("device") != device
+            or record.get("bytes") != payload_size
+            or record.get("run_id") != run_id
+        ):
             raise RuntimeError(
                 f"consumer GPU {device} emitted mismatched result record: {record!r}"
             )
-        iteration = record["iteration"]
-        expected_phase = "cold" if iteration == 0 else "warm"
+        put_delta = require_cache_delta(record, "put", device)
+        get_delta = require_cache_delta(record, "get", device)
+        expected_phase = classify_cache_delta(put_delta, get_delta)
         if record.get("cache_phase") != expected_phase:
             raise RuntimeError(
                 f"consumer GPU {device} emitted invalid cache phase: {record!r}"
             )
+        if record.get("iteration") == 0:
+            if (
+                put_delta["miss"] <= 0
+                or put_delta["lazy_import_duration_us"] <= 0
+                or get_delta["hit"] <= 0
+                or get_delta["miss"] != 0
+            ):
+                raise RuntimeError(
+                    f"consumer GPU {device} did not prove miss-then-hit: {record!r}"
+                )
         for field in (
             "put_latency_ns",
             "get_latency_ns",
@@ -107,6 +172,7 @@ def main() -> int:
     parser.add_argument("--payload-sizes", default="4096,1048576,16777216")
     parser.add_argument("--iterations", type=int, default=4)
     parser.add_argument("--key-prefix", default="nvlink-host-numa-bench")
+    parser.add_argument("--run-id", type=safe_identifier, default=uuid.uuid4().hex)
     args = parser.parse_args()
 
     consumer_script = pathlib.Path(__file__).with_name("nvlink_host_numa_consumer.py")
@@ -126,6 +192,7 @@ def main() -> int:
     if len(set(endpoints.values())) != len(endpoints):
         parser.error("--local-hostname-prefix generated duplicate endpoints")
     all_results: list[dict[str, object]] = []
+    run_id = args.run_id
 
     for payload_size in sizes:
         commands: list[tuple[int, list[str]]] = []
@@ -147,6 +214,8 @@ def main() -> int:
                 str(args.iterations),
                 "--key-prefix",
                 args.key_prefix,
+                "--run-id",
+                run_id,
             ]
             commands.append((device, command))
 
@@ -173,7 +242,11 @@ def main() -> int:
                 try:
                     all_results.extend(
                         result_records(
-                            completed.stdout, device, payload_size, args.iterations
+                            completed.stdout,
+                            device,
+                            payload_size,
+                            args.iterations,
+                            run_id,
                         )
                     )
                 except RuntimeError as exc:
@@ -190,23 +263,49 @@ def main() -> int:
                 f"expected {expected_samples}"
             )
         for operation in ("put", "get"):
-            latency_us = [
-                float(record[f"{operation}_latency_ns"]) / 1000 for record in records
-            ]
-            throughput = [float(record[f"{operation}_gib_s"]) for record in records]
-            summary = {
-                "event": "summary",
-                "operation": operation,
-                "bytes": payload_size,
-                "samples": len(records),
-                "latency_p50_us": percentile(latency_us, 0.50),
-                "latency_p95_us": percentile(latency_us, 0.95),
-                "latency_p99_us": percentile(latency_us, 0.99),
-                "throughput_mean_gib_s": statistics.fmean(throughput)
-                if throughput
-                else 0.0,
-            }
-            print(json.dumps(summary, sort_keys=True))
+            phases: dict[str, list[dict[str, object]]] = {}
+            for record in records:
+                delta = require_cache_delta(record, operation, int(record["device"]))
+                phases.setdefault(classify_cache_delta(delta), []).append(record)
+            for phase, phase_records in sorted(phases.items()):
+                latency_us = [
+                    float(record[f"{operation}_latency_ns"]) / 1000
+                    for record in phase_records
+                ]
+                throughput = [
+                    float(record[f"{operation}_gib_s"]) for record in phase_records
+                ]
+                deltas = [
+                    require_cache_delta(record, operation, int(record["device"]))
+                    for record in phase_records
+                ]
+                hits = sum(delta["hit"] for delta in deltas)
+                misses = sum(delta["miss"] for delta in deltas)
+                import_duration = [
+                    delta["lazy_import_duration_us"]
+                    for delta in deltas
+                    if delta["lazy_imports"] > 0
+                ]
+                lookups = hits + misses
+                summary = {
+                    "event": "summary",
+                    "run_id": run_id,
+                    "operation": operation,
+                    "cache_phase": phase,
+                    "bytes": payload_size,
+                    "samples": len(phase_records),
+                    "mapping_hits": hits,
+                    "mapping_misses": misses,
+                    "mapping_hit_ratio": hits / lookups if lookups else 0.0,
+                    "latency_p50_us": percentile(latency_us, 0.50),
+                    "latency_p95_us": percentile(latency_us, 0.95),
+                    "latency_p99_us": percentile(latency_us, 0.99),
+                    "cold_import_duration_p50_us": percentile(import_duration, 0.50),
+                    "throughput_mean_gib_s": statistics.fmean(throughput)
+                    if throughput
+                    else 0.0,
+                }
+                print(json.dumps(summary, sort_keys=True))
     return 0
 
 

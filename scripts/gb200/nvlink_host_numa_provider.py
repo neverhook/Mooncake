@@ -8,7 +8,10 @@ import pathlib
 import re
 import signal
 import time
+import urllib.parse
 import urllib.request
+
+from nvlink_host_numa_metrics import provider_capacity
 
 
 def import_store_module():
@@ -64,16 +67,72 @@ def redact(config: dict[str, str]) -> dict[str, str]:
     }
 
 
-def fetch_metrics(url: str) -> str:
+def fetch_text(url: str) -> str:
     with urllib.request.urlopen(url, timeout=5) as response:
         return response.read().decode("utf-8", errors="replace")
 
 
-def metric_value(metrics: str, name: str) -> int | None:
-    match = re.search(
-        rf"^{re.escape(name)}(?:\{{[^}}]*\}})?\s+(-?\d+)\s*$", metrics, re.M
-    )
-    return int(match.group(1)) if match else None
+def fetch_master_publication(
+    master_admin_url: str, segment_name: str
+) -> tuple[str, str]:
+    base = master_admin_url.rstrip("/")
+    segments = fetch_text(f"{base}/get_all_segments")
+    query = urllib.parse.urlencode({"segment": segment_name})
+    detail = fetch_text(f"{base}/query_segment?{query}")
+    return segments, detail
+
+
+def parse_query_segment(detail: str, expected_name: str) -> tuple[int, int]:
+    lines = detail.splitlines()
+    if not lines or lines[0] != expected_name:
+        raise ValueError(
+            f"Master query returned segment {lines[0] if lines else None!r}, "
+            f"expected {expected_name!r}"
+        )
+    used_match = re.search(r"^Used\(bytes\)\s*:\s*(\d+)\s*$", detail, re.M)
+    capacity_match = re.search(r"^Capacity\(bytes\)\s*:\s*(\d+)\s*$", detail, re.M)
+    if used_match is None or capacity_match is None:
+        raise ValueError("Master /query_segment response is missing used/capacity")
+    used = int(used_match.group(1))
+    capacity = int(capacity_match.group(1))
+    if used > capacity:
+        raise ValueError("Master reports segment used bytes above capacity")
+    return used, capacity
+
+
+def validate_publication(
+    metrics: str,
+    requested_bytes: int,
+    segment_name: str,
+    all_segments: str,
+    segment_detail: str,
+) -> dict[str, int]:
+    expected = provider_capacity(metrics)
+    if expected.requested_bytes != requested_bytes:
+        raise ValueError(
+            "Provider requested-capacity metric mismatch: "
+            f"{expected.requested_bytes} != {requested_bytes}"
+        )
+    names = [line for line in all_segments.splitlines() if line]
+    mounted_chunks = sum(name == segment_name for name in names)
+    if mounted_chunks != expected.chunk_count:
+        raise ValueError(
+            f"Master mounted {mounted_chunks} chunks for {segment_name!r}, "
+            f"expected {expected.chunk_count}"
+        )
+    used, capacity = parse_query_segment(segment_detail, segment_name)
+    if capacity != expected.effective_bytes:
+        raise ValueError(
+            f"Master capacity for {segment_name!r} is {capacity}, "
+            f"expected {expected.effective_bytes}"
+        )
+    return {
+        "effective_capacity_bytes": expected.effective_bytes,
+        "expected_chunk_count": expected.chunk_count,
+        "master_chunk_count": mounted_chunks,
+        "master_used_bytes": used,
+        "master_capacity_bytes": capacity,
+    }
 
 
 def write_ready_file(path: pathlib.Path, status: dict[str, object]) -> None:
@@ -85,21 +144,48 @@ def write_ready_file(path: pathlib.Path, status: dict[str, object]) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def serve(args: argparse.Namespace, requested_bytes: int) -> int:
+def wait_for_readiness(
+    provider, args: argparse.Namespace, requested_bytes: int
+) -> dict[str, int]:
+    deadline = time.monotonic() + args.readiness_timeout_sec
+    last_error: Exception | None = None
+    while True:
+        try:
+            metrics = provider.serialize_metrics()
+            all_segments, detail = fetch_master_publication(
+                args.master_admin_url, args.local_hostname
+            )
+            return validate_publication(
+                metrics,
+                requested_bytes,
+                args.local_hostname,
+                all_segments,
+                detail,
+            )
+        except Exception as exc:
+            last_error = exc
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"Provider readiness validation timed out: {last_error}"
+                ) from last_error
+            print(
+                json.dumps(
+                    {"event": "readiness_pending", "error": str(exc)},
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+            time.sleep(args.readiness_retry_sec)
+
+
+def serve(args: argparse.Namespace, provider, requested_bytes: int) -> int:
+    publication = wait_for_readiness(provider, args, requested_bytes)
     status: dict[str, object] = {
         "event": "ready",
         "requested_capacity_bytes": requested_bytes,
-        "effective_capacity_bytes": None,
         "local_hostname": args.local_hostname,
+        **publication,
     }
-    if args.metrics_url:
-        try:
-            metrics = fetch_metrics(args.metrics_url)
-            status["effective_capacity_bytes"] = metric_value(
-                metrics, "mooncake_nvlink_host_numa_effective_capacity_bytes"
-            )
-        except Exception as exc:  # hardware harness should keep Provider alive
-            status["metrics_error"] = str(exc)
     print(json.dumps(status, sort_keys=True), flush=True)
     if args.ready_file:
         write_ready_file(pathlib.Path(args.ready_file), status)
@@ -115,21 +201,21 @@ def serve(args: argparse.Namespace, requested_bytes: int) -> int:
     deadline = time.monotonic() + args.run_seconds if args.run_seconds > 0 else None
     next_metrics = time.monotonic()
     while not stopping and (deadline is None or time.monotonic() < deadline):
-        if args.metrics_url and time.monotonic() >= next_metrics:
+        if time.monotonic() >= next_metrics:
             try:
-                metrics = fetch_metrics(args.metrics_url)
+                metrics = (
+                    fetch_text(args.metrics_url)
+                    if args.metrics_url
+                    else provider.serialize_metrics()
+                )
+                capacity = provider_capacity(metrics)
                 print(
                     json.dumps(
                         {
                             "event": "capacity_metrics",
-                            "requested_capacity_bytes": metric_value(
-                                metrics,
-                                "mooncake_nvlink_host_numa_requested_capacity_bytes",
-                            ),
-                            "effective_capacity_bytes": metric_value(
-                                metrics,
-                                "mooncake_nvlink_host_numa_effective_capacity_bytes",
-                            ),
+                            "requested_capacity_bytes": capacity.requested_bytes,
+                            "effective_capacity_bytes": capacity.effective_bytes,
+                            "chunk_count": capacity.chunk_count,
                         },
                         sort_keys=True,
                     ),
@@ -150,12 +236,19 @@ def main() -> int:
     parser.add_argument("--local-hostname", required=True)
     parser.add_argument("--metadata-server", required=True)
     parser.add_argument("--master-server", required=True)
+    parser.add_argument(
+        "--master-admin-url",
+        required=True,
+        help="Master admin HTTP base URL (metrics_port, default 9003)",
+    )
     parser.add_argument("--global-segment-size", default="600 GB")
     parser.add_argument("--local-buffer-size", default="0")
     parser.add_argument("--nodes", default="auto")
-    parser.add_argument("--metrics-url", default="")
+    parser.add_argument("--metrics-url", default="", help=argparse.SUPPRESS)
     parser.add_argument("--ready-file", default="")
     parser.add_argument("--metrics-interval-sec", type=positive_float, default=10.0)
+    parser.add_argument("--readiness-timeout-sec", type=positive_float, default=30.0)
+    parser.add_argument("--readiness-retry-sec", type=positive_float, default=0.5)
     parser.add_argument("--run-seconds", type=nonnegative_float, default=0.0)
     args = parser.parse_args()
 
@@ -163,6 +256,8 @@ def main() -> int:
         requested_bytes = parse_size(args.global_segment_size)
     except argparse.ArgumentTypeError as exc:
         parser.error(str(exc))
+    if args.ready_file:
+        pathlib.Path(args.ready_file).unlink(missing_ok=True)
     config = {
         "local_hostname": args.local_hostname,
         "metadata_server": args.metadata_server,
@@ -191,7 +286,7 @@ def main() -> int:
             )
             exit_code = int(setup_result) if int(setup_result) > 0 else 2
         else:
-            exit_code = serve(args, requested_bytes)
+            exit_code = serve(args, provider, requested_bytes)
     except BaseException:
         active_error = True
         raise

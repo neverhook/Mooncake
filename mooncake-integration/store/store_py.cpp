@@ -2277,6 +2277,26 @@ PYBIND11_MODULE(store, m) {
             py::arg("keys"), py::arg("force") = false,
             "Batch remove objects by keys. Returns a list of status codes "
             "(0=success, negative=error code) for each key.")
+        .def(
+            "serialize_metrics",
+            [](MooncakeStorePyWrapper& self) {
+                if (!self.store_ || !self.store_->client_) {
+                    throw std::runtime_error("store metrics are not available");
+                }
+                auto client = self.store_->client_;
+                auto result = [&client]() {
+                    py::gil_scoped_release release;
+                    return client->SerializeMetrics();
+                }();
+                if (!result) {
+                    throw std::runtime_error(
+                        "failed to serialize store metrics: " +
+                        toString(result.error()));
+                }
+                return std::move(*result);
+            },
+            "Return a read-only Prometheus snapshot of Store and transport "
+            "metrics.")
         .def("is_exist",
              [](MooncakeStorePyWrapper& self, const std::string& key) {
                  py::gil_scoped_release release;

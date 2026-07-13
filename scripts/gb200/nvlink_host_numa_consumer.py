@@ -7,6 +7,14 @@ import json
 import time
 import uuid
 
+from nvlink_host_numa_metrics import (
+    classify_cache_phase,
+    consumer_delta,
+    consumer_delta_dict,
+    consumer_metrics,
+    validate_miss_then_hit,
+)
+
 
 def import_store_module():
     try:
@@ -26,7 +34,7 @@ def positive_int(value: str) -> int:
 def at_least_two(value: str) -> int:
     number = int(value)
     if number < 2:
-        raise argparse.ArgumentTypeError("value must be at least two (cold and warm)")
+        raise argparse.ArgumentTypeError("value must be at least two")
     return number
 
 
@@ -86,11 +94,14 @@ def run_iterations(consumer, torch, args: argparse.Namespace) -> None:
         )
         with registered_buffers(consumer, buffers):
             key = f"{args.key_prefix}-{run_id}-gpu{args.device}-{iteration}"
+            before_put = consumer_metrics(consumer.serialize_metrics())
             put_started = time.perf_counter_ns()
             put_result = consumer.put_from(key, source_ptr, args.payload_size)
             put_ns = time.perf_counter_ns() - put_started
             if put_result != 0:
                 raise RuntimeError(f"put_from failed: {put_result}")
+            after_put = consumer_metrics(consumer.serialize_metrics())
+            put_cache_delta = consumer_delta(before_put, after_put)
 
             get_started = time.perf_counter_ns()
             get_result = consumer.get_into(key, destination_ptr, args.payload_size)
@@ -100,6 +111,10 @@ def run_iterations(consumer, torch, args: argparse.Namespace) -> None:
                 raise RuntimeError(
                     f"get_into returned {get_result}, expected {args.payload_size}"
                 )
+            after_get = consumer_metrics(consumer.serialize_metrics())
+            get_cache_delta = consumer_delta(after_put, after_get)
+            if iteration == 0:
+                validate_miss_then_hit(put_cache_delta, get_cache_delta)
             actual_hash = hashlib.sha256(
                 destination.cpu().numpy().tobytes()
             ).hexdigest()
@@ -114,7 +129,11 @@ def run_iterations(consumer, torch, args: argparse.Namespace) -> None:
                         "event": "result",
                         "device": args.device,
                         "iteration": iteration,
-                        "cache_phase": "cold" if iteration == 0 else "warm",
+                        "cache_phase": classify_cache_phase(
+                            put_cache_delta, get_cache_delta
+                        ),
+                        "put_cache_delta": consumer_delta_dict(put_cache_delta),
+                        "get_cache_delta": consumer_delta_dict(get_cache_delta),
                         "bytes": args.payload_size,
                         "sha256": actual_hash,
                         "put_latency_ns": put_ns,

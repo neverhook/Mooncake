@@ -14,6 +14,8 @@ DRAM and Consumers transfer from/to registered HBM through protocol `nvlink`.
   RDMA, intra-node, or mixed transport installation.
 - Give the Provider and Consumer users access to the same IMEX channel.
 - Start the Mooncake Master and metadata service before the Provider.
+- Make the Master's admin HTTP port reachable from the Provider (default
+  `--metrics_port=9003`).
 
 CUDA requires `nvidia-caps-imex-channels` in `/proc/devices` and an accessible
 `/dev/nvidia-caps-imex-channels/channel*` for Fabric handles. See the official
@@ -56,22 +58,34 @@ python3 scripts/gb200/nvlink_host_numa_provider.py \
   --local-hostname "${NODE_A_IP}:12345" \
   --metadata-server "http://${NODE_A_IP}:8080/metadata" \
   --master-server "${NODE_A_IP}:50051" \
+  --master-admin-url "http://${NODE_A_IP}:9003" \
   --global-segment-size "600 GB" \
   --nodes auto \
-  --metrics-url "http://127.0.0.1:9300/metrics" \
   --ready-file /tmp/mooncake-host-numa.ready
 ```
 
 Readiness is printed and optionally written atomically only after
-`setup(config)` succeeds. The HTTP metrics URL is optional and requires the
-existing Store HTTP server. The Provider removes its ready file and validates
-the Store close result on every exit path.
+`setup(config)` succeeds and two independent views agree exactly:
+
+- the Provider's read-only `serialize_metrics()` snapshot supplies requested
+  capacity, effective capacity, and the sum of per-NUMA chunk counts;
+- Master `/get_all_segments` must contain exactly that many entries for the
+  Provider hostname, and `/query_segment` must report exactly the same
+  effective capacity.
+
+A mismatch or an unreachable admin endpoint times out without creating the
+ready file. The Provider removes any stale ready file before setup, removes its
+ready file on every exit path, and validates the Store close result.
 
 ## Consumers and concurrency
 
-Run one Consumer per visible GPU on Node B. Each process performs at least one
-cold and one warm iteration and verifies SHA256 plus a byte-for-byte tensor
-comparison:
+Run one Consumer per visible GPU on Node B. Each process verifies SHA256 plus a
+byte-for-byte tensor comparison. It snapshots `serialize_metrics()` around the
+first `put_from` and the following `get_into`; acceptance requires a real
+mapping miss/lazy import followed by a cache hit with no second import. The
+JSON records contain measured `put_cache_delta` / `get_cache_delta` counters;
+`cache_phase` is derived from those counters as `cold`, `warm`, `mixed`, or
+`none`, never from the iteration number:
 
 ```bash
 python3 scripts/gb200/nvlink_host_numa_consumer.py \
@@ -97,3 +111,12 @@ python3 scripts/gb200/nvlink_host_numa_bench.py \
 Record topology, driver/toolkit/IMEX versions, CTest XML, Provider metrics, and
 the JSON result stream. Hardware results are `PASS`, `FAIL`, or `NOT RUN`; a
 skip is not acceptance evidence.
+
+The harness parsers, Master admin mock, and metric-delta assertions can be
+tested in a build container without Torch or a GPU:
+
+```bash
+python3 -m unittest discover -s scripts/gb200 \
+  -p 'test_nvlink_host_numa_harness.py' -v
+python3 -m py_compile scripts/gb200/*.py
+```

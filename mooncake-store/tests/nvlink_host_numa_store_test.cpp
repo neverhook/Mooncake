@@ -75,7 +75,7 @@ class NvlinkHostNumaStoreTestPeer {
 namespace {
 
 using testing::InProcMaster;
-using testing::InProcMasterConfigBuilder;
+using ::mooncake::InProcMasterConfigBuilder;
 
 ConfigDict MinimalConfig(const std::string& protocol) {
     return {{CONFIG_KEY_LOCAL_HOSTNAME, "localhost:17991"},
@@ -503,11 +503,12 @@ TEST(NvlinkHostNumaStoreHardwareTest,
     EXPECT_NE(metrics->find("stage=\"preflight\""), std::string::npos);
     EXPECT_NE(metrics->find("stage=\"mount\""), std::string::npos);
 
-    testing::Test::RecordProperty("numa_node_count",
-                                  std::to_string(hardware->plan.nodes.size()));
-    testing::Test::RecordProperty("provider_chunk_count",
-                                  std::to_string(hardware->plan.chunks.size()));
-    testing::Test::RecordProperty(
+    ::testing::Test::RecordProperty(
+        "numa_node_count", std::to_string(hardware->plan.nodes.size()));
+    ::testing::Test::RecordProperty(
+        "provider_chunk_count",
+        std::to_string(hardware->plan.chunks.size()));
+    ::testing::Test::RecordProperty(
         "effective_capacity_bytes",
         std::to_string(hardware->plan.effective_total));
 
@@ -645,9 +646,9 @@ TEST(NvlinkHostNumaStoreHardwareTest,
     EXPECT_TRUE(!rollback_failures || *rollback_failures == 0U)
         << "an unchanged zero counter may be omitted from serialization";
 
-    testing::Test::RecordProperty("injected_mount_ordinal",
-                                  std::to_string(fail_nth));
-    testing::Test::RecordProperty("rollback_result", "success");
+    ::testing::Test::RecordProperty("injected_mount_ordinal",
+                                    std::to_string(fail_nth));
+    ::testing::Test::RecordProperty("rollback_result", "success");
     NvlinkHostNumaStoreTestPeer::ClearMasterMountFailureHook(*client);
     EXPECT_TRUE(client->tearDownAll_internal());
 }

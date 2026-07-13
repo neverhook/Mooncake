@@ -30,6 +30,7 @@
 #include <iomanip>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -51,6 +52,27 @@ static bool checkCudaErrorReturn(cudaError_t result, const char* message) {
 }
 
 namespace mooncake {
+
+#if defined(USE_MNNVL) && defined(USE_CUDA)
+namespace {
+
+struct OwnedVmmRange {
+    size_t length = 0;
+    size_t owners = 0;
+};
+
+std::mutex& ownedVmmRangesMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+std::unordered_map<uintptr_t, OwnedVmmRange>& ownedVmmRanges() {
+    static std::unordered_map<uintptr_t, OwnedVmmRange> ranges;
+    return ranges;
+}
+
+}  // namespace
+#endif
 
 struct NvlinkTransport::ConsumerMetrics {
     std::array<std::atomic<uint64_t>, 2> mapping_cache_total{};
@@ -541,6 +563,38 @@ NvlinkVmmAllocation::DriverApi NvlinkVmmAllocation::ProductionDriverApi() {
     return api;
 }
 
+bool NvlinkVmmAllocation::RegisterOwnedRange(void* base, size_t length) {
+    if (base == nullptr || length == 0) return false;
+    std::lock_guard<std::mutex> lock(ownedVmmRangesMutex());
+    auto& ranges = ownedVmmRanges();
+    const uintptr_t address = reinterpret_cast<uintptr_t>(base);
+    auto [it, inserted] = ranges.emplace(address, OwnedVmmRange{length, 0});
+    if (!inserted && it->second.length != length) return false;
+    ++it->second.owners;
+    return true;
+}
+
+void NvlinkVmmAllocation::UnregisterOwnedRange(void* base, size_t length) {
+    if (base == nullptr || length == 0) return;
+    std::lock_guard<std::mutex> lock(ownedVmmRangesMutex());
+    auto& ranges = ownedVmmRanges();
+    const auto it = ranges.find(reinterpret_cast<uintptr_t>(base));
+    if (it == ranges.end() || it->second.length != length) {
+        LOG(ERROR) << "NvlinkVmmAllocation: owned range registry mismatch";
+        return;
+    }
+    if (--it->second.owners == 0) ranges.erase(it);
+}
+
+bool NvlinkVmmAllocation::IsExactOwnedRange(void* base, size_t length) {
+    if (base == nullptr || length == 0) return false;
+    std::lock_guard<std::mutex> lock(ownedVmmRangesMutex());
+    const auto& ranges = ownedVmmRanges();
+    const auto it = ranges.find(reinterpret_cast<uintptr_t>(base));
+    return it != ranges.end() && it->second.length == length &&
+           it->second.owners > 0;
+}
+
 NvlinkVmmAllocation::NvlinkVmmAllocation(NvlinkVmmAllocation&& other) noexcept {
     *this = std::move(other);
 }
@@ -561,6 +615,7 @@ NvlinkVmmAllocation& NvlinkVmmAllocation::operator=(
     address_reserved_ = other.address_reserved_;
     handle_owned_ = other.handle_owned_;
     allocation_handle_ = other.allocation_handle_;
+    owned_range_registered_ = other.owned_range_registered_;
     driver_api_ = std::move(other.driver_api_);
 
     other.base_ = nullptr;
@@ -571,6 +626,7 @@ NvlinkVmmAllocation& NvlinkVmmAllocation::operator=(
     other.address_reserved_ = false;
     other.handle_owned_ = false;
     other.allocation_handle_ = 0;
+    other.owned_range_registered_ = false;
     return *this;
 }
 
@@ -578,6 +634,10 @@ NvlinkVmmAllocation::~NvlinkVmmAllocation() { reset(); }
 
 void NvlinkVmmAllocation::reset() noexcept {
     const CUdeviceptr ptr = reinterpret_cast<CUdeviceptr>(base_);
+    if (owned_range_registered_) {
+        UnregisterOwnedRange(base_, length_);
+        owned_range_registered_ = false;
+    }
     if (mapped_ && driver_api_.mem_unmap) {
         CUresult result = driver_api_.mem_unmap(ptr, length_);
         if (result != CUDA_SUCCESS)
@@ -860,6 +920,15 @@ Status NvlinkVmmAllocation::CreateWithDriverApi(
     }
     owner->handle_owned_ = false;
     owner->allocation_handle_ = 0;
+    if (options.location_type == LocationType::HOST_NUMA &&
+        options.fabric_exportable) {
+        if (!RegisterOwnedRange(owner->base_, owner->length_)) {
+            owner->reset();
+            return Status::Memory(
+                "HOST_NUMA VMM owned-range provenance registration failed");
+        }
+        owner->owned_range_registered_ = true;
+    }
     allocation = std::move(owner);
     return Status::OK();
 }
@@ -1635,6 +1704,14 @@ int NvlinkTransport::registerLocalMemory(void* addr, size_t length,
                 return ERR_MEMORY;
             }
 
+            if (!NvlinkVmmAllocation::IsExactOwnedRange(addr, length)) {
+                LOG(ERROR)
+                    << "NvlinkTransport: HOST_NUMA range-query fallback "
+                       "requires an exact Mooncake-owned VMM base and length";
+                fabric_driver_api_.mem_release(handle);
+                return ERR_INVALID_ARGUMENT;
+            }
+
             // CUDA's legacy address-range query may reject HOST_NUMA VMM
             // mappings even though retaining and exporting their allocation
             // handle is supported. Store registers the exact base and aligned
@@ -1648,6 +1725,13 @@ int NvlinkTransport::registerLocalMemory(void* addr, size_t length,
             real_address = reinterpret_cast<CUdeviceptr>(addr);
             real_size = length;
         } else if (real_address == 0 && is_host_numa) {
+            if (!NvlinkVmmAllocation::IsExactOwnedRange(addr, length)) {
+                LOG(ERROR)
+                    << "NvlinkTransport: HOST_NUMA null-base fallback "
+                       "requires an exact Mooncake-owned VMM base and length";
+                fabric_driver_api_.mem_release(handle);
+                return ERR_INVALID_ARGUMENT;
+            }
             LOG(WARNING)
                 << "NvlinkTransport: cuMemGetAddressRange returned a null "
                    "base for HOST_NUMA VMM allocation; using exact registered "

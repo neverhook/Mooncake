@@ -360,7 +360,9 @@ For `remote_accessible=true`:
 - query the exact whole mapped range;
 - when the legacy `cuMemGetAddressRange()` query rejects a verified HOST_NUMA
   VMM mapping (for example with CUDA error 201) or returns a null base, use the
-  exact base and aligned length passed by the owning `NvlinkVmmAllocation`;
+  exact base and aligned length only when they match a live
+  `NvlinkVmmAllocation` ownership record; arbitrary callers and interior
+  subranges are rejected;
   DEVICE allocations still fail the query, and the old guessed 2 MiB fallback
   remains forbidden;
 - export one `CUmemFabricHandle`;

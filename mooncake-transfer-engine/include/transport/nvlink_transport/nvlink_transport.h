@@ -145,10 +145,14 @@ class NvlinkVmmAllocation {
 
    private:
     friend class NvlinkTransport;
+    friend class NvlinkTransportTestPeer;
     NvlinkVmmAllocation() = default;
 
 #if defined(USE_MNNVL) && defined(USE_CUDA)
     static DriverApi ProductionDriverApi();
+    static bool RegisterOwnedRange(void* base, size_t length);
+    static void UnregisterOwnedRange(void* base, size_t length);
+    static bool IsExactOwnedRange(void* base, size_t length);
     void reset() noexcept;
 #endif
 
@@ -164,6 +168,7 @@ class NvlinkVmmAllocation {
     bool handle_owned_ = false;
     uint64_t allocation_handle_ = 0;
 #if defined(USE_MNNVL) && defined(USE_CUDA)
+    bool owned_range_registered_ = false;
     DriverApi driver_api_;
 #endif
 };

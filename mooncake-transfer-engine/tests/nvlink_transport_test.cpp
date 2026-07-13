@@ -129,6 +129,21 @@ class NvlinkTransportTestPeer {
     static size_t registrationCount(const NvlinkTransport& transport) {
         return transport.local_registrations_.size();
     }
+
+    static std::unique_ptr<NvlinkVmmAllocation> makeOwnedHostNumaRange(
+        void* base, size_t length) {
+        std::unique_ptr<NvlinkVmmAllocation> allocation(
+            new NvlinkVmmAllocation());
+        allocation->base_ = base;
+        allocation->length_ = length;
+        allocation->location_type_ =
+            NvlinkVmmAllocation::LocationType::HOST_NUMA;
+        allocation->fabric_exportable_ = true;
+        allocation->owned_range_registered_ =
+            NvlinkVmmAllocation::RegisterOwnedRange(base, length);
+        if (!allocation->owned_range_registered_) return nullptr;
+        return allocation;
+    }
 };
 
 }  // namespace mooncake
@@ -511,6 +526,10 @@ TEST(NvlinkTransportUnitTest,
     driver.allocation_location_type = CU_MEM_LOCATION_TYPE_HOST_NUMA;
     int add_calls = 0;
     TransferMetadata::BufferDesc published;
+    auto owner = NvlinkTransportTestPeer::makeOwnedHostNumaRange(
+        reinterpret_cast<void*>(FakeFabricDriver::kPublishedBase),
+        FakeFabricDriver::kMappedLength);
+    ASSERT_NE(owner, nullptr);
 
     NvlinkTransport transport;
     NvlinkTransportTestPeer::configureFabric(
@@ -532,6 +551,38 @@ TEST(NvlinkTransportUnitTest,
     EXPECT_EQ(driver.live_handles, 1);
 
     ASSERT_EQ(NvlinkTransportTestPeer::unregister(transport, address), 0);
+    driver.expectNoResources();
+}
+
+TEST(NvlinkTransportUnitTest,
+     HostNumaRangeFallbackRejectsInteriorSubrangeWithoutProvenance) {
+    FakeFabricDriver driver;
+    driver.failure = FakeFabricDriver::Failure::ADDRESS_RANGE;
+    driver.allocation_location_type = CU_MEM_LOCATION_TYPE_HOST_NUMA;
+    int add_calls = 0;
+    auto owner = NvlinkTransportTestPeer::makeOwnedHostNumaRange(
+        reinterpret_cast<void*>(FakeFabricDriver::kPublishedBase),
+        FakeFabricDriver::kMappedLength);
+    ASSERT_NE(owner, nullptr);
+
+    NvlinkTransport transport;
+    NvlinkTransportTestPeer::configureFabric(
+        transport, driver.api(),
+        [&](const TransferMetadata::BufferDesc&, bool) {
+            ++add_calls;
+            return 0;
+        });
+
+    constexpr size_t kInteriorOffset = 4096;
+    void* interior = reinterpret_cast<void*>(
+        FakeFabricDriver::kPublishedBase + kInteriorOffset);
+    EXPECT_EQ(NvlinkTransportTestPeer::registerRemote(
+                  transport, interior,
+                  FakeFabricDriver::kMappedLength - kInteriorOffset),
+              ERR_INVALID_ARGUMENT);
+    EXPECT_EQ(add_calls, 0);
+    EXPECT_EQ(NvlinkTransportTestPeer::registrationCount(transport), 0);
+    EXPECT_EQ(driver.release_calls, 1);
     driver.expectNoResources();
 }
 

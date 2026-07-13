@@ -76,41 +76,40 @@ class NvlinkTransportTestPeer {
                 if (result == CUDA_SUCCESS) ++audit->live_handles;
                 return result;
             };
-        api.mem_address_reserve =
-            [audit, original_reserve](CUdeviceptr* address, size_t size,
+        api.mem_address_reserve = [audit, original_reserve](
+                                      CUdeviceptr* address, size_t size,
                                       size_t alignment, CUdeviceptr requested,
                                       unsigned long long flags) {
-                const CUresult result = original_reserve(
-                    address, size, alignment, requested, flags);
-                if (result == CUDA_SUCCESS) ++audit->live_reserved_ranges;
-                return result;
-            };
-        api.mem_map =
-            [audit, original_map](CUdeviceptr address, size_t size,
-                                  size_t offset,
-                                  CUmemGenericAllocationHandle handle,
-                                  unsigned long long flags) {
-                if (audit->fail_next_map.exchange(false)) {
-                    ++audit->injected_map_failures;
-                    return CUDA_ERROR_INVALID_VALUE;
-                }
-                const CUresult result =
-                    original_map(address, size, offset, handle, flags);
-                if (result == CUDA_SUCCESS) ++audit->live_mappings;
-                return result;
-            };
+            const CUresult result =
+                original_reserve(address, size, alignment, requested, flags);
+            if (result == CUDA_SUCCESS) ++audit->live_reserved_ranges;
+            return result;
+        };
+        api.mem_map = [audit, original_map](CUdeviceptr address, size_t size,
+                                            size_t offset,
+                                            CUmemGenericAllocationHandle handle,
+                                            unsigned long long flags) {
+            if (audit->fail_next_map.exchange(false)) {
+                ++audit->injected_map_failures;
+                return CUDA_ERROR_INVALID_VALUE;
+            }
+            const CUresult result =
+                original_map(address, size, offset, handle, flags);
+            if (result == CUDA_SUCCESS) ++audit->live_mappings;
+            return result;
+        };
         api.mem_unmap = [audit, original_unmap](CUdeviceptr address,
                                                 size_t size) {
             const CUresult result = original_unmap(address, size);
             if (result == CUDA_SUCCESS) --audit->live_mappings;
             return result;
         };
-        api.mem_address_free =
-            [audit, original_free](CUdeviceptr address, size_t size) {
-                const CUresult result = original_free(address, size);
-                if (result == CUDA_SUCCESS) --audit->live_reserved_ranges;
-                return result;
-            };
+        api.mem_address_free = [audit, original_free](CUdeviceptr address,
+                                                      size_t size) {
+            const CUresult result = original_free(address, size);
+            if (result == CUDA_SUCCESS) --audit->live_reserved_ranges;
+            return result;
+        };
         api.mem_release =
             [audit, original_release](CUmemGenericAllocationHandle handle) {
                 const CUresult result = original_release(handle);
@@ -620,17 +619,17 @@ TEST(NvlinkHostNumaFabricTest, CpuAllVisibleGpusAndColdWarmFabricPath) {
         ASSERT_TRUE(exported)
             << "remote registration must publish one serialized Fabric handle";
 
-    auto client = std::make_unique<TransferEngine>(false);
-    ASSERT_EQ(client->init(P2PHANDSHAKE, "127.0.0.1:0", "127.0.0.1", 0), 0);
-    ASSERT_NE(client->installTransport("nvlink", nullptr), nullptr);
-    auto* client_nvlink =
-        dynamic_cast<NvlinkTransport*>(client->getTransport("nvlink"));
-    ASSERT_NE(client_nvlink, nullptr);
-    auto import_audit = std::make_shared<FabricImportAudit>();
-    NvlinkTransportTestPeer::InstallOneShotMapFailure(*client_nvlink,
-                                                      import_audit);
-    const SegmentID provider_segment =
-        client->openSegment(server->getLocalIpAndPort());
+        auto client = std::make_unique<TransferEngine>(false);
+        ASSERT_EQ(client->init(P2PHANDSHAKE, "127.0.0.1:0", "127.0.0.1", 0), 0);
+        ASSERT_NE(client->installTransport("nvlink", nullptr), nullptr);
+        auto* client_nvlink =
+            dynamic_cast<NvlinkTransport*>(client->getTransport("nvlink"));
+        ASSERT_NE(client_nvlink, nullptr);
+        auto import_audit = std::make_shared<FabricImportAudit>();
+        NvlinkTransportTestPeer::InstallOneShotMapFailure(*client_nvlink,
+                                                          import_audit);
+        const SegmentID provider_segment =
+            client->openSegment(server->getLocalIpAndPort());
         ASSERT_NE(provider_segment, static_cast<SegmentID>(-1));
 
         bool cold_transfer_completed = false;
@@ -681,16 +680,49 @@ TEST(NvlinkHostNumaFabricTest, CpuAllVisibleGpusAndColdWarmFabricPath) {
             ASSERT_EQ(cudaMemcpy(hbm.get(), write_pattern.data(),
                                  kTransferBytes, cudaMemcpyHostToDevice),
                       cudaSuccess);
+            if (!cold_transfer_completed) {
+                const std::string injected_error = RunTransfer(
+                    *client, TransferRequest::WRITE, hbm.get(),
+                    provider_segment, allocation->base(), kTransferBytes);
+                ASSERT_FALSE(injected_error.empty())
+                    << "one-shot cuMemMap failure was not surfaced";
+                if (import_audit->injected_map_failures.load() == 0) {
+                    REQUIRE_FABRIC_OR_SKIP(
+                        strict,
+                        "cold Fabric import prerequisite failed before "
+                        "the injected cuMemMap stage: " +
+                            injected_error);
+                }
+                ASSERT_EQ(import_audit->injected_map_failures.load(), 1);
+                ASSERT_EQ(NvlinkTransportTestPeer::MappingCount(*client_nvlink),
+                          0U);
+                ASSERT_EQ(import_audit->live_handles.load(), 0);
+                ASSERT_EQ(import_audit->live_reserved_ranges.load(), 0);
+                ASSERT_EQ(import_audit->live_mappings.load(), 0);
+            }
+
+            const int imports_before_success =
+                import_audit->import_calls.load();
             const std::string write_error = RunTransfer(
                 *client, TransferRequest::WRITE, hbm.get(), provider_segment,
                 allocation->base(), kTransferBytes);
             if (!cold_transfer_completed && !write_error.empty()) {
                 REQUIRE_FABRIC_OR_SKIP(
                     strict,
-                    "cold Fabric import/map/copy prerequisite failed: " +
+                    "Fabric import retry prerequisite failed after clean "
+                    "rollback: " +
                         write_error);
             }
             ASSERT_TRUE(write_error.empty()) << write_error;
+            if (!cold_transfer_completed) {
+                ASSERT_EQ(import_audit->import_calls.load(),
+                          imports_before_success + 1);
+                ASSERT_EQ(NvlinkTransportTestPeer::MappingCount(*client_nvlink),
+                          1U);
+                ASSERT_EQ(import_audit->live_handles.load(), 0);
+                ASSERT_EQ(import_audit->live_reserved_ranges.load(), 1);
+                ASSERT_EQ(import_audit->live_mappings.load(), 1);
+            }
             cold_transfer_completed = true;
             std::atomic_thread_fence(std::memory_order_seq_cst);
             ASSERT_TRUE(MatchesPattern(host_numa, write_pattern));
@@ -702,10 +734,13 @@ TEST(NvlinkHostNumaFabricTest, CpuAllVisibleGpusAndColdWarmFabricPath) {
                 MakePattern(kTransferBytes, 0xa0U + device);
             std::copy(read_pattern.begin(), read_pattern.end(), host_numa);
             std::atomic_thread_fence(std::memory_order_seq_cst);
+            const int imports_before_warm = import_audit->import_calls.load();
             const std::string read_error = RunTransfer(
                 *client, TransferRequest::READ, hbm.get(), provider_segment,
                 allocation->base(), kTransferBytes);
             ASSERT_TRUE(read_error.empty()) << read_error;
+            ASSERT_EQ(import_audit->import_calls.load(), imports_before_warm)
+                << "warm transfer unexpectedly missed the Fabric map cache";
             ASSERT_EQ(cudaMemcpy(observed.data(), hbm.get(), kTransferBytes,
                                  cudaMemcpyDeviceToHost),
                       cudaSuccess);
@@ -719,6 +754,9 @@ TEST(NvlinkHostNumaFabricTest, CpuAllVisibleGpusAndColdWarmFabricPath) {
         // Destroy the Consumer first so imported mappings are unmapped before
         // the Provider unregisters and releases the owning VMM allocation.
         client.reset();
+        ASSERT_EQ(import_audit->live_handles.load(), 0);
+        ASSERT_EQ(import_audit->live_reserved_ranges.load(), 0);
+        ASSERT_EQ(import_audit->live_mappings.load(), 0);
         ASSERT_EQ(server_registration.Reset(), 0);
         allocation.reset();
         server.reset();

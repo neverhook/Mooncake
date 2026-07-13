@@ -27,6 +27,21 @@ using namespace mooncake;
 
 namespace mooncake {
 
+class TransferMetadataTestPeer {
+   public:
+    static int EncodeSegmentDesc(TransferMetadata& metadata,
+                                 const TransferMetadata::SegmentDesc& desc,
+                                 Json::Value& encoded) {
+        return metadata.encodeSegmentDesc(desc, encoded);
+    }
+
+    static std::shared_ptr<TransferMetadata::SegmentDesc> DecodeSegmentDesc(
+        TransferMetadata& metadata, Json::Value& encoded,
+        const std::string& segment_name) {
+        return metadata.decodeSegmentDesc(encoded, segment_name);
+    }
+};
+
 template <typename T>
 concept HasMemoryKind = requires(T value) { value.memory_kind; };
 template <typename T>
@@ -44,6 +59,77 @@ static_assert(!HasMemoryKind<TransferMetadata::BufferDesc>);
 static_assert(!HasNumaNode<TransferMetadata::BufferDesc>);
 static_assert(!HasFabricDomain<TransferMetadata::BufferDesc>);
 static_assert(!HasGeneration<TransferMetadata::BufferDesc>);
+
+TEST(TransferMetadataSchemaTest, NvlinkDescriptorMatchesV1GoldenJson) {
+    TransferMetadata metadata(P2PHANDSHAKE);
+    // Freeze the V1 JSON contract from origin/main@98ff4e47. Compare parsed
+    // values so key order and whitespace do not become accidental ABI.
+    TransferMetadata::SegmentDesc descriptor{};
+    descriptor.name = "provider:12345";
+    descriptor.protocol = "nvlink";
+    descriptor.tcp_data_port = 0;
+
+    TransferMetadata::BufferDesc buffer{};
+    buffer.name = descriptor.name;
+    buffer.addr = 0x100000000ULL;
+    buffer.length = 0x20000ULL;
+    buffer.shm_name = "fabric-handle-v1";
+    descriptor.buffers.push_back(buffer);
+
+    Json::Value encoded;
+    ASSERT_EQ(TransferMetadataTestPeer::EncodeSegmentDesc(metadata, descriptor,
+                                                          encoded),
+              0);
+    ASSERT_TRUE(encoded.isMember("timestamp"));
+    ASSERT_TRUE(encoded["timestamp"].isString());
+    ASSERT_FALSE(encoded["timestamp"].asString().empty());
+    encoded["timestamp"] = "<timestamp>";
+
+    Json::Value expected;
+    expected["name"] = descriptor.name;
+    expected["protocol"] = descriptor.protocol;
+    expected["tcp_data_port"] = descriptor.tcp_data_port;
+    expected["timestamp"] = "<timestamp>";
+    Json::Value expected_buffers(Json::arrayValue);
+    Json::Value expected_buffer;
+    expected_buffer["name"] = buffer.name;
+    expected_buffer["addr"] = static_cast<Json::UInt64>(buffer.addr);
+    expected_buffer["length"] = static_cast<Json::UInt64>(buffer.length);
+    expected_buffer["shm_name"] = buffer.shm_name;
+    expected_buffers.append(expected_buffer);
+    expected["buffers"] = expected_buffers;
+
+    EXPECT_EQ(encoded, expected)
+        << "NVLink SegmentDesc wire fields changed from the V1 golden schema";
+    for (const char* forbidden :
+         {"memory_kind", "numa_node", "fabric_domain_id", "generation"}) {
+        EXPECT_FALSE(encoded.isMember(forbidden));
+        EXPECT_FALSE(encoded["buffers"][0].isMember(forbidden));
+    }
+
+    Json::Value baseline_golden = expected;
+    auto decoded = TransferMetadataTestPeer::DecodeSegmentDesc(
+        metadata, baseline_golden, descriptor.name);
+    ASSERT_NE(decoded, nullptr);
+    EXPECT_EQ(decoded->name, descriptor.name);
+    EXPECT_EQ(decoded->protocol, descriptor.protocol);
+    EXPECT_EQ(decoded->tcp_data_port, descriptor.tcp_data_port);
+    ASSERT_EQ(decoded->buffers.size(), 1U);
+    EXPECT_EQ(decoded->buffers[0].name, buffer.name);
+    EXPECT_EQ(decoded->buffers[0].addr, buffer.addr);
+    EXPECT_EQ(decoded->buffers[0].length, buffer.length);
+    EXPECT_EQ(decoded->buffers[0].shm_name, buffer.shm_name);
+
+    Json::Value reencoded;
+    ASSERT_EQ(TransferMetadataTestPeer::EncodeSegmentDesc(metadata, *decoded,
+                                                          reencoded),
+              0);
+    ASSERT_TRUE(reencoded.isMember("timestamp"));
+    ASSERT_TRUE(reencoded["timestamp"].isString());
+    ASSERT_FALSE(reencoded["timestamp"].asString().empty());
+    reencoded["timestamp"] = "<timestamp>";
+    EXPECT_EQ(reencoded, expected);
+}
 
 TEST(TransferTaskSubmissionFailureTest, ZeroSliceFailureIsExplicitlyTerminal) {
     Transport::BatchDesc batch;

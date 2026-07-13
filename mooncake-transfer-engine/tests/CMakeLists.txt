@@ -290,7 +290,7 @@ add_test(NAME transfer_metadata_test COMMAND transfer_metadata_test)
 add_test(
   NAME nvlink_host_numa_transfer_metadata_test
   COMMAND $<TARGET_FILE:transfer_metadata_test>
-          --gtest_filter=TransferTaskSubmissionFailureTest.*)
+          --gtest_filter=TransferMetadataSchemaTest.*:TransferTaskSubmissionFailureTest.*)
 set_tests_properties(nvlink_host_numa_transfer_metadata_test
                      PROPERTIES LABELS "nvlink_host_numa_unit")
 

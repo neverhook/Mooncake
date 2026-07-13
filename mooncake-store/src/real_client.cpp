@@ -12,6 +12,7 @@
 #include <cstdlib>  // for atexit
 #include <algorithm>
 #include <cctype>
+#include <exception>
 #include <functional>
 #include <limits>
 #include <optional>
@@ -343,6 +344,157 @@ inline QueryResult FilterQueryResult(const QueryResult& qr,
                                      const Replica::Descriptor& replica) {
     return QueryResult({replica}, qr.lease_timeout);
 }
+}  // namespace
+
+namespace {
+
+class ProductionNvlinkHostNumaAllocation final
+    : public NvlinkHostNumaAllocation {
+   public:
+    explicit ProductionNvlinkHostNumaAllocation(
+        std::unique_ptr<NvlinkVmmAllocation> owner)
+        : owner_(std::move(owner)) {}
+
+    void* base() const override { return owner_->base(); }
+    size_t length() const override { return owner_->length(); }
+    size_t granularity() const override { return owner_->granularity(); }
+
+   private:
+    std::unique_ptr<NvlinkVmmAllocation> owner_;
+};
+
+class ProductionNvlinkHostNumaOperations final
+    : public NvlinkHostNumaOperations {
+   public:
+    explicit ProductionNvlinkHostNumaOperations(RealClient& owner)
+        : owner_(owner) {}
+
+    tl::expected<std::unique_ptr<NvlinkHostNumaAllocation>, ErrorCode> Allocate(
+        const NvlinkHostNumaAllocationRequest& request) override {
+        NvlinkVmmAllocation::Options options;
+        options.location_type =
+            NvlinkVmmAllocation::LocationType::HOST_NUMA;
+        options.location_id = request.numa_node;
+        options.requested_length = request.requested_length;
+        options.fabric_exportable = request.fabric_exportable;
+        options.required_va_alignment = request.required_va_alignment;
+        options.access_observer = [this](uint64_t duration_us, bool success) {
+            if (owner_.client_) {
+                owner_.client_->ObserveNvlinkHostNumaStage(
+                    NvlinkHostNumaStage::kAccess, duration_us, success);
+            }
+        };
+
+        std::unique_ptr<NvlinkVmmAllocation> allocation;
+        Status status = NvlinkVmmAllocation::Create(options, allocation);
+        if (!status.ok() || allocation == nullptr) {
+            LOG(ERROR) << "NVLink HOST_NUMA "
+                       << (request.role == NvlinkHostNumaAllocationRole::kLocal
+                               ? "local"
+                               : "global")
+                       << " allocation failed for node " << request.numa_node
+                       << ", chunk=" << request.plan_index << ": " << status;
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        return std::unique_ptr<NvlinkHostNumaAllocation>(
+            new ProductionNvlinkHostNumaAllocation(std::move(allocation)));
+    }
+
+    tl::expected<void, ErrorCode> InstallAllocatorView(
+        NvlinkHostNumaAllocation* local_allocation,
+        size_t configured_local_length) override {
+        try {
+            if (local_allocation != nullptr) {
+                owner_.client_buffer_allocator_ = ClientBufferAllocator::create(
+                    local_allocation->base(), configured_local_length,
+                    "nvlink");
+            } else {
+                owner_.client_buffer_allocator_ =
+                    ClientBufferAllocator::create(size_t{0}, "nvlink");
+            }
+        } catch (const std::exception& error) {
+            LOG(ERROR) << "NVLink HOST_NUMA allocator view creation failed: "
+                       << error.what();
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        return {};
+    }
+
+    void ReleaseAllocatorView() override {
+        {
+            std::unique_lock<std::shared_mutex> lock(
+                owner_.registered_buffer_mutex_);
+            owner_.local_buffer_region_.reset();
+        }
+        owner_.client_buffer_allocator_.reset();
+    }
+
+    tl::expected<void, ErrorCode> RegisterLocal(
+        void* base, size_t length, bool remote_accessible) override {
+        if (!owner_.client_) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        auto registered = owner_.client_->RegisterLocalMemory(
+            base, length, kWildcardLocation, remote_accessible, false);
+        if (!registered) return registered;
+
+        std::unique_lock<std::shared_mutex> lock(owner_.registered_buffer_mutex_);
+        owner_.local_buffer_region_ = RealClient::WritableBufferRegion{
+            .base = base,
+            .size = length,
+            .offset = 0,
+        };
+        return {};
+    }
+
+    tl::expected<UUID, ErrorCode> MountGlobal(void* base,
+                                              size_t length) override {
+        if (!owner_.client_) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        return owner_.client_->MountSegmentAndGetId(
+            base, length, "nvlink", kWildcardLocation);
+    }
+
+    tl::expected<void, ErrorCode> UnmountGlobal(
+        const UUID& segment_id) override {
+        if (!owner_.client_) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        return owner_.client_->UnmountSegmentById(segment_id);
+    }
+
+    tl::expected<void, ErrorCode> UnregisterIfPresent(
+        void* base, bool update_metadata) override {
+        if (!owner_.client_) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        return owner_.client_->UnregisterLocalMemoryIfPresent(base,
+                                                               update_metadata);
+    }
+
+    tl::expected<void, ErrorCode> Destroy(
+        std::unique_ptr<NvlinkHostNumaAllocation>& allocation) override {
+        allocation.reset();
+        return {};
+    }
+
+   private:
+    RealClient& owner_;
+};
+
+NvlinkHostNumaStage ToMetricStage(NvlinkHostNumaOrchestrationStage stage) {
+    switch (stage) {
+        case NvlinkHostNumaOrchestrationStage::kAllocation:
+            return NvlinkHostNumaStage::kAllocation;
+        case NvlinkHostNumaOrchestrationStage::kRegistration:
+            return NvlinkHostNumaStage::kRegistration;
+        case NvlinkHostNumaOrchestrationStage::kMount:
+            return NvlinkHostNumaStage::kMount;
+    }
+    return NvlinkHostNumaStage::kAllocation;
+}
+
 }  // namespace
 
 PyClient::~PyClient() {}
@@ -782,117 +934,6 @@ tl::expected<void, ErrorCode> RealClient::SetupNvlinkHostNuma(
             chunk_count);
     }
 
-    // Allocation is deliberately completed for every local/global range before
-    // Client registration or Master publication begins.
-    stage_start = std::chrono::steady_clock::now();
-    nvlink_host_numa_globals_.clear();
-    nvlink_host_numa_local_.reset();
-    nvlink_host_numa_globals_.reserve(plan.chunks.size());
-
-    if (local_buffer_size > 0) {
-        NvlinkVmmAllocation::Options allocation_options;
-        allocation_options.location_type =
-            NvlinkVmmAllocation::LocationType::HOST_NUMA;
-        allocation_options.location_id = local_numa_node;
-        allocation_options.requested_length = local_buffer_size;
-        allocation_options.fabric_exportable = false;
-        allocation_options.access_observer = [this](uint64_t duration_us,
-                                                    bool success) {
-            client_->ObserveNvlinkHostNumaStage(NvlinkHostNumaStage::kAccess,
-                                                duration_us, success);
-        };
-        std::unique_ptr<NvlinkVmmAllocation> allocation;
-        Status status =
-            NvlinkVmmAllocation::Create(allocation_options, allocation);
-        if (!status.ok()) {
-            LOG(ERROR) << "NVLink HOST_NUMA local allocation failed: "
-                       << status;
-            observe_stage(NvlinkHostNumaStage::kAllocation, stage_start, false);
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
-        NvlinkHostNumaLocalRecord local_record;
-        LOG(INFO) << "NVLink HOST_NUMA allocated local node=" << local_numa_node
-                  << " configured_bytes=" << local_buffer_size
-                  << " mapped_bytes=" << allocation->length()
-                  << " granularity=" << allocation->granularity();
-        local_record.allocation = std::move(allocation);
-        nvlink_host_numa_local_.emplace(std::move(local_record));
-    }
-
-    for (const auto& chunk : plan.chunks) {
-        NvlinkVmmAllocation::Options allocation_options;
-        allocation_options.location_type =
-            NvlinkVmmAllocation::LocationType::HOST_NUMA;
-        allocation_options.location_id = chunk.node_id;
-        allocation_options.requested_length = chunk.chunk_bytes;
-        allocation_options.fabric_exportable = true;
-        allocation_options.required_va_alignment = plan.common_alignment;
-        allocation_options.access_observer = [this](uint64_t duration_us,
-                                                    bool success) {
-            client_->ObserveNvlinkHostNumaStage(NvlinkHostNumaStage::kAccess,
-                                                duration_us, success);
-        };
-        std::unique_ptr<NvlinkVmmAllocation> allocation;
-        Status status =
-            NvlinkVmmAllocation::Create(allocation_options, allocation);
-        if (!status.ok() || allocation == nullptr ||
-            allocation->length() != chunk.chunk_bytes ||
-            reinterpret_cast<uintptr_t>(allocation->base()) %
-                    plan.common_alignment !=
-                0) {
-            LOG(ERROR) << "NVLink HOST_NUMA global allocation failed for node "
-                       << chunk.node_id << ", chunk=" << chunk.plan_index
-                       << ": " << status;
-            observe_stage(NvlinkHostNumaStage::kAllocation, stage_start, false);
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
-        NvlinkHostNumaGlobalRecord record;
-        record.allocation = std::move(allocation);
-        record.numa_node = chunk.node_id;
-        record.plan_index = chunk.plan_index;
-        LOG(INFO) << "NVLink HOST_NUMA allocated node=" << chunk.node_id
-                  << " chunk=" << chunk.plan_index
-                  << " bytes=" << record.allocation->length()
-                  << " granularity=" << record.allocation->granularity();
-        nvlink_host_numa_globals_.push_back(std::move(record));
-    }
-    observe_stage(NvlinkHostNumaStage::kAllocation, stage_start, true);
-
-    if (nvlink_host_numa_local_) {
-        auto& local = *nvlink_host_numa_local_;
-        local.allocator_view = ClientBufferAllocator::create(
-            local.allocation->base(), local_buffer_size, "nvlink");
-        client_buffer_allocator_ = local.allocator_view;
-    } else {
-        client_buffer_allocator_ =
-            ClientBufferAllocator::create(size_t{0}, "nvlink");
-    }
-    nvlink_host_numa_allocator_installed_ = true;
-
-    stage_start = std::chrono::steady_clock::now();
-    if (nvlink_host_numa_local_) {
-        auto& local = *nvlink_host_numa_local_;
-        auto registered = client_->RegisterLocalMemory(
-            local.allocation->base(), local_buffer_size, kWildcardLocation,
-            false, false);
-        if (!registered) {
-            LOG(ERROR) << "NVLink HOST_NUMA local registration failed: "
-                       << toString(registered.error());
-            observe_stage(NvlinkHostNumaStage::kRegistration, stage_start,
-                          false);
-            return tl::make_unexpected(registered.error());
-        }
-        local.registered = true;
-        std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
-        local_buffer_region_ = WritableBufferRegion{
-            .base = local.allocation->base(),
-            .size = local_buffer_size,
-            .offset = 0,
-        };
-    }
-    observe_stage(NvlinkHostNumaStage::kRegistration, stage_start, true);
-
-    stage_start = std::chrono::steady_clock::now();
     const bool has_master_mount_test_hook =
         static_cast<bool>(nvlink_host_numa_master_mount_failure_for_test_);
     if (has_master_mount_test_hook) {
@@ -905,27 +946,19 @@ tl::expected<void, ErrorCode> RealClient::SetupNvlinkHostNuma(
                 client_->mount_segment_master_failure_for_test_ = {};
             }
         });
-    for (auto& record : nvlink_host_numa_globals_) {
-        record.registration_attempted = true;
-        auto mounted = client_->MountSegmentAndGetId(
-            record.allocation->base(), record.allocation->length(), "nvlink",
-            kWildcardLocation);
-        if (!mounted) {
-            LOG(ERROR) << "NVLink HOST_NUMA mount failed for node "
-                       << record.numa_node << ", chunk=" << record.plan_index
-                       << ", bytes=" << record.allocation->length()
-                       << ", granularity=" << record.allocation->granularity()
-                       << ": " << toString(mounted.error());
-            observe_stage(NvlinkHostNumaStage::kMount, stage_start, false);
-            return tl::make_unexpected(mounted.error());
-        }
-        record.mounted_segment_id = *mounted;
-        LOG(INFO) << "NVLink HOST_NUMA mounted node=" << record.numa_node
-                  << " chunk=" << record.plan_index
-                  << " bytes=" << record.allocation->length()
-                  << " granularity=" << record.allocation->granularity();
+    ProductionNvlinkHostNumaOperations operations(*this);
+    auto orchestrated = SetupNvlinkHostNumaOrchestration(
+        operations, plan, local_numa_node, local_buffer_size,
+        nvlink_host_numa_globals_, nvlink_host_numa_local_,
+        nvlink_host_numa_allocator_installed_,
+        [this](NvlinkHostNumaOrchestrationStage stage, uint64_t duration_us,
+               bool success) {
+            client_->ObserveNvlinkHostNumaStage(ToMetricStage(stage),
+                                                duration_us, success);
+        });
+    if (!orchestrated) {
+        return tl::make_unexpected(orchestrated.error().error);
     }
-    observe_stage(NvlinkHostNumaStage::kMount, stage_start, true);
 
     LOG(INFO) << "NVLink HOST_NUMA publication complete: requested="
               << global_segment_size << " effective=" << plan.effective_total
@@ -936,66 +969,10 @@ tl::expected<void, ErrorCode> RealClient::SetupNvlinkHostNuma(
 
 bool RealClient::CleanupNvlinkHostNuma(bool rollback) {
     const auto cleanup_start = std::chrono::steady_clock::now();
-    bool success = true;
-    auto record_cleanup = [&](bool step_success, const char* operation) {
-        if (!step_success) {
-            success = false;
-            LOG(ERROR) << "NVLink HOST_NUMA " << operation << " cleanup failed";
-        }
-    };
-
-    if (client_) {
-        // First reverse every successful Master publication by UUID. Repeated
-        // Provider names are intentionally never used to identify chunks.
-        for (auto it = nvlink_host_numa_globals_.rbegin();
-             it != nvlink_host_numa_globals_.rend(); ++it) {
-            if (!it->mounted_segment_id) continue;
-            auto unmounted =
-                client_->UnmountSegmentById(*it->mounted_segment_id);
-            record_cleanup(unmounted.has_value(), "global unmount");
-            if (unmounted) {
-                it->mounted_segment_id.reset();
-                it->registration_attempted = false;
-            }
-        }
-
-        // MountSegmentAndGetId already attempted compensation for the current
-        // failed mount. This idempotent base unregister is the orchestrator's
-        // fallback if that first attempt failed.
-        for (auto it = nvlink_host_numa_globals_.rbegin();
-             it != nvlink_host_numa_globals_.rend(); ++it) {
-            if (it->mounted_segment_id || !it->registration_attempted) continue;
-            auto unregistered = client_->UnregisterLocalMemoryIfPresent(
-                it->allocation->base(), true);
-            record_cleanup(unregistered.has_value(),
-                           "current registration fallback");
-            if (unregistered) it->registration_attempted = false;
-        }
-
-        if (nvlink_host_numa_local_ && nvlink_host_numa_local_->registered) {
-            auto unregistered = client_->unregisterLocalMemory(
-                nvlink_host_numa_local_->allocation->base(), false);
-            record_cleanup(unregistered.has_value(), "local unregister");
-            if (unregistered) nvlink_host_numa_local_->registered = false;
-        }
-    }
-
-    if (success) {
-        {
-            std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
-            local_buffer_region_.reset();
-        }
-        client_buffer_allocator_.reset();
-        nvlink_host_numa_allocator_installed_ = false;
-        if (nvlink_host_numa_local_) {
-            nvlink_host_numa_local_->allocator_view.reset();
-        }
-        nvlink_host_numa_local_.reset();
-        nvlink_host_numa_globals_.clear();
-    } else {
-        LOG(ERROR) << "NVLink HOST_NUMA cleanup is incomplete; retaining VMM "
-                      "allocations and ownership records for a later retry";
-    }
+    ProductionNvlinkHostNumaOperations operations(*this);
+    const bool success = CleanupNvlinkHostNumaOrchestration(
+        operations, nvlink_host_numa_globals_, nvlink_host_numa_local_,
+        nvlink_host_numa_allocator_installed_);
     if (client_) {
         const auto elapsed =
             std::chrono::duration_cast<std::chrono::microseconds>(

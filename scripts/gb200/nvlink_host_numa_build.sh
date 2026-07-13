@@ -94,6 +94,7 @@ assert_label_exact nvlink_host_numa_unit \
   client_integration_test \
   client_metrics_test \
   nvlink_host_numa_config_test \
+  nvlink_host_numa_orchestrator_test \
   nvlink_host_numa_setup_test \
   nvlink_host_numa_store_test \
   nvlink_transport_fake_driver_test \

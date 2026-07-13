@@ -18,6 +18,7 @@
 #include "client_service.h"
 #include "client_buffer.h"
 #include "mutex.h"
+#include "nvlink_host_numa_orchestrator.h"
 #include "utils.h"
 #include "rpc_types.h"
 #if defined(USE_SUNRISE)
@@ -33,7 +34,6 @@ namespace mooncake {
 class RealClient;
 class UdsAcceptor;
 class UdsConnection;
-class NvlinkVmmAllocation;
 struct NvlinkHostNumaOptions;
 class NvlinkHostNumaStoreTestPeer;
 
@@ -758,20 +758,6 @@ class RealClient : public PyClient {
         void* base = nullptr;
         size_t size = 0;
         std::string protocol;
-    };
-
-    struct NvlinkHostNumaGlobalRecord {
-        std::unique_ptr<NvlinkVmmAllocation> allocation;
-        int numa_node = -1;
-        size_t plan_index = 0;
-        bool registration_attempted = false;
-        std::optional<UUID> mounted_segment_id;
-    };
-
-    struct NvlinkHostNumaLocalRecord {
-        std::unique_ptr<NvlinkVmmAllocation> allocation;
-        std::shared_ptr<ClientBufferAllocator> allocator_view;
-        bool registered = false;
     };
 
     std::unique_ptr<AutoPortBinder> port_binder_ = nullptr;

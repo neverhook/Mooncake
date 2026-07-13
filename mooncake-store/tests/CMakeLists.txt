@@ -85,6 +85,8 @@ add_store_test(utils_test utils_test.cpp)
 add_store_test(client_buffer_test client_buffer_test.cpp)
 add_store_test(nvlink_host_numa_config_test nvlink_host_numa_config_test.cpp)
 add_store_test(nvlink_host_numa_setup_test nvlink_host_numa_setup_test.cpp)
+add_store_test(nvlink_host_numa_orchestrator_test
+               nvlink_host_numa_orchestrator_test.cpp)
 add_executable(nvlink_host_numa_store_test nvlink_host_numa_store_test.cpp)
 target_include_directories(
   nvlink_host_numa_store_test
@@ -108,9 +110,12 @@ target_include_directories(nvlink_host_numa_config_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_include_directories(nvlink_host_numa_setup_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
-set_tests_properties(nvlink_host_numa_config_test nvlink_host_numa_setup_test
-                     nvlink_host_numa_store_test client_integration_test
-                     PROPERTIES LABELS "nvlink_host_numa_unit")
+target_include_directories(nvlink_host_numa_orchestrator_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+set_tests_properties(
+  nvlink_host_numa_config_test nvlink_host_numa_setup_test
+  nvlink_host_numa_orchestrator_test nvlink_host_numa_store_test
+  client_integration_test PROPERTIES LABELS "nvlink_host_numa_unit")
 if(USE_MNNVL AND USE_CUDA AND NOT USE_HIP)
   add_test(
     NAME nvlink_host_numa_store_hardware_test

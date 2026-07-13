@@ -27,6 +27,7 @@ set(MOONCAKE_STORE_SOURCES
     client_buffer.cpp
     aligned_client_buffer.cpp
     nvlink_host_numa.cpp
+    nvlink_host_numa_orchestrator.cpp
     real_client.cpp
     dummy_client.cpp
     uds_transport.cpp

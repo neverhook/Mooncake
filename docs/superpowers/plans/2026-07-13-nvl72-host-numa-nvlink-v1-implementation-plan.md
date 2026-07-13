@@ -21,8 +21,12 @@ label membership review, and non-strict preflight behavior. After the first
 GB200 compile exposed and the implementation fixed a test namespace error, a
 disposable Linux/arm64 CUDA 12.8 development container configured with
 `USE_CUDA=ON` and `USE_MNNVL=ON`, compiled the Store/Fabric/RDMA/VMM/metrics/HBM
-test targets, and passed all 10 `nvlink_host_numa_unit` CTest entries. This is
-compile and fake-driver/CPU evidence only: the container had no real CUDA
+test targets, and passed all 11 `nvlink_host_numa_unit` CTest entries, including
+the production-reused orchestration failure matrix. The final ownership audit
+also passed all 12 VMM fault-injection cases, including staged release retry
+and pinned-owner retention. The no-Torch Python harness parser/admin mock suite
+passed 4/4 and the Store binding imported with its read-only metrics API. This
+is compile and fake-driver/CPU evidence only: the container had no real CUDA
 driver, Fabric, IMEX, RNIC, or GB200 topology, so Fabric copy, Store hardware,
 and verbs smoke results remain `NOT RUN`.
 

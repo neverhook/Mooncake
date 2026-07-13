@@ -358,6 +358,7 @@ class ProductionNvlinkHostNumaAllocation final
     void* base() const override { return owner_->base(); }
     size_t length() const override { return owner_->length(); }
     size_t granularity() const override { return owner_->granularity(); }
+    Status Release() { return owner_->Release(); }
 
    private:
     std::unique_ptr<NvlinkVmmAllocation> owner_;
@@ -475,6 +476,31 @@ class ProductionNvlinkHostNumaOperations final
 
     tl::expected<void, ErrorCode> Destroy(
         std::unique_ptr<NvlinkHostNumaAllocation>& allocation) override {
+        auto* production_allocation =
+            dynamic_cast<ProductionNvlinkHostNumaAllocation*>(allocation.get());
+        if (production_allocation == nullptr) {
+            LOG(ERROR) << "NVLink HOST_NUMA destroy received an unknown "
+                          "allocation implementation";
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        try {
+            Status status = production_allocation->Release();
+            if (!status.ok()) {
+                LOG(ERROR) << "NVLink HOST_NUMA VMM release failed; retaining "
+                              "ownership for cleanup retry: "
+                           << status;
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+        } catch (const std::exception& error) {
+            LOG(ERROR) << "NVLink HOST_NUMA VMM release threw; retaining "
+                          "ownership for cleanup retry: "
+                       << error.what();
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        } catch (...) {
+            LOG(ERROR) << "NVLink HOST_NUMA VMM release threw an unknown "
+                          "exception; retaining ownership for cleanup retry";
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
         allocation.reset();
         return {};
     }

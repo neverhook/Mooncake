@@ -574,16 +574,18 @@ bool NvlinkVmmAllocation::RegisterOwnedRange(void* base, size_t length) {
     return true;
 }
 
-void NvlinkVmmAllocation::UnregisterOwnedRange(void* base, size_t length) {
-    if (base == nullptr || length == 0) return;
+bool NvlinkVmmAllocation::UnregisterOwnedRange(void* base, size_t length) {
+    if (base == nullptr || length == 0) return false;
     std::lock_guard<std::mutex> lock(ownedVmmRangesMutex());
     auto& ranges = ownedVmmRanges();
     const auto it = ranges.find(reinterpret_cast<uintptr_t>(base));
-    if (it == ranges.end() || it->second.length != length) {
+    if (it == ranges.end() || it->second.length != length ||
+        it->second.owners == 0) {
         LOG(ERROR) << "NvlinkVmmAllocation: owned range registry mismatch";
-        return;
+        return false;
     }
     if (--it->second.owners == 0) ranges.erase(it);
+    return true;
 }
 
 bool NvlinkVmmAllocation::IsExactOwnedRange(void* base, size_t length) {
@@ -595,28 +597,21 @@ bool NvlinkVmmAllocation::IsExactOwnedRange(void* base, size_t length) {
            it->second.owners > 0;
 }
 
-NvlinkVmmAllocation::NvlinkVmmAllocation(NvlinkVmmAllocation&& other) noexcept {
-    *this = std::move(other);
-}
-
-NvlinkVmmAllocation& NvlinkVmmAllocation::operator=(
-    NvlinkVmmAllocation&& other) noexcept {
-    if (this == &other) return *this;
-
-    reset();
-    base_ = other.base_;
-    length_ = other.length_;
-    granularity_ = other.granularity_;
-    va_alignment_ = other.va_alignment_;
-    location_type_ = other.location_type_;
-    location_id_ = other.location_id_;
-    fabric_exportable_ = other.fabric_exportable_;
-    mapped_ = other.mapped_;
-    address_reserved_ = other.address_reserved_;
-    handle_owned_ = other.handle_owned_;
-    allocation_handle_ = other.allocation_handle_;
-    owned_range_registered_ = other.owned_range_registered_;
-    driver_api_ = std::move(other.driver_api_);
+NvlinkVmmAllocation::NvlinkVmmAllocation(
+    NvlinkVmmAllocation&& other) noexcept
+    : base_(other.base_),
+      length_(other.length_),
+      granularity_(other.granularity_),
+      va_alignment_(other.va_alignment_),
+      location_type_(other.location_type_),
+      location_id_(other.location_id_),
+      fabric_exportable_(other.fabric_exportable_),
+      mapped_(other.mapped_),
+      address_reserved_(other.address_reserved_),
+      handle_owned_(other.handle_owned_),
+      allocation_handle_(other.allocation_handle_),
+      owned_range_registered_(other.owned_range_registered_),
+      driver_api_(std::move(other.driver_api_)) {
 
     other.base_ = nullptr;
     other.length_ = 0;
@@ -627,45 +622,81 @@ NvlinkVmmAllocation& NvlinkVmmAllocation::operator=(
     other.handle_owned_ = false;
     other.allocation_handle_ = 0;
     other.owned_range_registered_ = false;
-    return *this;
 }
 
 NvlinkVmmAllocation::~NvlinkVmmAllocation() { reset(); }
 
-void NvlinkVmmAllocation::reset() noexcept {
+Status NvlinkVmmAllocation::Release() {
     const CUdeviceptr ptr = reinterpret_cast<CUdeviceptr>(base_);
+
+    // Cleanup-pending Fabric memory must stop satisfying provenance checks
+    // before the first unmap attempt. Otherwise a failed unmap would leave a
+    // range eligible for a new remote-accessible registration while teardown
+    // is already in progress. This registry transition is idempotent and does
+    // not need to be repeated by later release retries.
     if (owned_range_registered_) {
-        UnregisterOwnedRange(base_, length_);
+        if (!UnregisterOwnedRange(base_, length_)) {
+            return Status::Memory(
+                "HOST_NUMA VMM owned-range provenance removal failed");
+        }
         owned_range_registered_ = false;
     }
-    if (mapped_ && driver_api_.mem_unmap) {
+
+    // These operations are deliberately serialized in reverse creation order.
+    // A later stage must not run after an earlier stage fails: for example, a
+    // still-mapped VA cannot safely be returned to the CUDA address allocator.
+    if (mapped_) {
+        if (!driver_api_.mem_unmap)
+            return missingDriverFunction("cuMemUnmap");
         CUresult result = driver_api_.mem_unmap(ptr, length_);
         if (result != CUDA_SUCCESS)
-            LOG(ERROR) << "NvlinkVmmAllocation: cuMemUnmap cleanup failed: "
-                       << result;
+            return cudaDriverFailure("cuMemUnmap", result);
+        mapped_ = false;
     }
-    mapped_ = false;
 
-    if (address_reserved_ && driver_api_.mem_address_free) {
+    if (address_reserved_) {
+        if (!driver_api_.mem_address_free)
+            return missingDriverFunction("cuMemAddressFree");
         CUresult result = driver_api_.mem_address_free(ptr, length_);
         if (result != CUDA_SUCCESS)
-            LOG(ERROR)
-                << "NvlinkVmmAllocation: cuMemAddressFree cleanup failed: "
-                << result;
+            return cudaDriverFailure("cuMemAddressFree", result);
+        address_reserved_ = false;
+        base_ = nullptr;
     }
-    address_reserved_ = false;
 
-    if (handle_owned_ && driver_api_.mem_release) {
+    if (handle_owned_) {
+        if (!driver_api_.mem_release)
+            return missingDriverFunction("cuMemRelease");
         CUresult result = driver_api_.mem_release(
             static_cast<CUmemGenericAllocationHandle>(allocation_handle_));
         if (result != CUDA_SUCCESS)
-            LOG(ERROR) << "NvlinkVmmAllocation: cuMemRelease cleanup failed: "
-                       << result;
+            return cudaDriverFailure("cuMemRelease", result);
+        handle_owned_ = false;
+        allocation_handle_ = 0;
     }
-    handle_owned_ = false;
-    allocation_handle_ = 0;
+
     base_ = nullptr;
     length_ = 0;
+    granularity_ = 0;
+    va_alignment_ = 0;
+    return Status::OK();
+}
+
+void NvlinkVmmAllocation::reset() noexcept {
+    try {
+        Status status = Release();
+        if (!status.ok()) {
+            LOG(ERROR) << "NvlinkVmmAllocation: best-effort cleanup retained "
+                          "unreleased CUDA ownership: "
+                       << status;
+        }
+    } catch (const std::exception& error) {
+        LOG(ERROR) << "NvlinkVmmAllocation: best-effort cleanup threw: "
+                   << error.what();
+    } catch (...) {
+        LOG(ERROR) << "NvlinkVmmAllocation: best-effort cleanup threw an "
+                      "unknown exception";
+    }
 }
 
 Status NvlinkVmmAllocation::CheckStrictFabricCapability() {
@@ -2114,6 +2145,44 @@ int NvlinkTransport::unregisterLocalMemoryBatch(
     return metadata_->updateLocalSegmentDesc();
 }
 
+#if defined(USE_MNNVL) && defined(USE_CUDA)
+bool NvlinkTransport::TrackPinnedVmmAllocation(
+    std::unique_ptr<NvlinkVmmAllocation> owner) {
+    if (!owner || owner->base() == nullptr) return false;
+    void* const ptr = owner->base();
+    std::lock_guard<std::mutex> lock(vmm_allocation_owner_mutex);
+    return vmm_allocation_owners.emplace(ptr, std::move(owner)).second;
+}
+
+bool NvlinkTransport::ReleasePinnedVmmAllocation(void* ptr) {
+    std::lock_guard<std::mutex> lock(vmm_allocation_owner_mutex);
+    auto it = vmm_allocation_owners.find(ptr);
+    if (it == vmm_allocation_owners.end()) return false;
+
+    try {
+        Status status = it->second->Release();
+        if (!status.ok()) {
+            LOG(ERROR) << "NvlinkTransport: pinned VMM release failed; "
+                          "retaining owner for repeated free: "
+                       << status;
+            return true;
+        }
+    } catch (const std::exception& error) {
+        LOG(ERROR) << "NvlinkTransport: pinned VMM release threw; retaining "
+                      "owner for repeated free: "
+                   << error.what();
+        return true;
+    } catch (...) {
+        LOG(ERROR) << "NvlinkTransport: pinned VMM release threw an unknown "
+                      "exception; retaining owner for repeated free";
+        return true;
+    }
+
+    vmm_allocation_owners.erase(it);
+    return true;
+}
+#endif
+
 void* NvlinkTransport::allocatePinnedLocalMemory(size_t size) {
 #if defined(USE_MNNVL) && defined(USE_CUDA)
     if (!supportFabricMem()) {
@@ -2145,15 +2214,10 @@ void* NvlinkTransport::allocatePinnedLocalMemory(size_t size) {
     }
 
     void* ptr = owner->base();
-    {
-        std::lock_guard<std::mutex> lock(vmm_allocation_owner_mutex);
-        auto inserted =
-            vmm_allocation_owners.emplace(ptr, std::move(owner)).second;
-        if (!inserted) {
-            LOG(ERROR) << "NvlinkTransport: duplicate VMM allocation address "
-                       << ptr;
-            return nullptr;
-        }
+    if (!TrackPinnedVmmAllocation(std::move(owner))) {
+        LOG(ERROR) << "NvlinkTransport: duplicate VMM allocation address "
+                   << ptr;
+        return nullptr;
     }
     return ptr;
 #else
@@ -2167,16 +2231,7 @@ void NvlinkTransport::freePinnedLocalMemory(void* ptr) {
 #if defined(USE_MNNVL) && defined(USE_CUDA)
     if (ptr == nullptr) return;
 
-    std::unique_ptr<NvlinkVmmAllocation> owner;
-    {
-        std::lock_guard<std::mutex> lock(vmm_allocation_owner_mutex);
-        auto it = vmm_allocation_owners.find(ptr);
-        if (it != vmm_allocation_owners.end()) {
-            owner = std::move(it->second);
-            vmm_allocation_owners.erase(it);
-        }
-    }
-    if (owner) return;
+    if (ReleasePinnedVmmAllocation(ptr)) return;
 
     // Preserve compatibility with imported Fabric mappings until their
     // ownership moves to the registration/import RAII objects. Such mappings

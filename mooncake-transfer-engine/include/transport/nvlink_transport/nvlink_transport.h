@@ -91,7 +91,7 @@ class NvlinkVmmAllocation {
 
 #if defined(USE_MNNVL) && defined(USE_CUDA)
     NvlinkVmmAllocation(NvlinkVmmAllocation&& other) noexcept;
-    NvlinkVmmAllocation& operator=(NvlinkVmmAllocation&& other) noexcept;
+    NvlinkVmmAllocation& operator=(NvlinkVmmAllocation&&) noexcept = delete;
     ~NvlinkVmmAllocation();
 
     static Status Create(const Options& options,
@@ -112,9 +112,14 @@ class NvlinkVmmAllocation {
         const DriverApi& api, size_t& granularity);
     static Status CheckStrictFabricCapabilityWithDriverApi(
         const DriverApi& api);
+
+    // Releases the CUDA VMM resources in reverse creation order. Each
+    // completed stage is committed independently; on failure the remaining
+    // ownership state is retained so an explicit caller can retry safely.
+    [[nodiscard]] Status Release();
 #else
     NvlinkVmmAllocation(NvlinkVmmAllocation&&) noexcept = default;
-    NvlinkVmmAllocation& operator=(NvlinkVmmAllocation&&) noexcept = default;
+    NvlinkVmmAllocation& operator=(NvlinkVmmAllocation&&) noexcept = delete;
     ~NvlinkVmmAllocation() = default;
 
     static Status Create(const Options&,
@@ -133,6 +138,7 @@ class NvlinkVmmAllocation {
         return Status::NotSupportedTransport(
             "NVLink HOST_NUMA VMM requires USE_MNNVL and USE_CUDA");
     }
+    [[nodiscard]] Status Release() { return Status::OK(); }
 #endif
 
     void* base() const { return base_; }
@@ -151,7 +157,7 @@ class NvlinkVmmAllocation {
 #if defined(USE_MNNVL) && defined(USE_CUDA)
     static DriverApi ProductionDriverApi();
     static bool RegisterOwnedRange(void* base, size_t length);
-    static void UnregisterOwnedRange(void* base, size_t length);
+    static bool UnregisterOwnedRange(void* base, size_t length);
     static bool IsExactOwnedRange(void* base, size_t length);
     void reset() noexcept;
 #endif
@@ -270,6 +276,9 @@ class NvlinkTransport : public Transport {
     std::unordered_map<void*, LocalRegistration> local_registrations_;
 #if defined(USE_MNNVL) && defined(USE_CUDA)
     NvlinkVmmAllocation::DriverApi fabric_driver_api_;
+    static bool TrackPinnedVmmAllocation(
+        std::unique_ptr<NvlinkVmmAllocation> owner);
+    static bool ReleasePinnedVmmAllocation(void* ptr);
 #endif
 
     std::function<int(const BufferDesc&, bool)> add_buffer_for_testing_;

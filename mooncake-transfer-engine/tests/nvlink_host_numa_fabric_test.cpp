@@ -437,11 +437,11 @@ TEST(NvlinkHostNumaFabricTest, CpuAllVisibleGpusAndColdWarmFabricPath) {
               NvlinkVmmAllocation::LocationType::HOST_NUMA);
     ASSERT_EQ(allocation->location_id(), hardware.numa_node);
     ASSERT_TRUE(allocation->fabric_exportable());
-    testing::Test::RecordProperty("host_numa_node",
-                                  std::to_string(hardware.numa_node));
-    testing::Test::RecordProperty("visible_gpu_count",
-                                  std::to_string(hardware.devices.size()));
-    testing::Test::RecordProperty("numa_selection_source", hardware.source);
+    ::testing::Test::RecordProperty("host_numa_node",
+                                    std::to_string(hardware.numa_node));
+    ::testing::Test::RecordProperty("visible_gpu_count",
+                                    std::to_string(hardware.devices.size()));
+    ::testing::Test::RecordProperty("numa_selection_source", hardware.source);
 
     auto* host_numa = static_cast<unsigned char*>(allocation->base());
     const auto cpu_pattern = MakePattern(kTransferBytes, 0x21U);

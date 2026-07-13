@@ -208,8 +208,8 @@ jobs:
           nvlink_host_numa_config_test
           nvlink_host_numa_setup_test
           nvlink_host_numa_store_test
+          nvlink_host_numa_transfer_metadata_test
           serializer_test
-          transfer_metadata_test
         )
         if [[ "$nvlink_host_numa_test_count" -ne "${#expected_tests[@]}" ]]; then
           echo "::error::nvlink_host_numa_unit membership count mismatch"
@@ -477,11 +477,11 @@ jobs:
           nvlink_host_numa_config_test
           nvlink_host_numa_setup_test
           nvlink_host_numa_store_test
+          nvlink_host_numa_transfer_metadata_test
           nvlink_transport_fake_driver_test
           nvlink_transport_metrics_test
           nvlink_vmm_allocation_test
           serializer_test
-          transfer_metadata_test
         )
         if [[ "$nvlink_host_numa_test_count" -ne "${#expected_tests[@]}" ]]; then
           echo "::error::nvlink_host_numa_unit membership count mismatch"

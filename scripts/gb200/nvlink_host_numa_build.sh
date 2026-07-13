@@ -99,8 +99,8 @@ assert_label_exact nvlink_host_numa_unit \
   nvlink_transport_fake_driver_test \
   nvlink_transport_metrics_test \
   nvlink_vmm_allocation_test \
-  serializer_test \
-  transfer_metadata_test
+  nvlink_host_numa_transfer_metadata_test \
+  serializer_test
 
 unit_junit="${build_dir}/nvlink-host-numa-unit.xml"
 ctest_in_build -L nvlink_host_numa_unit \

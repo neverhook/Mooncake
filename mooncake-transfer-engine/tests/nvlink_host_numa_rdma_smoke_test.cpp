@@ -340,10 +340,10 @@ TEST(NvlinkHostNumaRdmaSmokeTest, VerbsCanRegisterProviderVmmAllocation) {
         REQUIRE_RDMA_OR_SKIP(strict, prerequisite_error);
     }
 
-    testing::Test::RecordProperty("host_numa_node",
-                                  std::to_string(host_numa_node));
-    testing::Test::RecordProperty("rdma_device", rdma_device_name);
-    testing::Test::RecordProperty(
+    ::testing::Test::RecordProperty("host_numa_node",
+                                    std::to_string(host_numa_node));
+    ::testing::Test::RecordProperty("rdma_device", rdma_device_name);
+    ::testing::Test::RecordProperty(
         "rdma_device_numa_node",
         std::to_string(ReadRdmaDeviceNumaNode(rdma_device_name)));
 
@@ -376,7 +376,8 @@ TEST(NvlinkHostNumaRdmaSmokeTest, VerbsCanRegisterProviderVmmAllocation) {
     ASSERT_EQ(domain.Reset(), 0) << "ibv_dealloc_pd failed";
     ASSERT_EQ(context.Reset(), 0) << "ibv_close_device failed";
     allocation.reset();
-    testing::Test::RecordProperty("result", "ibv_reg_mr_and_dereg_mr_pass");
+    ::testing::Test::RecordProperty("result",
+                                    "ibv_reg_mr_and_dereg_mr_pass");
 }
 
 #undef REQUIRE_RDMA_OR_SKIP

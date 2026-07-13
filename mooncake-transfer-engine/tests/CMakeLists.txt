@@ -90,9 +90,9 @@ if(USE_MNNVL AND USE_CUDA AND NOT USE_HIP)
                                                      gtest_main)
   add_test(
     NAME nvlink_transport_fake_driver_test
-    COMMAND ${CMAKE_COMMAND} -E env MC_USE_NVLINK_IPC=1
-            $<TARGET_FILE:nvlink_transport_test>
-            --gtest_filter=NvlinkTransportUnitTest.*)
+    COMMAND ${CMAKE_COMMAND} -E env --unset=MC_USE_NVLINK_IPC
+            GTEST_FILTER=NvlinkTransportUnitTest.*
+            $<TARGET_FILE:nvlink_transport_test>)
   set_tests_properties(nvlink_transport_fake_driver_test
                        PROPERTIES LABELS "nvlink_host_numa_unit")
   add_executable(nvlink_transport_metrics_test
@@ -105,12 +105,12 @@ if(USE_MNNVL AND USE_CUDA AND NOT USE_HIP)
                        PROPERTIES LABELS "nvlink_host_numa_unit")
   add_test(NAME nvlink_transport_fabric_hbm_test
            COMMAND ${CMAKE_COMMAND} -E env --unset=MC_USE_NVLINK_IPC
-                   $<TARGET_FILE:nvlink_transport_test>
-                   --gtest_filter=NvlinkTransportTest.WriteAndRead)
+                   GTEST_FILTER=NvlinkTransportTest.WriteAndRead
+                   $<TARGET_FILE:nvlink_transport_test>)
   add_test(NAME nvlink_transport_ipc_cuda_malloc_test
            COMMAND ${CMAKE_COMMAND} -E env MC_USE_NVLINK_IPC=1
-                   $<TARGET_FILE:nvlink_transport_test>
-                   --gtest_filter=NvlinkTransportTest.WriteAndRead)
+                   GTEST_FILTER=NvlinkTransportTest.WriteAndRead
+                   $<TARGET_FILE:nvlink_transport_test>)
   set_tests_properties(
     nvlink_transport_fabric_hbm_test nvlink_transport_ipc_cuda_malloc_test
     PROPERTIES LABELS "nvlink_hbm_regression;nvlink_host_numa_hardware")
@@ -287,7 +287,11 @@ add_executable(transfer_metadata_test ${WORKSPACE}/transfer_metadata_test.cpp)
 target_link_libraries(transfer_metadata_test PUBLIC transfer_engine gtest
                                                     gtest_main)
 add_test(NAME transfer_metadata_test COMMAND transfer_metadata_test)
-set_tests_properties(transfer_metadata_test
+add_test(
+  NAME nvlink_host_numa_transfer_metadata_test
+  COMMAND $<TARGET_FILE:transfer_metadata_test>
+          --gtest_filter=TransferTaskSubmissionFailureTest.*)
+set_tests_properties(nvlink_host_numa_transfer_metadata_test
                      PROPERTIES LABELS "nvlink_host_numa_unit")
 
 add_executable(config_test ${WORKSPACE}/config_test.cpp)

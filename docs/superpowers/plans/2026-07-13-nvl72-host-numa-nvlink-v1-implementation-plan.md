@@ -17,12 +17,14 @@ Consumer metrics, ordinary/arm64 CTest gates, and the GB200 validation harness.
 
 Current-workstation checks passed for clang-format 20.1.8, `git diff --check`,
 workflow YAML parsing, GB200 shell syntax, Python AST/Ruff, CLI entry points,
-label membership review, and non-strict preflight behavior. CMake configuration
-reached the project dependency checks with `USE_CUDA=ON` and `USE_MNNVL=ON`,
-then stopped because this macOS workstation lacks `yaml-cpp` (and does not have
-the Linux/CUDA/MNNVL runtime required by the targets). Consequently no C++
-binary, CTest suite, Fabric copy, Store hardware, or verbs smoke test was run
-locally.
+label membership review, and non-strict preflight behavior. After the first
+GB200 compile exposed and the implementation fixed a test namespace error, a
+disposable Linux/arm64 CUDA 12.8 development container configured with
+`USE_CUDA=ON` and `USE_MNNVL=ON`, compiled the Store/Fabric/RDMA/VMM/metrics/HBM
+test targets, and passed all 10 `nvlink_host_numa_unit` CTest entries. This is
+compile and fake-driver/CPU evidence only: the container had no real CUDA
+driver, Fabric, IMEX, RNIC, or GB200 topology, so Fabric copy, Store hardware,
+and verbs smoke results remain `NOT RUN`.
 
 The remaining external gate is deliberately strict:
 
@@ -699,10 +701,14 @@ Register three labels:
 
 Apply `set_tests_properties(... PROPERTIES LABELS ...)` explicitly. The unit
 label includes the new config/setup/VMM tests plus `client_integration_test`,
-`client_metrics_test`, `serializer_test`, and `transfer_metadata_test`. The
-hardware label includes the HOST_NUMA Fabric/Store tests and both named HBM
-regression cases. CI must first run `ctest -N -L <label>` and assert the expected
-test names/count so an empty label cannot be reported as success.
+`client_metrics_test`, `serializer_test`, and the filtered
+`nvlink_host_numa_transfer_metadata_test` CTest wrapper around the
+`transfer_metadata_test` binary. The wrapper runs only the self-contained
+submission/schema checks; the pre-existing metadata-plugin cases remain on the
+original unlabelled CTest entry. The hardware label includes the HOST_NUMA
+Fabric/Store tests and both named HBM regression cases. CI must first run
+`ctest -N -L <label>` and assert the expected test names/count so an empty label
+cannot be reported as success.
 
 Generic environments may skip hardware tests with a precise reason. When
 `MC_REQUIRE_MNNVL_FABRIC=1` is set, missing CUDA, Fabric, IMEX, visible GPU, or

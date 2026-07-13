@@ -61,7 +61,7 @@ class Transport {
         enum OpCode { READ, WRITE };
 
         OpCode opcode;
-        void *source;
+        void* source;
         SegmentID target_id;
         uint64_t target_offset;
         size_t length;
@@ -99,8 +99,8 @@ class Transport {
     // minimize overhead on hot paths. The caller must ensure that
     // the underlying BatchDesc object remains alive and valid for
     // as long as the handle is in use.
-    static inline BatchDesc &toBatchDesc(BatchID id) {
-        return *reinterpret_cast<BatchDesc *>(id);
+    static inline BatchDesc& toBatchDesc(BatchID id) {
+        return *reinterpret_cast<BatchDesc*>(id);
     }
 
     // Slice must be allocated on heap, as it will delete self on markSuccess
@@ -108,14 +108,14 @@ class Transport {
     struct Slice {
         enum SliceStatus { PENDING, POSTED, SUCCESS, TIMEOUT, FAILED };
 
-        void *source_addr;
+        void* source_addr;
         size_t length;
         TransferRequest::OpCode opcode;
         SegmentID target_id;
         std::string peer_nic_path;
         std::string source_location;
         SliceStatus status;
-        TransferTask *task;
+        TransferTask* task;
         // EFA/CXI's libfabric MR keys are 64-bit (fi_mr_key()); RDMA verbs keys
         // are 32-bit. Use a scoped alias so the width is defined in one place.
 #if defined(USE_EFA) || defined(USE_CXI)
@@ -133,23 +133,23 @@ class Transport {
                 mr_key_t dest_rkey;
                 int lkey_index;
                 int rkey_index;
-                volatile int *qp_depth;
+                volatile int* qp_depth;
                 uint32_t retry_cnt;
                 uint32_t max_retry_cnt;
-                RdmaEndPoint *endpoint;  // Endpoint used for this transfer
+                RdmaEndPoint* endpoint;  // Endpoint used for this transfer
             } rdma;
             struct {
                 uint64_t dest_addr;
-                volatile int *jetty_depth;
+                volatile int* jetty_depth;
                 uint32_t retry_cnt;
                 uint32_t max_retry_cnt;
-                void *r_seg;
-                void *l_seg;
-                void *endpoint;
+                void* r_seg;
+                void* l_seg;
+                void* endpoint;
             } ub;
             struct {
-                void *dest_addr;
-                void *cuda_stream;  // cudaStream_t, used by async NVLink
+                void* dest_addr;
+                void* cuda_stream;  // cudaStream_t, used by async NVLink
                                     // transport
             } local;
             struct {
@@ -159,17 +159,17 @@ class Transport {
                 uint64_t offset;
                 int cufile_desc;
                 uint64_t start;
-                const char *file_path;
+                const char* file_path;
             } nvmeof;
             struct {
-                void *dest_addr;
+                void* dest_addr;
             } cxl;
             struct {
                 uint64_t dest_addr;
             } hccl;
             struct {
                 uint64_t dest_addr;
-                void *handle;
+                void* handle;
                 int64_t start_time;
                 int32_t engine_id;
             } ascend_direct;
@@ -200,7 +200,7 @@ class Transport {
        private:
         inline void check_batch_completion(bool is_failed) {
 #ifdef USE_EVENT_DRIVEN_COMPLETION
-            auto &batch_desc = toBatchDesc(task->batch_id);
+            auto& batch_desc = toBatchDesc(task->batch_id);
             if (is_failed) {
                 batch_desc.has_failure.store(true, std::memory_order_relaxed);
             }
@@ -265,8 +265,8 @@ class Transport {
             }
         }
 
-        Slice *allocate() {
-            Slice *slice;
+        Slice* allocate() {
+            Slice* slice;
 
             if (head_ - tail_ == 0) {
                 slice = new Slice();
@@ -280,7 +280,7 @@ class Transport {
             return slice;
         }
 
-        void deallocate(Slice *slice) {
+        void deallocate(Slice* slice) {
             if (head_ - tail_ == kLazyDeleteSliceCapacity) {
                 delete slice;
                 return;
@@ -290,7 +290,7 @@ class Transport {
         }
 
         const static size_t kLazyDeleteSliceCapacity = 4096;
-        std::vector<Slice *> lazy_delete_slices_;
+        std::vector<Slice*> lazy_delete_slices_;
         uint64_t head_, tail_;
     };
 
@@ -300,6 +300,20 @@ class Transport {
         volatile uint64_t failed_slice_count = 0;
         volatile uint64_t transferred_bytes = 0;
         volatile bool is_finished = false;
+        // Explicit terminal state for failures that happen before a transport
+        // can create a Slice (for example address relocation or stream setup).
+        // A zero-slice task otherwise looks spuriously successful to legacy
+        // completion code.
+        volatile bool submission_failed = false;
+        // NvlinkTransport may be polled repeatedly after a task reaches a
+        // terminal state. Keep its bounded result metric idempotent per task.
+        volatile bool transport_result_observed = false;
+        // The request storage is owned by the submit caller and may be gone by
+        // the time an asynchronous transfer completes. Snapshot the operation
+        // while staging the task so terminal metrics never dereference the
+        // borrowed request pointer.
+        TransferRequest::OpCode operation = TransferRequest::READ;
+        bool operation_initialized = false;
         uint64_t total_bytes = 0;
         BatchID batch_id = 0;
 
@@ -307,7 +321,7 @@ class Transport {
         // MultiTransport::submitTransfer(). Used to delegate
         // transport-specific completion polling (e.g., CUDA stream
         // query for NVLink async transfers) in getTransferStatus().
-        Transport *transport_ = nullptr;
+        Transport* transport_ = nullptr;
 
 #ifdef WITH_METRICS
         std::chrono::steady_clock::time_point start_time;
@@ -321,14 +335,14 @@ class Transport {
 #ifdef USE_ASCEND_HETEROGENEOUS
         // need to modify the request's source address, changing it from an NPU
         // address to a CPU address.
-        TransferRequest *request = nullptr;
+        TransferRequest* request = nullptr;
 #else
-        const TransferRequest *request = nullptr;
+        const TransferRequest* request = nullptr;
 #endif
         // record the slice list for freeing objects
-        std::vector<Slice *> slice_list;
+        std::vector<Slice*> slice_list;
         ~TransferTask() {
-            for (auto &slice : slice_list)
+            for (auto& slice : slice_list)
                 Transport::getSliceCache().deallocate(slice);
         }
     };
@@ -337,7 +351,7 @@ class Transport {
         BatchID id;
         size_t batch_size;
         std::vector<TransferTask> task_list;
-        void *context;  // for transport implementers.
+        void* context;  // for transport implementers.
         int64_t start_timestamp;
 
         // Track batch progress and notifies waiters
@@ -356,6 +370,33 @@ class Transport {
 #endif
     };
 
+    // Mark a task terminal when submission failed before Slice ownership was
+    // established. This is shared by transports and MultiTransport so every
+    // batch remains queryable/freeable even when submitTransfer() returns an
+    // error. The operation is idempotent.
+    static void markSubmissionFailed(TransferTask& task) {
+        if (__atomic_exchange_n(&task.submission_failed, true,
+                                __ATOMIC_ACQ_REL)) {
+            return;
+        }
+        __atomic_store_n(&task.is_finished, true, __ATOMIC_RELEASE);
+
+        if (task.batch_id == 0) return;
+        auto& batch_desc = toBatchDesc(task.batch_id);
+        batch_desc.has_failure.store(true, std::memory_order_release);
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+        auto previous = batch_desc.finished_task_count.fetch_add(
+            1, std::memory_order_relaxed);
+        if (previous + 1 == batch_desc.batch_size) {
+            {
+                std::lock_guard<std::mutex> lock(batch_desc.completion_mutex);
+                batch_desc.is_finished.store(true, std::memory_order_release);
+            }
+            batch_desc.completion_cv.notify_all();
+        }
+#endif
+    }
+
    public:
     virtual ~Transport() {}
 
@@ -369,10 +410,10 @@ class Transport {
     /// @return The number of successfully submitted transfers on success. If
     /// that number is less than nr, errno is set.
     virtual Status submitTransfer(
-        BatchID batch_id, const std::vector<TransferRequest> &entries) = 0;
+        BatchID batch_id, const std::vector<TransferRequest>& entries) = 0;
 
     virtual Status submitTransferTask(
-        const std::vector<TransferTask *> &task_list) {
+        const std::vector<TransferTask*>& task_list) {
         return Status::NotImplemented(
             "Transport::submitTransferTask is not implemented");
     }
@@ -382,22 +423,32 @@ class Transport {
     /// @return Return 1 on completed (either success or failure); 0 if still in
     /// progress.
     virtual Status getTransferStatus(BatchID batch_id, size_t task_id,
-                                     TransferStatus &status) = 0;
+                                     TransferStatus& status) = 0;
 
-    std::shared_ptr<TransferMetadata> &meta() { return metadata_; }
+    // Called when a terminal task is observed without necessarily polling the
+    // transport (for example MultiTransport's event-driven batch fast path).
+    // Implementations must tolerate repeated calls.
+    virtual void finalizeTransferResult(TransferTask& task, bool success) {
+        (void)task;
+        (void)success;
+    }
+
+    std::shared_ptr<TransferMetadata>& meta() { return metadata_; }
 
     struct BufferEntry {
-        void *addr;
+        void* addr;
         size_t length;
     };
 
-    virtual Status OpenChannel(const std::string &segment_name, SegmentID sid) {
+    virtual Status OpenChannel(const std::string& segment_name, SegmentID sid) {
         return Status::OK();
     }
     virtual Status CheckStatus(SegmentID sid) { return Status::OK(); }
 
+    virtual void appendMetrics(std::string& output) { (void)output; }
+
    protected:
-    virtual int install(std::string &local_server_name,
+    virtual int install(std::string& local_server_name,
                         std::shared_ptr<TransferMetadata> meta,
                         std::shared_ptr<Topology> topo);
 
@@ -407,25 +458,25 @@ class Transport {
     RWSpinlock batch_desc_lock_;
     std::unordered_map<BatchID, std::shared_ptr<BatchDesc>> batch_desc_set_;
 
-    static ThreadLocalSliceCache &getSliceCache();
+    static ThreadLocalSliceCache& getSliceCache();
 
    private:
-    virtual int registerLocalMemory(void *addr, size_t length,
-                                    const std::string &location,
+    virtual int registerLocalMemory(void* addr, size_t length,
+                                    const std::string& location,
                                     bool remote_accessible,
                                     bool update_metadata = true) = 0;
 
-    virtual int unregisterLocalMemory(void *addr,
+    virtual int unregisterLocalMemory(void* addr,
                                       bool update_metadata = true) = 0;
 
     virtual int registerLocalMemoryBatch(
-        const std::vector<BufferEntry> &buffer_list,
-        const std::string &location) = 0;
+        const std::vector<BufferEntry>& buffer_list,
+        const std::string& location) = 0;
 
     virtual int unregisterLocalMemoryBatch(
-        const std::vector<void *> &addr_list) = 0;
+        const std::vector<void*>& addr_list) = 0;
 
-    virtual const char *getName() const = 0;
+    virtual const char* getName() const = 0;
 };
 }  // namespace mooncake
 

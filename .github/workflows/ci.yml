@@ -188,12 +188,51 @@ jobs:
         kill $MASTER_PID 2>/dev/null || true
       shell: bash
 
+    - name: Gate NVLink HOST_NUMA unit tests
+      run: |
+        cd build
+        export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+        nvlink_host_numa_tests="$(ctest -N -L nvlink_host_numa_unit)"
+        printf '%s\n' "$nvlink_host_numa_tests"
+        nvlink_host_numa_test_count="$(
+          awk '$1 == "Total" && $2 == "Tests:" {print $3}' \
+            <<<"$nvlink_host_numa_tests"
+        )"
+        if [[ ! "$nvlink_host_numa_test_count" =~ ^[1-9][0-9]*$ ]]; then
+          echo "::error::No nvlink_host_numa_unit tests were discovered"
+          exit 1
+        fi
+        expected_tests=(
+          client_integration_test
+          client_metrics_test
+          nvlink_host_numa_config_test
+          nvlink_host_numa_setup_test
+          nvlink_host_numa_store_test
+          serializer_test
+          transfer_metadata_test
+        )
+        if [[ "$nvlink_host_numa_test_count" -ne "${#expected_tests[@]}" ]]; then
+          echo "::error::nvlink_host_numa_unit membership count mismatch"
+          exit 1
+        fi
+        for expected_test in "${expected_tests[@]}"; do
+          if ! grep -Eq "Test +#[0-9]+: ${expected_test}$" \
+              <<<"$nvlink_host_numa_tests"; then
+            echo "::error::Missing nvlink_host_numa_unit test: $expected_test"
+            exit 1
+          fi
+        done
+        MC_METADATA_SERVER=http://127.0.0.1:8080/metadata \
+          DEFAULT_KV_LEASE_TTL=500 \
+          ctest -L nvlink_host_numa_unit --output-on-failure
+      shell: bash
+
     - name: Test (in build env) with coverage
       run: |
         cd build
         export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
         ldconfig -v || echo "always continue"
-        MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 ctest -j --output-on-failure
+        MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 ctest -j -LE nvlink_host_numa_unit --output-on-failure
       shell: bash
 
     - name: Drain HTTP E2E test
@@ -379,7 +418,7 @@ jobs:
         sudo bash -x dependencies.sh -y
         mkdir build
         cd build
-        cmake -G Ninja .. -DUSE_HTTP=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=OFF -DWITH_STORE_RUST=OFF -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
+        cmake -G Ninja .. -DUSE_HTTP=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=OFF -DWITH_STORE_RUST=OFF -DBUILD_UNIT_TESTS=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
       shell: bash
 
     - name: Build project
@@ -393,6 +432,70 @@ jobs:
         cd build
         cmake --build .
         sudo cmake --install .
+      shell: bash
+
+    - name: Start Metadata Server
+      run: |
+        cd mooncake-transfer-engine/example/http-metadata-server-python
+        pip install aiohttp
+        python ./bootstrap_server.py &
+      shell: bash
+
+    - name: Gate NVLink HOST_NUMA unit tests with CUDA driver stubs
+      run: |
+        cuda_driver_stub=""
+        for stub_dir in /usr/local/cuda/lib64/stubs /usr/local/cuda/targets/*/lib/stubs; do
+          if [ -f "$stub_dir/libcuda.so" ]; then
+            cuda_driver_stub="$stub_dir/libcuda.so"
+            break
+          fi
+        done
+        if [ -z "$cuda_driver_stub" ]; then
+          echo "::error::CUDA driver stub libcuda.so was not found"
+          exit 1
+        fi
+
+        cuda_driver_stub_runtime="$RUNNER_TEMP/cuda-driver-stubs"
+        mkdir -p "$cuda_driver_stub_runtime"
+        cp -L "$cuda_driver_stub" "$cuda_driver_stub_runtime/libcuda.so.1"
+        export LD_LIBRARY_PATH="$cuda_driver_stub_runtime:$(dirname "$cuda_driver_stub"):/usr/local/cuda/lib64:/usr/local/lib:${LD_LIBRARY_PATH:-}"
+
+        cd build
+        nvlink_host_numa_tests="$(ctest -N -L nvlink_host_numa_unit)"
+        printf '%s\n' "$nvlink_host_numa_tests"
+        nvlink_host_numa_test_count="$(
+          awk '$1 == "Total" && $2 == "Tests:" {print $3}' \
+            <<<"$nvlink_host_numa_tests"
+        )"
+        if [[ ! "$nvlink_host_numa_test_count" =~ ^[1-9][0-9]*$ ]]; then
+          echo "::error::No nvlink_host_numa_unit tests were discovered"
+          exit 1
+        fi
+        expected_tests=(
+          client_integration_test
+          client_metrics_test
+          nvlink_host_numa_config_test
+          nvlink_host_numa_setup_test
+          nvlink_host_numa_store_test
+          nvlink_transport_fake_driver_test
+          nvlink_transport_metrics_test
+          nvlink_vmm_allocation_test
+          serializer_test
+          transfer_metadata_test
+        )
+        if [[ "$nvlink_host_numa_test_count" -ne "${#expected_tests[@]}" ]]; then
+          echo "::error::nvlink_host_numa_unit membership count mismatch"
+          exit 1
+        fi
+        for expected_test in "${expected_tests[@]}"; do
+          if ! grep -Eq "Test +#[0-9]+: ${expected_test}$" \
+              <<<"$nvlink_host_numa_tests"; then
+            echo "::error::Missing nvlink_host_numa_unit test: $expected_test"
+            exit 1
+          fi
+        done
+        MC_METADATA_SERVER=http://127.0.0.1:8080/metadata \
+          ctest -L nvlink_host_numa_unit --output-on-failure
       shell: bash
 
     - name: Run sccache stat for check

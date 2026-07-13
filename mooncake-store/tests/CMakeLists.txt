@@ -83,6 +83,42 @@ add_store_test(segment_test segment_test.cpp)
 add_store_test(offset_allocator_test offset_allocator_test.cpp)
 add_store_test(utils_test utils_test.cpp)
 add_store_test(client_buffer_test client_buffer_test.cpp)
+add_store_test(nvlink_host_numa_config_test nvlink_host_numa_config_test.cpp)
+add_store_test(nvlink_host_numa_setup_test nvlink_host_numa_setup_test.cpp)
+add_executable(nvlink_host_numa_store_test nvlink_host_numa_store_test.cpp)
+target_include_directories(
+  nvlink_host_numa_store_test
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(
+  nvlink_host_numa_store_test
+  PUBLIC mooncake_store
+         transfer_engine
+         cachelib_memory_allocator
+         ${ETCD_WRAPPER_LIB}
+         glog
+         ibverbs
+         gtest
+         gtest_main
+         pthread)
+add_test(
+  NAME nvlink_host_numa_store_test
+  COMMAND $<TARGET_FILE:nvlink_host_numa_store_test>
+          --gtest_filter=NvlinkHostNumaStoreTest.*)
+target_include_directories(nvlink_host_numa_config_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_include_directories(nvlink_host_numa_setup_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+set_tests_properties(nvlink_host_numa_config_test nvlink_host_numa_setup_test
+                     nvlink_host_numa_store_test client_integration_test
+                     PROPERTIES LABELS "nvlink_host_numa_unit")
+if(USE_MNNVL AND USE_CUDA AND NOT USE_HIP)
+  add_test(
+    NAME nvlink_host_numa_store_hardware_test
+    COMMAND $<TARGET_FILE:nvlink_host_numa_store_test>
+            --gtest_filter=NvlinkHostNumaStoreHardwareTest.*)
+  set_tests_properties(nvlink_host_numa_store_hardware_test
+                       PROPERTIES LABELS "nvlink_host_numa_hardware")
+endif()
 add_store_test(client_local_hot_cache_test client_local_hot_cache_test.cpp)
 add_store_test(client_tcp_local_memcpy_test client_tcp_local_memcpy_test.cpp)
 add_store_test(pybind_client_test pybind_client_test.cpp)
@@ -91,6 +127,8 @@ add_store_test(host_port_fix_test host_port_fix_test.cpp)
 add_store_test(client_metrics_test client_metrics_test.cpp)
 add_store_test(ssd_metrics_test ssd_metrics_test.cpp)
 add_store_test(serializer_test serializer_test.cpp)
+set_tests_properties(client_metrics_test serializer_test
+                     PROPERTIES LABELS "nvlink_host_numa_unit")
 add_store_test(
   embedded_snapshot_catalog_store_test
   ha/snapshot/catalog/backends/embedded/embedded_snapshot_catalog_store_test.cpp

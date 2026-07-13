@@ -12,6 +12,7 @@
 #include <unordered_set>
 #include <vector>
 #include <ylt/metric/counter.hpp>
+#include <ylt/metric/gauge.hpp>
 #include <ylt/metric/histogram.hpp>
 #include <ylt/metric/summary.hpp>
 #include "utils.h"
@@ -100,6 +101,129 @@ Result execute_timed_operation(Operation&& operation, SuccessFn&& success_fn,
 }
 
 enum class TransferOperationKind { kRead, kWrite };
+
+enum class NvlinkHostNumaStage {
+    kPreflight,
+    kDiscovery,
+    kPlanning,
+    kAllocation,
+    kAccess,
+    kRegistration,
+    kMount,
+    kRollback,
+    kTeardown,
+};
+
+inline const char* NvlinkHostNumaStageName(NvlinkHostNumaStage stage) {
+    switch (stage) {
+        case NvlinkHostNumaStage::kPreflight:
+            return "preflight";
+        case NvlinkHostNumaStage::kDiscovery:
+            return "discovery";
+        case NvlinkHostNumaStage::kPlanning:
+            return "planning";
+        case NvlinkHostNumaStage::kAllocation:
+            return "allocation";
+        case NvlinkHostNumaStage::kAccess:
+            return "access";
+        case NvlinkHostNumaStage::kRegistration:
+            return "registration";
+        case NvlinkHostNumaStage::kMount:
+            return "mount";
+        case NvlinkHostNumaStage::kRollback:
+            return "rollback";
+        case NvlinkHostNumaStage::kTeardown:
+            return "teardown";
+    }
+    return "unknown";
+}
+
+struct NvlinkHostNumaMetric {
+    std::array<std::string, 1> numa_node_label = {"numa_node"};
+    std::array<std::string, 1> stage_label = {"stage"};
+
+    explicit NvlinkHostNumaMetric(std::map<std::string, std::string> = {})
+        : requested_capacity_bytes(
+              "mooncake_nvlink_host_numa_requested_capacity_bytes",
+              "Requested NVLink HOST_NUMA Provider capacity in bytes", {}),
+          effective_capacity_bytes(
+              "mooncake_nvlink_host_numa_effective_capacity_bytes",
+              "Effective NVLink HOST_NUMA Provider capacity in bytes", {}),
+          effective_bytes_by_node(
+              "mooncake_nvlink_host_numa_node_effective_bytes",
+              "Effective NVLink HOST_NUMA Provider bytes by NUMA node",
+              numa_node_label),
+          chunk_count_by_node(
+              "mooncake_nvlink_host_numa_node_chunks",
+              "NVLink HOST_NUMA Provider chunk count by NUMA node",
+              numa_node_label),
+          stage_duration_us(
+              "mooncake_nvlink_host_numa_stage_duration_us",
+              "NVLink HOST_NUMA setup stage duration in microseconds",
+              kLatencyBucket, {}, stage_label),
+          initialization_failures(
+              "mooncake_nvlink_host_numa_initialization_failures_total",
+              "NVLink HOST_NUMA initialization failures by stage", {},
+              stage_label),
+          rollback_attempts("mooncake_nvlink_host_numa_rollback_attempts_total",
+                            "NVLink HOST_NUMA rollback attempts", {}),
+          rollback_failures("mooncake_nvlink_host_numa_rollback_failures_total",
+                            "NVLink HOST_NUMA rollback failures", {}) {}
+
+    ylt::metric::gauge_t requested_capacity_bytes;
+    ylt::metric::gauge_t effective_capacity_bytes;
+    ylt::metric::dynamic_gauge_1t effective_bytes_by_node;
+    ylt::metric::dynamic_gauge_1t chunk_count_by_node;
+    ylt::metric::hybrid_histogram_1t stage_duration_us;
+    ylt::metric::hybrid_counter_1t initialization_failures;
+    ylt::metric::counter_t rollback_attempts;
+    ylt::metric::counter_t rollback_failures;
+
+    void SetCapacity(uint64_t requested_bytes, uint64_t effective_bytes) {
+        requested_capacity_bytes.update(static_cast<int64_t>(requested_bytes));
+        effective_capacity_bytes.update(static_cast<int64_t>(effective_bytes));
+    }
+
+    void SetNodeCapacity(int numa_node, uint64_t effective_bytes,
+                         uint64_t chunk_count) {
+        const std::array<std::string, 1> label = {std::to_string(numa_node)};
+        effective_bytes_by_node.update(label,
+                                       static_cast<int64_t>(effective_bytes));
+        chunk_count_by_node.update(label, static_cast<int64_t>(chunk_count));
+    }
+
+    void ObserveStage(NvlinkHostNumaStage stage, uint64_t duration_us,
+                      bool success) {
+        const std::array<std::string, 1> label = {
+            NvlinkHostNumaStageName(stage)};
+        // basic_hybrid_histogram omits zero-valued observations during
+        // serialization and may clear the caller's output buffer when every
+        // observation is zero. Preserve sub-microsecond stages as 1 us so
+        // serializing this metric cannot erase metrics appended before it.
+        stage_duration_us.observe(label, std::max<uint64_t>(duration_us, 1));
+        if (!success) {
+            initialization_failures.inc(label);
+        }
+    }
+
+    void ObserveRollback(bool success) {
+        rollback_attempts.inc();
+        if (!success) {
+            rollback_failures.inc();
+        }
+    }
+
+    void serialize(std::string& str) {
+        requested_capacity_bytes.serialize(str);
+        effective_capacity_bytes.serialize(str);
+        effective_bytes_by_node.serialize(str);
+        chunk_count_by_node.serialize(str);
+        stage_duration_us.serialize(str);
+        initialization_failures.serialize(str);
+        rollback_attempts.serialize(str);
+        rollback_failures.serialize(str);
+    }
+};
 
 struct TransferMetric {
     TransferMetric(std::map<std::string, std::string> labels = {})
@@ -662,6 +786,8 @@ struct ClientMetric {
     MasterClientMetric master_client_metric;
     TransferOperationMetric transfer_operation_metric;
     SsdMetric ssd_metric;
+    NvlinkHostNumaMetric nvlink_host_numa_metric;
+    ylt::metric::counter_t mount_segment_compensation_failures;
 
     /**
      * @brief Creates a ClientMetric instance based on environment variables
@@ -682,6 +808,30 @@ struct ClientMetric {
                                   const std::string& op_name, uint64_t bytes,
                                   uint64_t latency_us) {
         transfer_operation_metric.Observe(kind, op_name, bytes, latency_us);
+    }
+
+    void ObserveNvlinkHostNumaCapacity(uint64_t requested_bytes,
+                                       uint64_t effective_bytes) {
+        nvlink_host_numa_metric.SetCapacity(requested_bytes, effective_bytes);
+    }
+
+    void ObserveNvlinkHostNumaNode(int numa_node, uint64_t effective_bytes,
+                                   uint64_t chunk_count) {
+        nvlink_host_numa_metric.SetNodeCapacity(numa_node, effective_bytes,
+                                                chunk_count);
+    }
+
+    void ObserveNvlinkHostNumaStage(NvlinkHostNumaStage stage,
+                                    uint64_t duration_us, bool success) {
+        nvlink_host_numa_metric.ObserveStage(stage, duration_us, success);
+    }
+
+    void ObserveNvlinkHostNumaRollback(bool success) {
+        nvlink_host_numa_metric.ObserveRollback(success);
+    }
+
+    void ObserveMountSegmentCompensationFailure() {
+        mount_segment_compensation_failures.inc();
     }
 
     void serialize(std::string& str);

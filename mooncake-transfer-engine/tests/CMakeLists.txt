@@ -84,11 +84,64 @@ add_executable(tcp_address_validation_test
 target_link_libraries(tcp_address_validation_test PUBLIC gtest gtest_main)
 add_test(NAME tcp_address_validation_test COMMAND tcp_address_validation_test)
 
-if(USE_MNNVL)
+if(USE_MNNVL AND USE_CUDA AND NOT USE_HIP)
   add_executable(nvlink_transport_test ${WORKSPACE}/nvlink_transport_test.cpp)
   target_link_libraries(nvlink_transport_test PUBLIC transfer_engine gtest
                                                      gtest_main)
-  add_test(NAME nvlink_transport_test COMMAND nvlink_transport_test)
+  add_test(
+    NAME nvlink_transport_fake_driver_test
+    COMMAND ${CMAKE_COMMAND} -E env MC_USE_NVLINK_IPC=1
+            $<TARGET_FILE:nvlink_transport_test>
+            --gtest_filter=NvlinkTransportUnitTest.*)
+  set_tests_properties(nvlink_transport_fake_driver_test
+                       PROPERTIES LABELS "nvlink_host_numa_unit")
+  add_executable(nvlink_transport_metrics_test
+                 ${WORKSPACE}/nvlink_transport_metrics_test.cpp)
+  target_link_libraries(nvlink_transport_metrics_test
+                        PUBLIC transfer_engine gtest gtest_main)
+  add_test(NAME nvlink_transport_metrics_test
+           COMMAND nvlink_transport_metrics_test)
+  set_tests_properties(nvlink_transport_metrics_test
+                       PROPERTIES LABELS "nvlink_host_numa_unit")
+  add_test(NAME nvlink_transport_fabric_hbm_test
+           COMMAND ${CMAKE_COMMAND} -E env --unset=MC_USE_NVLINK_IPC
+                   $<TARGET_FILE:nvlink_transport_test>
+                   --gtest_filter=NvlinkTransportTest.WriteAndRead)
+  add_test(NAME nvlink_transport_ipc_cuda_malloc_test
+           COMMAND ${CMAKE_COMMAND} -E env MC_USE_NVLINK_IPC=1
+                   $<TARGET_FILE:nvlink_transport_test>
+                   --gtest_filter=NvlinkTransportTest.WriteAndRead)
+  set_tests_properties(
+    nvlink_transport_fabric_hbm_test nvlink_transport_ipc_cuda_malloc_test
+    PROPERTIES LABELS "nvlink_hbm_regression;nvlink_host_numa_hardware")
+endif()
+
+if(USE_MNNVL AND USE_CUDA AND NOT USE_HIP)
+  add_executable(nvlink_vmm_allocation_test
+                 ${WORKSPACE}/nvlink_vmm_allocation_test.cpp)
+  target_link_libraries(nvlink_vmm_allocation_test PUBLIC transfer_engine gtest
+                                                          gtest_main)
+  add_test(NAME nvlink_vmm_allocation_test COMMAND nvlink_vmm_allocation_test)
+  set_tests_properties(nvlink_vmm_allocation_test
+                       PROPERTIES LABELS "nvlink_host_numa_unit")
+
+  add_executable(nvlink_host_numa_fabric_test
+                 ${WORKSPACE}/nvlink_host_numa_fabric_test.cpp)
+  target_link_libraries(nvlink_host_numa_fabric_test
+                        PUBLIC transfer_engine gtest gtest_main)
+  add_test(NAME nvlink_host_numa_fabric_test
+           COMMAND nvlink_host_numa_fabric_test)
+  set_tests_properties(nvlink_host_numa_fabric_test
+                       PROPERTIES LABELS "nvlink_host_numa_hardware")
+
+  add_executable(nvlink_host_numa_rdma_smoke_test
+                 ${WORKSPACE}/nvlink_host_numa_rdma_smoke_test.cpp)
+  target_link_libraries(nvlink_host_numa_rdma_smoke_test
+                        PUBLIC transfer_engine gtest gtest_main ibverbs)
+  add_test(NAME nvlink_host_numa_rdma_smoke_test
+           COMMAND nvlink_host_numa_rdma_smoke_test)
+  set_tests_properties(nvlink_host_numa_rdma_smoke_test
+                       PROPERTIES LABELS "nvlink_host_numa_rdma")
 endif()
 
 if(USE_HIP)
@@ -234,6 +287,8 @@ add_executable(transfer_metadata_test ${WORKSPACE}/transfer_metadata_test.cpp)
 target_link_libraries(transfer_metadata_test PUBLIC transfer_engine gtest
                                                     gtest_main)
 add_test(NAME transfer_metadata_test COMMAND transfer_metadata_test)
+set_tests_properties(transfer_metadata_test
+                     PROPERTIES LABELS "nvlink_host_numa_unit")
 
 add_executable(config_test ${WORKSPACE}/config_test.cpp)
 target_link_libraries(config_test PUBLIC transfer_engine gtest gtest_main)

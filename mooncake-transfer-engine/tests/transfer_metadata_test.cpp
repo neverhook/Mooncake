@@ -27,6 +27,45 @@ using namespace mooncake;
 
 namespace mooncake {
 
+template <typename T>
+concept HasMemoryKind = requires(T value) { value.memory_kind; };
+template <typename T>
+concept HasNumaNode = requires(T value) { value.numa_node; };
+template <typename T>
+concept HasFabricDomain = requires(T value) { value.fabric_domain_id; };
+template <typename T>
+concept HasGeneration = requires(T value) { value.generation; };
+
+static_assert(!HasMemoryKind<TransferMetadata::SegmentDesc>);
+static_assert(!HasNumaNode<TransferMetadata::SegmentDesc>);
+static_assert(!HasFabricDomain<TransferMetadata::SegmentDesc>);
+static_assert(!HasGeneration<TransferMetadata::SegmentDesc>);
+static_assert(!HasMemoryKind<TransferMetadata::BufferDesc>);
+static_assert(!HasNumaNode<TransferMetadata::BufferDesc>);
+static_assert(!HasFabricDomain<TransferMetadata::BufferDesc>);
+static_assert(!HasGeneration<TransferMetadata::BufferDesc>);
+
+TEST(TransferTaskSubmissionFailureTest, ZeroSliceFailureIsExplicitlyTerminal) {
+    Transport::BatchDesc batch;
+    batch.batch_size = 1;
+    batch.id = reinterpret_cast<Transport::BatchID>(&batch);
+    batch.task_list.resize(1);
+    auto& task = batch.task_list.front();
+    task.batch_id = batch.id;
+
+    Transport::markSubmissionFailed(task);
+    Transport::markSubmissionFailed(task);
+
+    EXPECT_TRUE(task.submission_failed);
+    EXPECT_TRUE(task.is_finished);
+    EXPECT_EQ(task.slice_count, 0);
+    EXPECT_TRUE(batch.has_failure.load());
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+    EXPECT_TRUE(batch.is_finished.load());
+    EXPECT_EQ(batch.finished_task_count.load(), 1);
+#endif
+}
+
 class TransferMetadataTest : public ::testing::Test {
    protected:
     void SetUp() override {

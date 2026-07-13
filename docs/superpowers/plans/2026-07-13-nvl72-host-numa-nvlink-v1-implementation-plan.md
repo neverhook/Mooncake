@@ -357,8 +357,12 @@ For `remote_accessible=false`:
 For `remote_accessible=true`:
 
 - require a retainable, Fabric-exportable VMM allocation in Fabric mode;
-- query the exact whole mapped range; do not retain the current guessed 2 MiB
-  fallback;
+- query the exact whole mapped range;
+- when the legacy `cuMemGetAddressRange()` query rejects a verified HOST_NUMA
+  VMM mapping (for example with CUDA error 201) or returns a null base, use the
+  exact base and aligned length passed by the owning `NvlinkVmmAllocation`;
+  DEVICE allocations still fail the query, and the old guessed 2 MiB fallback
+  remains forbidden;
 - export one `CUmemFabricHandle`;
 - publish the existing BufferDesc fields only;
 - if metadata publication fails, undo the local descriptor mutation, release

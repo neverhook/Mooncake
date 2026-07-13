@@ -6,6 +6,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <string>
@@ -34,6 +35,7 @@ namespace mooncake {
 class RealClient;
 class UdsAcceptor;
 class UdsConnection;
+class ProductionNvlinkHostNumaOperations;
 struct NvlinkHostNumaOptions;
 class NvlinkHostNumaStoreTestPeer;
 
@@ -516,8 +518,7 @@ class RealClient : public PyClient {
         const std::string& ipc_socket_path = "", int local_rpc_port = 50052,
         bool enable_ssd_offload = false, bool start_offload_rpc_server = false,
         const std::string& ssd_offload_path = "",
-        const std::string& tenant_id = "default",
-        const NvlinkHostNumaOptions* nvlink_host_numa_options = nullptr);
+        const std::string& tenant_id = "default");
 
     // Overload that accepts a configuration dictionary
     tl::expected<void, ErrorCode> setup_internal(const ConfigDict& config);
@@ -935,7 +936,25 @@ class RealClient : public PyClient {
         size_t local_buffer_size);
 
    private:
+    friend class ProductionNvlinkHostNumaOperations;
     friend class NvlinkHostNumaStoreTestPeer;
+
+    tl::expected<void, ErrorCode> setup_internal_with_nvlink_host_numa(
+        const std::string& local_hostname, const std::string& metadata_server,
+        size_t global_segment_size, size_t local_buffer_size,
+        const std::string& protocol, const std::string& rdma_devices,
+        const std::string& master_server_addr,
+        const std::shared_ptr<TransferEngine>& transfer_engine,
+        const std::string& ipc_socket_path, int local_rpc_port,
+        bool enable_ssd_offload, bool start_offload_rpc_server,
+        const std::string& ssd_offload_path, const std::string& tenant_id,
+        const NvlinkHostNumaOptions* nvlink_host_numa_options);
+
+    void PublishClientBufferAllocator(
+        std::shared_ptr<ClientBufferAllocator> allocator);
+    std::optional<BufferHandle> AllocateClientBuffer(size_t size);
+    tl::expected<void, ErrorCode> ReleaseNvlinkHostNumaAllocatorView(
+        const std::function<void()>& after_exchange_for_test = {});
 
     // Tracks allocator ownership independently of the exported allocation
     // records so setup cannot overwrite a cleanup-pending allocator.

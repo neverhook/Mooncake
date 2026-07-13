@@ -329,6 +329,11 @@ class Transport {
 
 #ifdef USE_EVENT_DRIVEN_COMPLETION
         volatile uint64_t completed_slice_count = 0;
+        // NVLink POSTED slices require getTransferStatus() to drive
+        // cudaStreamQuery progress even when no completion notification fires.
+        // Other event-driven transports leave this false and remain purely
+        // condition-variable driven.
+        bool requires_periodic_status_polling = false;
 #endif
 
         // record the origin request

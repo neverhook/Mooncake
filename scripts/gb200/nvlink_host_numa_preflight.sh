@@ -151,13 +151,18 @@ else
 fi
 
 if [[ -n "${MC_MNNVL_FABRIC_PROBE:-}" ]]; then
-  if "${MC_MNNVL_FABRIC_PROBE}"; then
+  if [[ ! -x "${MC_MNNVL_FABRIC_PROBE}" ]]; then
+    fail "MC_MNNVL_FABRIC_PROBE is not an executable file: ${MC_MNNVL_FABRIC_PROBE}"
+  elif "${MC_MNNVL_FABRIC_PROBE}"; then
     pass "CUDA Fabric-handle capability probe succeeded"
   else
     fail "CUDA Fabric-handle capability probe failed: ${MC_MNNVL_FABRIC_PROBE}"
   fi
+elif [[ "$strict" == "1" ]]; then
+  fail "strict Fabric preflight requires MC_MNNVL_FABRIC_PROBE"
 else
   warn "MC_MNNVL_FABRIC_PROBE is unset; the hardware CTest must perform the CUDA attribute/allocation probe"
+  fail "CUDA Fabric-handle capability was not probed because MC_MNNVL_FABRIC_PROBE is unset"
 fi
 
 if (( failures == 0 )); then

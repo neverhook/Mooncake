@@ -376,8 +376,7 @@ TEST(NvlinkHostNumaRdmaSmokeTest, VerbsCanRegisterProviderVmmAllocation) {
     ASSERT_EQ(domain.Reset(), 0) << "ibv_dealloc_pd failed";
     ASSERT_EQ(context.Reset(), 0) << "ibv_close_device failed";
     allocation.reset();
-    ::testing::Test::RecordProperty("result",
-                                    "ibv_reg_mr_and_dereg_mr_pass");
+    ::testing::Test::RecordProperty("result", "ibv_reg_mr_and_dereg_mr_pass");
 }
 
 #undef REQUIRE_RDMA_OR_SKIP

@@ -97,9 +97,12 @@ class FakeOperations final : public NvlinkHostNumaOperations {
         return {};
     }
 
-    void ReleaseAllocatorView() override {
-        (void)Record(Operation::kReleaseAllocator, 0, false, "allocator");
+    tl::expected<void, ErrorCode> ReleaseAllocatorView() override {
+        const bool fail =
+            Record(Operation::kReleaseAllocator, 0, false, "allocator");
+        if (fail) return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         allocator_installed_ = false;
+        return {};
     }
 
     tl::expected<void, ErrorCode> RegisterLocal(
@@ -547,6 +550,28 @@ TEST(NvlinkHostNumaOrchestratorTest,
     const size_t events_after_retry = operations.events().size();
     EXPECT_TRUE(Cleanup(operations, state));
     EXPECT_EQ(operations.events().size(), events_after_retry);
+    ExpectNoPublishedOrOwnedState(operations, state);
+}
+
+TEST(NvlinkHostNumaOrchestratorTest,
+     OutstandingAllocatorViewRetainsEveryVmmOwnerUntilRetry) {
+    FakeOperations operations;
+    State state;
+    ASSERT_TRUE(RunSetup(operations, state, PlanWithChunks(2), 4096));
+    operations.Fail(Operation::kReleaseAllocator, {1});
+
+    EXPECT_FALSE(Cleanup(operations, state));
+    EXPECT_EQ(operations.mounted_segment_count(), 0U);
+    EXPECT_TRUE(operations.global_registrations().empty());
+    EXPECT_TRUE(operations.local_registrations().empty());
+    EXPECT_TRUE(operations.allocator_installed());
+    EXPECT_TRUE(state.allocator_installed);
+    EXPECT_EQ(operations.Count(Operation::kDestroy), 0U);
+    EXPECT_EQ(operations.live_allocations().size(), 3U);
+
+    operations.ClearFailures();
+    ASSERT_TRUE(Cleanup(operations, state));
+    EXPECT_EQ(operations.Count(Operation::kReleaseAllocator), 2U);
     ExpectNoPublishedOrOwnedState(operations, state);
 }
 

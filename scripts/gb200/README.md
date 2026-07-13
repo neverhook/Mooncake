@@ -22,23 +22,49 @@ CUDA requires `nvidia-caps-imex-channels` in `/proc/devices` and an accessible
 [CUDA Driver API](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__VA.html)
 and [NVIDIA IMEX channel guide](https://docs.nvidia.com/multi-node-nvlink-systems/imex-guide/imexchannels.html).
 
-Strict preflight and build:
+Strict build, preflight, and hardware tests:
+
+```bash
+export BUILD_DIR="${BUILD_DIR:-$PWD/build-nvlink-host-numa}"
+RUN_HARDWARE_TESTS=1 scripts/gb200/nvlink_host_numa_build.sh
+export PYTHONPATH="${BUILD_DIR}/mooncake-integration${PYTHONPATH:+:${PYTHONPATH}}"
+export LD_LIBRARY_PATH="${BUILD_DIR}/mooncake-common${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+python3 -c 'import store; print("Store binding:", store.__file__)'
+```
+
+Run this build/provenance check on both nodes. The printed binding must resolve
+under this `BUILD_DIR`, not to an older site-packages installation. Provider
+and Consumer JSON also record the selected module path. The build-tree binding
+links `libasio.so` from `BUILD_DIR/mooncake-common`; keep the exported
+`LD_LIBRARY_PATH` in the Provider and Consumer shells.
+
+In hardware mode the build script first builds every target, sets strict
+Fabric/RDMA requirements, defaults `MC_MNNVL_FABRIC_PROBE` to the newly built
+`nvlink_host_numa_fabric_test`, and only then runs preflight and the required
+CTest labels. An explicit executable `MC_MNNVL_FABRIC_PROBE` still overrides
+that default. Strict standalone preflight requires this variable and rejects a
+missing or non-executable probe:
 
 ```bash
 MC_REQUIRE_MNNVL_FABRIC=1 \
-MC_MNNVL_FABRIC_PROBE=/path/to/nvlink_host_numa_fabric_test \
+MC_MNNVL_FABRIC_PROBE="$PWD/build-nvlink-host-numa/mooncake-transfer-engine/tests/nvlink_host_numa_fabric_test" \
 scripts/gb200/nvlink_host_numa_preflight.sh
-
-BUILD_DIR=$PWD/build-nvlink-host-numa \
-SKIP_PREFLIGHT=1 \
-RUN_HARDWARE_TESTS=1 \
-scripts/gb200/nvlink_host_numa_build.sh
 ```
 
-Torch is not a build prerequisite. The Provider and all parser/mock gates run
-without it. Only the HBM Consumer needs a CUDA-enabled Torch wheel; install an
-internally approved, driver-compatible wheel into the workspace venv before
-the data-plane step if the base image must remain unchanged.
+`SKIP_PREFLIGHT=1` remains available only for a preflight result already
+captured for the same build and host; hardware CTest strict/zero-skip gates
+still run.
+
+Torch is not used anywhere in this validation path. The HBM Consumer loads
+`libcudart.so` directly with Python `ctypes`, allocates source/destination HBM
+with `cudaMalloc`, and performs host-to-device/device-to-host verification with
+`cudaMemcpy`. A normal CUDA-enabled Mooncake build container is sufficient. If
+the runtime library is outside the loader's search path, set
+`MC_CUDART_LIBRARY=/absolute/path/to/libcudart.so` or pass
+`--cuda-runtime-library`.
+The build wrapper applies its fixed `WITH_EP=OFF`, CUDA, and MNNVL settings
+after `CMAKE_EXTRA_ARGS`, so optional CMake arguments cannot re-enable the
+Torch-backed EP build in this validation path.
 
 The Fabric probe tests every online NUMA node discovered from the visible GPUs.
 Set `MC_NVLINK_HOST_NUMA_TEST_NODES=0,1` to override that discovery explicitly;
@@ -46,7 +72,8 @@ the single-node `MC_NVLINK_HOST_NUMA_TEST_NODE` override remains available for
 focused diagnosis.
 
 Without `RUN_HARDWARE_TESTS=1`, the build script runs only the required unit
-label. JUnit files are written under `BUILD_DIR`; required hardware/RDMA suites
+label plus the no-Torch Python fake-runtime suite and a `libcudart` load/version
+check. JUnit files are written under `BUILD_DIR`; required hardware/RDMA suites
 must contain testcases and must report zero skipped tests.
 
 When the IMEX daemon is deliberately managed outside a container, set
@@ -87,7 +114,7 @@ ready file on every exit path, and validates the Store close result.
 ## Consumers and concurrency
 
 Run one Consumer per visible GPU on Node B. Each process verifies SHA256 plus a
-byte-for-byte tensor comparison. It snapshots `serialize_metrics()` around the
+byte-for-byte HBM round trip. It snapshots `serialize_metrics()` around the
 first `put_from` and the following `get_into`; acceptance requires a real
 mapping miss/lazy import followed by a cache hit with no second import. The
 JSON records contain measured `put_cache_delta` / `get_cache_delta` counters;
@@ -99,7 +126,8 @@ python3 scripts/gb200/nvlink_host_numa_consumer.py \
   --local-hostname "${NODE_B_IP}:12400" \
   --metadata-server "http://${NODE_A_IP}:8080/metadata" \
   --master-server "${NODE_A_IP}:50051" \
-  --device 0 --iterations 2 --payload-size 16777216
+  --device 0 --iterations 2 --payload-size 16777216 \
+  --run-id "${RUN_ID}"
 ```
 
 The benchmark launches GPU Consumers concurrently, rejects duplicate GPU IDs,
@@ -117,19 +145,22 @@ python3 scripts/gb200/nvlink_host_numa_bench.py \
 ```
 
 Use the same explicit `RUN_ID` on both nodes. Consumer context records include
-the PID, Torch/CUDA versions, GPU name, and Linux CPU/NUMA affinity; summaries
-are split by counter-derived cache phase and include mapping hit ratio and cold
-import latency.
+the PID, loaded CUDA runtime path, CUDA runtime/driver versions,
+`CUDA_VISIBLE_DEVICES`, and Linux CPU/NUMA affinity; summaries are split by
+counter-derived cache phase and include mapping hit ratio and cold import
+latency.
 
 Record topology, driver/toolkit/IMEX versions, CTest XML, Provider metrics, and
 the JSON result stream. Hardware results are `PASS`, `FAIL`, or `NOT RUN`; a
 skip is not acceptance evidence.
 
-The harness parsers, Master admin mock, and metric-delta assertions can be
-tested in a build container without Torch or a GPU:
+The harness parsers, Master admin mock, no-Torch Consumer fake-runtime round
+trip, and metric-delta assertions can be tested in a build container without a
+GPU:
 
 ```bash
 python3 -m unittest discover -s scripts/gb200 \
   -p 'test_nvlink_host_numa_harness.py' -v
 python3 -m py_compile scripts/gb200/*.py
+bash scripts/gb200/test_nvlink_host_numa_scripts.sh
 ```

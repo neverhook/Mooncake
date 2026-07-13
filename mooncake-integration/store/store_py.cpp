@@ -1457,6 +1457,7 @@ class MooncakeStorePyWrapper {
             std::vector<size_t> original_indices;
 
             std::vector<std::unique_ptr<BufferHandle>> temp_allocations;
+            auto allocator = store_->SnapshotClientBufferAllocator();
 
             for (size_t i = 0; i < infos.size(); ++i) {
                 if (!infos[i].valid()) continue;
@@ -1464,7 +1465,7 @@ class MooncakeStorePyWrapper {
                 size_t total_size =
                     sizeof(TensorMetadata) + infos[i].tensor_size;
                 auto alloc_result =
-                    store_->client_buffer_allocator_->allocate(total_size);
+                    allocator ? allocator->allocate(total_size) : std::nullopt;
 
                 if (!alloc_result) {
                     LOG(ERROR)

@@ -51,7 +51,10 @@ class NvlinkHostNumaOperations {
     virtual tl::expected<void, ErrorCode> InstallAllocatorView(
         NvlinkHostNumaAllocation* local_allocation,
         size_t configured_local_length) = 0;
-    virtual void ReleaseAllocatorView() = 0;
+    // Releasing the non-owning allocator view can fail while caller-visible
+    // BufferHandles still retain it. In that case cleanup must keep both the
+    // allocator view and the backing VMM owner for an explicit retry.
+    virtual tl::expected<void, ErrorCode> ReleaseAllocatorView() = 0;
 
     virtual tl::expected<void, ErrorCode> RegisterLocal(
         void* base, size_t length, bool remote_accessible) = 0;

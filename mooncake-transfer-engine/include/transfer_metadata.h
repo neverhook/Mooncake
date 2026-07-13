@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -245,6 +246,11 @@ class TransferMetadata {
     std::string common_key_prefix_;
     std::string rpc_meta_prefix_;
     // local cache
+    // Serializes every mutation/publication transaction for the local segment.
+    // The segment spinlock still protects short in-memory snapshots; this
+    // mutex may span metadata I/O so a failed publication can restore its COW
+    // snapshot before another registration changes it.
+    std::mutex local_segment_publish_mutex_;
     RWSpinlock segment_lock_;
     std::unordered_map<uint64_t, std::shared_ptr<SegmentDesc>>
         segment_id_to_desc_map_;

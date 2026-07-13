@@ -368,6 +368,16 @@ class PyClient {
     virtual tl::expected<QueryTaskResponse, ErrorCode> query_task(
         const UUID &task_id) = 0;
 
+    // Readers must take an atomic shared_ptr snapshot before inspecting or
+    // allocating from the client buffer allocator. The returned shared_ptr is
+    // also a lifetime lease: allocator teardown cannot complete while a
+    // reader still holds it.
+    [[nodiscard]] std::shared_ptr<ClientBufferAllocator>
+    SnapshotClientBufferAllocator() const {
+        return std::atomic_load_explicit(&client_buffer_allocator_,
+                                         std::memory_order_acquire);
+    }
+
     std::shared_ptr<mooncake::Client> client_ = nullptr;
     std::shared_ptr<mooncake::ClientRequester> client_requester_ = nullptr;
     std::shared_ptr<mooncake::FileStorage> file_storage_ = nullptr;

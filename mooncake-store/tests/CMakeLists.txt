@@ -78,6 +78,15 @@ add_store_test(master_admin_server_test master_admin_server_test.cpp)
 add_store_test(posix_file_test posix_file_test.cpp)
 add_store_test(thread_pool_test thread_pool_test.cpp)
 add_store_test(transfer_task_test transfer_task_test.cpp)
+if(USE_EVENT_DRIVEN_COMPLETION)
+  add_test(
+    NAME nvlink_event_driven_completion_test
+    COMMAND
+      $<TARGET_FILE:transfer_task_test>
+      --gtest_filter=TransferEngineEventDrivenCompletionTest.*)
+  set_tests_properties(nvlink_event_driven_completion_test
+                       PROPERTIES LABELS "nvlink_host_numa_unit")
+endif()
 add_store_test(tenant_quota_test tenant_quota_test.cpp)
 add_store_test(segment_test segment_test.cpp)
 add_store_test(offset_allocator_test offset_allocator_test.cpp)

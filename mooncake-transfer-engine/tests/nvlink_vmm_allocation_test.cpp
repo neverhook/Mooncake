@@ -41,8 +41,15 @@ class NvlinkTransportTestPeer {
 
     static bool TrackPinnedVmmAllocation(
         std::unique_ptr<NvlinkVmmAllocation> allocation) {
-        return NvlinkTransport::TrackPinnedVmmAllocation(
-            std::move(allocation));
+        return NvlinkTransport::TrackPinnedVmmAllocation(std::move(allocation));
+    }
+
+    static bool RetryCleanupPendingOwners() {
+        return NvlinkVmmAllocation::RetryCleanupPendingOwners();
+    }
+
+    static size_t CleanupPendingOwnerCount() {
+        return NvlinkVmmAllocation::CleanupPendingOwnerCount();
     }
 };
 
@@ -411,15 +418,78 @@ TEST(NvlinkVmmAllocationTest, RetriesOriginalHandleReleaseDuringRollback) {
                                                           allocation)
                      .ok());
     EXPECT_EQ(allocation, nullptr);
-    driver.expectNoResources();
-    EXPECT_EQ(driver.release_calls, 3);
+    EXPECT_EQ(NvlinkTransportTestPeer::CleanupPendingOwnerCount(), 1U);
+    EXPECT_EQ(driver.owned_handles, 1);
+    EXPECT_EQ(driver.release_calls, 2);
     EXPECT_EQ(driver.unmap_calls, 1);
     EXPECT_EQ(driver.address_free_calls, 1);
+
+    EXPECT_TRUE(NvlinkTransportTestPeer::RetryCleanupPendingOwners());
+    EXPECT_EQ(NvlinkTransportTestPeer::CleanupPendingOwnerCount(), 0U);
+    driver.expectNoResources();
+    EXPECT_EQ(driver.release_calls, 3);
     ASSERT_GE(driver.operations.size(), 5);
     EXPECT_EQ(std::vector<std::string>(driver.operations.end() - 5,
                                        driver.operations.end()),
               (std::vector<std::string>{"release", "unmap", "address_free",
                                         "release", "release"}));
+}
+
+TEST(NvlinkVmmAllocationTest,
+     PersistentRollbackUnmapFailureRetainsCompleteOwnerForRetry) {
+    ScopedIpcEnvironment environment;
+    FakeCudaDriver driver;
+    driver.fail_access_call = 0;
+    driver.unmap_failures_remaining = 1000;
+    NvlinkVmmAllocation::Options options;
+    options.location_type = NvlinkVmmAllocation::LocationType::HOST_NUMA;
+    options.location_id = 0;
+    options.requested_length = 64 * 1024;
+
+    std::unique_ptr<NvlinkVmmAllocation> allocation;
+    EXPECT_FALSE(NvlinkVmmAllocation::CreateWithDriverApi(options, driver.api(),
+                                                          allocation)
+                     .ok());
+    EXPECT_EQ(allocation, nullptr);
+    EXPECT_EQ(NvlinkTransportTestPeer::CleanupPendingOwnerCount(), 1U);
+    EXPECT_EQ(driver.mapped_ranges, 1);
+    EXPECT_EQ(driver.reserved_ranges, 1);
+    EXPECT_EQ(driver.owned_handles, 1);
+    EXPECT_EQ(driver.address_free_calls, 0);
+    EXPECT_EQ(driver.release_calls, 0);
+
+    driver.unmap_failures_remaining = 0;
+    EXPECT_TRUE(NvlinkTransportTestPeer::RetryCleanupPendingOwners());
+    EXPECT_EQ(NvlinkTransportTestPeer::CleanupPendingOwnerCount(), 0U);
+    driver.expectNoResources();
+    EXPECT_EQ(driver.address_free_calls, 1);
+    EXPECT_EQ(driver.release_calls, 1);
+}
+
+TEST(NvlinkVmmAllocationTest,
+     PersistentRollbackHandleFailureRetainsOwnerForRetry) {
+    ScopedIpcEnvironment environment;
+    FakeCudaDriver driver;
+    driver.release_failures_remaining = 1000;
+    NvlinkVmmAllocation::Options options;
+    options.location_type = NvlinkVmmAllocation::LocationType::HOST_NUMA;
+    options.location_id = 0;
+    options.requested_length = 64 * 1024;
+
+    std::unique_ptr<NvlinkVmmAllocation> allocation;
+    EXPECT_FALSE(NvlinkVmmAllocation::CreateWithDriverApi(options, driver.api(),
+                                                          allocation)
+                     .ok());
+    EXPECT_EQ(allocation, nullptr);
+    EXPECT_EQ(NvlinkTransportTestPeer::CleanupPendingOwnerCount(), 1U);
+    EXPECT_EQ(driver.mapped_ranges, 0);
+    EXPECT_EQ(driver.reserved_ranges, 0);
+    EXPECT_EQ(driver.owned_handles, 1);
+
+    driver.release_failures_remaining = 0;
+    EXPECT_TRUE(NvlinkTransportTestPeer::RetryCleanupPendingOwners());
+    EXPECT_EQ(NvlinkTransportTestPeer::CleanupPendingOwnerCount(), 0U);
+    driver.expectNoResources();
 }
 
 TEST(NvlinkVmmAllocationTest, ReleaseRetriesUnmapBeforeLaterStages) {
@@ -432,8 +502,8 @@ TEST(NvlinkVmmAllocationTest, ReleaseRetriesUnmapBeforeLaterStages) {
     options.fabric_exportable = true;
 
     std::unique_ptr<NvlinkVmmAllocation> allocation;
-    ASSERT_TRUE(NvlinkVmmAllocation::CreateWithDriverApi(
-                    options, driver.api(), allocation)
+    ASSERT_TRUE(NvlinkVmmAllocation::CreateWithDriverApi(options, driver.api(),
+                                                         allocation)
                     .ok());
     ASSERT_TRUE(NvlinkTransportTestPeer::IsExactOwnedRange(
         allocation->base(), allocation->length()));
@@ -471,8 +541,8 @@ TEST(NvlinkVmmAllocationTest, ReleaseRetriesAddressFreeWithoutRepeatingUnmap) {
     options.requested_length = 64 * 1024;
 
     std::unique_ptr<NvlinkVmmAllocation> allocation;
-    ASSERT_TRUE(NvlinkVmmAllocation::CreateWithDriverApi(
-                    options, driver.api(), allocation)
+    ASSERT_TRUE(NvlinkVmmAllocation::CreateWithDriverApi(options, driver.api(),
+                                                         allocation)
                     .ok());
     driver.address_free_failures_remaining = 1;
 
@@ -508,13 +578,12 @@ TEST(NvlinkVmmAllocationTest,
     options.fabric_exportable = true;
 
     std::unique_ptr<NvlinkVmmAllocation> allocation;
-    ASSERT_TRUE(NvlinkVmmAllocation::CreateWithDriverApi(
-                    options, driver.api(), allocation)
+    ASSERT_TRUE(NvlinkVmmAllocation::CreateWithDriverApi(options, driver.api(),
+                                                         allocation)
                     .ok());
     void* const base = allocation->base();
     const size_t length = allocation->length();
-    ASSERT_TRUE(
-        NvlinkTransportTestPeer::IsExactOwnedRange(base, length));
+    ASSERT_TRUE(NvlinkTransportTestPeer::IsExactOwnedRange(base, length));
     ASSERT_TRUE(NvlinkTransportTestPeer::UnregisterOwnedRange(base, length));
 
     Status first = allocation->Release();
@@ -540,8 +609,8 @@ TEST(NvlinkVmmAllocationTest,
     options.requested_length = 64 * 1024;
 
     std::unique_ptr<NvlinkVmmAllocation> allocation;
-    ASSERT_TRUE(NvlinkVmmAllocation::CreateWithDriverApi(
-                    options, driver.api(), allocation)
+    ASSERT_TRUE(NvlinkVmmAllocation::CreateWithDriverApi(options, driver.api(),
+                                                         allocation)
                     .ok());
     void* const base = allocation->base();
 
@@ -568,8 +637,8 @@ TEST(NvlinkVmmAllocationTest, PinnedOwnerFreeRetainsAndRetriesFailedRelease) {
     options.requested_length = 64 * 1024;
 
     std::unique_ptr<NvlinkVmmAllocation> allocation;
-    ASSERT_TRUE(NvlinkVmmAllocation::CreateWithDriverApi(
-                    options, driver.api(), allocation)
+    ASSERT_TRUE(NvlinkVmmAllocation::CreateWithDriverApi(options, driver.api(),
+                                                         allocation)
                     .ok());
     void* const base = allocation->base();
     ASSERT_TRUE(NvlinkTransportTestPeer::TrackPinnedVmmAllocation(

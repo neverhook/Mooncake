@@ -15,11 +15,13 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <barrier>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
+#include <future>
 #include <glob.h>
 #include <limits>
 #include <memory>
@@ -59,6 +61,28 @@ class NvlinkHostNumaStoreTestPeer {
         client.nvlink_host_numa_allocator_installed_ = true;
     }
 
+    static tl::expected<void, ErrorCode> ReleaseAllocatorView(
+        RealClient& client,
+        const std::function<void()>& after_exchange_for_test = {}) {
+        return client.ReleaseNvlinkHostNumaAllocatorView(
+            after_exchange_for_test);
+    }
+
+    static void PublishAllocatorView(
+        RealClient& client, std::shared_ptr<ClientBufferAllocator> allocator) {
+        client.PublishClientBufferAllocator(std::move(allocator));
+    }
+
+    static std::shared_ptr<ClientBufferAllocator> SnapshotAllocatorView(
+        const RealClient& client) {
+        return client.SnapshotClientBufferAllocator();
+    }
+
+    static std::optional<BufferHandle> AllocateFromAllocatorView(
+        RealClient& client, size_t size) {
+        return client.AllocateClientBuffer(size);
+    }
+
     static bool HasLocalTeBuffer(Client& client, uintptr_t base) {
         auto metadata = client.transfer_engine_->getMetadata();
         if (metadata == nullptr) return false;
@@ -74,8 +98,8 @@ class NvlinkHostNumaStoreTestPeer {
 
 namespace {
 
-using testing::InProcMaster;
 using ::mooncake::InProcMasterConfigBuilder;
+using testing::InProcMaster;
 
 ConfigDict MinimalConfig(const std::string& protocol) {
     return {{CONFIG_KEY_LOCAL_HOSTNAME, "localhost:17991"},
@@ -378,6 +402,16 @@ TEST(NvlinkHostNumaStoreTest, EnabledConfigRejectsNonNvlinkBeforeSetup) {
 }
 
 TEST(NvlinkHostNumaStoreTest, FixedArgumentApiHasNoHostNumaSwitch) {
+    using FixedInternalSetupSignature =
+        tl::expected<void, ErrorCode> (RealClient::*)(
+            const std::string&, const std::string&, size_t, size_t,
+            const std::string&, const std::string&, const std::string&,
+            const std::shared_ptr<TransferEngine>&, const std::string&, int,
+            bool, bool, const std::string&, const std::string&);
+    FixedInternalSetupSignature fixed_internal_setup =
+        &RealClient::setup_internal;
+    EXPECT_TRUE(fixed_internal_setup != nullptr);
+
     using FixedSetupSignature = int (RealClient::*)(
         const std::string&, const std::string&, size_t, size_t,
         const std::string&, const std::string&, const std::string&,
@@ -399,6 +433,75 @@ TEST(NvlinkHostNumaStoreTest, EmptyPartialSetupCleanupIsIdempotent) {
 }
 
 TEST(NvlinkHostNumaStoreTest,
+     OutstandingBufferHandleBlocksAllocatorViewReleaseUntilRetry) {
+    auto client = RealClient::create();
+    std::vector<std::byte> storage(4096);
+    NvlinkHostNumaStoreTestPeer::PublishAllocatorView(
+        *client, ClientBufferAllocator::create(storage.data(), storage.size(),
+                                               "nvlink"));
+    auto allocation =
+        NvlinkHostNumaStoreTestPeer::AllocateFromAllocatorView(*client, 1024);
+    ASSERT_TRUE(allocation.has_value());
+    EXPECT_EQ(allocation->ptr(), storage.data());
+
+    auto blocked = NvlinkHostNumaStoreTestPeer::ReleaseAllocatorView(*client);
+    ASSERT_FALSE(blocked);
+    EXPECT_EQ(blocked.error(), ErrorCode::INTERNAL_ERROR);
+    ASSERT_NE(NvlinkHostNumaStoreTestPeer::SnapshotAllocatorView(*client),
+              nullptr);
+    EXPECT_EQ(allocation->ptr(), storage.data());
+
+    allocation.reset();
+    EXPECT_TRUE(NvlinkHostNumaStoreTestPeer::ReleaseAllocatorView(*client));
+    EXPECT_EQ(NvlinkHostNumaStoreTestPeer::SnapshotAllocatorView(*client),
+              nullptr);
+}
+
+TEST(NvlinkHostNumaStoreTest,
+     AtomicExchangeRejectsOldLeaseAndHidesOwnerFromNewReaders) {
+    auto client = RealClient::create();
+    std::vector<std::byte> storage(4096);
+    NvlinkHostNumaStoreTestPeer::PublishAllocatorView(
+        *client, ClientBufferAllocator::create(storage.data(), storage.size(),
+                                               "nvlink"));
+
+    auto old_lease =
+        NvlinkHostNumaStoreTestPeer::SnapshotAllocatorView(*client);
+    ASSERT_NE(old_lease, nullptr);
+
+    std::barrier exchange_reached(2);
+    std::barrier new_reader_checked(2);
+    auto release_future = std::async(std::launch::async, [&]() {
+        return NvlinkHostNumaStoreTestPeer::ReleaseAllocatorView(
+            *client, [&]() {
+                exchange_reached.arrive_and_wait();
+                new_reader_checked.arrive_and_wait();
+            });
+    });
+
+    // Release has atomically removed the published owner but is paused before
+    // inspecting the lease count. New readers must not attach to that owner.
+    exchange_reached.arrive_and_wait();
+    EXPECT_EQ(NvlinkHostNumaStoreTestPeer::SnapshotAllocatorView(*client),
+              nullptr);
+    EXPECT_FALSE(
+        NvlinkHostNumaStoreTestPeer::AllocateFromAllocatorView(*client, 1024)
+            .has_value());
+    new_reader_checked.arrive_and_wait();
+
+    auto blocked = release_future.get();
+    ASSERT_FALSE(blocked);
+    EXPECT_EQ(blocked.error(), ErrorCode::INTERNAL_ERROR);
+    EXPECT_EQ(NvlinkHostNumaStoreTestPeer::SnapshotAllocatorView(*client),
+              old_lease);
+
+    old_lease.reset();
+    EXPECT_TRUE(NvlinkHostNumaStoreTestPeer::ReleaseAllocatorView(*client));
+    EXPECT_EQ(NvlinkHostNumaStoreTestPeer::SnapshotAllocatorView(*client),
+              nullptr);
+}
+
+TEST(NvlinkHostNumaStoreTest,
      CleanupPendingOwnershipRejectsEnabledAndDisabledSetupBeforeMutation) {
     auto client = RealClient::create();
 
@@ -408,13 +511,14 @@ TEST(NvlinkHostNumaStoreTest,
     client->nvlink_host_numa_enabled_ = true;
     client->nvlink_host_numa_globals_.emplace_back();
     client->nvlink_host_numa_local_.emplace();
-    client->client_buffer_allocator_ =
-        ClientBufferAllocator::create(size_t{0}, "nvlink");
+    NvlinkHostNumaStoreTestPeer::PublishAllocatorView(
+        *client, ClientBufferAllocator::create(size_t{0}, "nvlink"));
     NvlinkHostNumaStoreTestPeer::MarkAllocatorCleanupPending(*client);
     client->protocol = "cleanup-pending-protocol";
     client->local_hostname = "cleanup-pending-host";
 
-    const auto retained_allocator = client->client_buffer_allocator_;
+    auto retained_allocator =
+        NvlinkHostNumaStoreTestPeer::SnapshotAllocatorView(*client);
     ConfigDict enabled = MinimalConfig("nvlink");
     enabled[CONFIG_KEY_ENABLE_NVLINK_HOST_NUMA] = "true";
     auto enabled_retry = client->setup_internal(enabled);
@@ -430,10 +534,12 @@ TEST(NvlinkHostNumaStoreTest,
     EXPECT_TRUE(client->nvlink_host_numa_enabled_);
     EXPECT_EQ(client->nvlink_host_numa_globals_.size(), 1U);
     EXPECT_TRUE(client->nvlink_host_numa_local_.has_value());
-    EXPECT_EQ(client->client_buffer_allocator_, retained_allocator);
+    EXPECT_EQ(NvlinkHostNumaStoreTestPeer::SnapshotAllocatorView(*client),
+              retained_allocator);
     EXPECT_EQ(client->protocol, "cleanup-pending-protocol");
     EXPECT_EQ(client->local_hostname, "cleanup-pending-host");
 
+    retained_allocator.reset();
     EXPECT_TRUE(client->CleanupNvlinkHostNuma(true));
 }
 
@@ -506,8 +612,7 @@ TEST(NvlinkHostNumaStoreHardwareTest,
     ::testing::Test::RecordProperty(
         "numa_node_count", std::to_string(hardware->plan.nodes.size()));
     ::testing::Test::RecordProperty(
-        "provider_chunk_count",
-        std::to_string(hardware->plan.chunks.size()));
+        "provider_chunk_count", std::to_string(hardware->plan.chunks.size()));
     ::testing::Test::RecordProperty(
         "effective_capacity_bytes",
         std::to_string(hardware->plan.effective_total));
@@ -597,7 +702,8 @@ TEST(NvlinkHostNumaStoreHardwareTest,
     EXPECT_FALSE(client->nvlink_host_numa_enabled_);
     EXPECT_TRUE(client->nvlink_host_numa_globals_.empty());
     EXPECT_FALSE(client->nvlink_host_numa_local_.has_value());
-    EXPECT_EQ(client->client_buffer_allocator_, nullptr);
+    EXPECT_EQ(NvlinkHostNumaStoreTestPeer::SnapshotAllocatorView(*client),
+              nullptr);
     EXPECT_FALSE(client->local_buffer_region_.has_value());
 
     auto absent = WaitForProviderVisibility(master, hostname, false);

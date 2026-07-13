@@ -1,6 +1,6 @@
 # NVL72 HOST_NUMA NVLink KV Pool V1 Implementation Plan
 
-- **Status:** Implemented in the design worktree; current-environment checks complete; GB200/Fabric/RDMA acceptance `NOT RUN`
+- **Status:** Code and local/arm64 checks complete; designated GB200 CI integration pending; GB200/Fabric/RDMA acceptance `NOT RUN`
 - **Date:** 2026-07-13
 - **Design:** [`2026-07-10-nvl72-host-numa-nvlink-v1-design.md`](../specs/2026-07-10-nvl72-host-numa-nvlink-v1-design.md)
 - **Code baseline:** `origin/main@98ff4e4787e99265d25938139551841350ca5f4e`
@@ -9,11 +9,14 @@
 
 ## Implementation status (2026-07-13)
 
-Tasks 1-8 below are implemented in the named design worktree. The
-implementation includes ConfigDict-only enablement, deterministic
-NUMA/chunk planning, Store-owned HOST_NUMA VMM lifetime, strict Fabric NVLink
-readiness, transactional registration/import/rollback, bounded Provider and
-Consumer metrics, ordinary/arm64 CTest gates, and the GB200 validation harness.
+Tasks 1-7 and Task 8's ordinary-CI, local harness, documentation, and rollout
+portions are implemented in the named design worktree. The designated
+self-hosted GB200 job in Task 8.3 remains pending runner integration, and its
+hardware acceptance remains `NOT RUN`. The implementation includes
+ConfigDict-only enablement, deterministic NUMA/chunk planning, Store-owned
+HOST_NUMA VMM lifetime, strict Fabric NVLink readiness, transactional
+registration/import/rollback, bounded Provider and Consumer metrics,
+ordinary/arm64 CTest gates, and the GB200 validation harness.
 
 Current-workstation checks passed for clang-format 20.1.8, `git diff --check`,
 workflow YAML parsing, GB200 shell syntax, Python AST/Ruff, CLI entry points,
@@ -21,11 +24,17 @@ label membership review, and non-strict preflight behavior. After the first
 GB200 compile exposed and the implementation fixed a test namespace error, a
 disposable Linux/arm64 CUDA 12.8 development container configured with
 `USE_CUDA=ON` and `USE_MNNVL=ON`, compiled the Store/Fabric/RDMA/VMM/metrics/HBM
-test targets, and passed all 11 `nvlink_host_numa_unit` CTest entries, including
-the production-reused orchestration failure matrix. The final ownership audit
-also passed all 12 VMM fault-injection cases, including staged release retry
-and pinned-owner retention. The no-Torch Python harness parser/admin mock suite
-passed 4/4 and the Store binding imported with its read-only metrics API. This
+test targets. The final source passed all 11 `nvlink_host_numa_unit` entries
+with event completion disabled and all 12 with it enabled, including the
+production-reused orchestration failure matrix and the event polling
+regression. Both configurations also passed `transfer_task_test` and
+`pybind_client_test`. The final ownership audit passed all 14 VMM
+fault-injection cases, including staged release retry, persistent cleanup
+failure, and pinned-owner retention. The Consumer now uses `libcudart` directly via
+`ctypes` for HBM allocation/copy/verification, so the entire Python validation
+path is Torch-free. The Python harness parser/admin/fake-CUDA/module-provenance
+suite passed 7/7; the arm64 container loaded the current build-tree Store
+binding and CUDA 12.8 `libcudart`. This
 is compile and fake-driver/CPU evidence only: the container had no real CUDA
 driver, Fabric, IMEX, RNIC, or GB200 topology, so Fabric copy, Store hardware,
 and verbs smoke results remain `NOT RUN`.
@@ -41,6 +50,10 @@ scripts/gb200/nvlink_host_numa_build.sh
 This command must run on a prepared GB200/NVL72 host. Required Fabric/RDMA
 testcases must be present and report zero skips; until then their status remains
 `NOT RUN`, not `PASS`.
+
+For `RUN_HARDWARE_TESTS=1`, the script builds first, defaults the strict Fabric
+probe to the resulting `nvlink_host_numa_fabric_test`, and then runs preflight.
+Standalone strict preflight rejects an unset or non-executable probe.
 
 ## Outcome
 
@@ -314,7 +327,9 @@ live resources. Also verify:
 - Fabric-exportable versus local-only requested handle types;
 - actual aligned length;
 - CPU plus all-visible-GPU access descriptors;
-- move construction/assignment and double-destruction safety;
+- move construction and double-destruction safety; move assignment is
+  intentionally deleted because a partially released owner must retain its
+  exact retryable CUDA VMM state;
 - legacy wrapper source compatibility;
 - non-CUDA/MNNVL stubs report unsupported rather than silently allocating.
 
@@ -732,7 +747,11 @@ successful process.
 
 The preflight script verifies driver/toolkit, Fabric-handle support,
 `MC_USE_NVLINK_IPC` absence, IMEX device/configuration, visible GPU PCI BDFs,
-PCI-to-NUMA mapping, and online NUMA nodes. It prints no Fabric handles.
+PCI-to-NUMA mapping, and online NUMA nodes. Strict mode additionally requires
+an executable allocation/export probe and treats an unset probe as failure. The
+build script resolves the build/probe dependency by building first and using its
+Fabric test as the default probe before strict preflight. It prints no Fabric
+handles.
 
 ### 7.2 Fabric-capable single-host test
 
@@ -752,13 +771,20 @@ Validate on each selected CPU NUMA node:
 Use the Python ConfigDict overload. A representative provider run is:
 
 ```bash
+export BUILD_DIR="${BUILD_DIR:-$PWD/build-nvlink-host-numa}"
+export PYTHONPATH="${BUILD_DIR}/mooncake-integration${PYTHONPATH:+:${PYTHONPATH}}"
+export LD_LIBRARY_PATH="${BUILD_DIR}/mooncake-common${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+RUN_ID="gb200-$(date -u +%Y%m%dT%H%M%SZ)"
 MC_MAX_MR_SIZE=$((150*1024*1024*1024)) \
 python3 scripts/gb200/nvlink_host_numa_provider.py \
   --local-hostname "${NODE_A_IP}:12345" \
   --metadata-server "http://${NODE_A_IP}:8080/metadata" \
   --master-server "${NODE_A_IP}:50051" \
+  --master-admin-url "http://${NODE_A_IP}:9003" \
   --global-segment-size "600 GB" \
-  --nodes auto
+  --nodes auto \
+  --run-id "${RUN_ID}" \
+  --ready-file /tmp/mooncake-host-numa.ready
 ```
 
 On a two-NUMA node, the logical plan is approximately 300 GiB per NUMA node;
@@ -766,6 +792,11 @@ On a two-NUMA node, the logical plan is approximately 300 GiB per NUMA node;
 chunking, not per-GPU export sharding.
 
 From Node B, run HBM-backed Consumers on each visible GPU. For every payload:
+
+The Consumer must remain Torch-free: it loads `libcudart` with `ctypes`, uses
+`cudaMalloc` for both registered buffers, copies deterministic host bytes into
+source HBM, and copies destination HBM back for SHA256 and byte comparison.
+No Python/C++ binding expansion is required.
 
 - Put from registered HBM into remote HOST_NUMA;
 - Get from remote HOST_NUMA into registered HBM;

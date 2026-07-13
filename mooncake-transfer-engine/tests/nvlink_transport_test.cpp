@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <functional>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
@@ -130,6 +131,38 @@ class NvlinkTransportTestPeer {
         return transport.local_registrations_.size();
     }
 
+    static size_t quarantinedRetainedHandleCount(
+        const NvlinkTransport& transport) {
+        return transport.quarantined_retained_handles_.size();
+    }
+
+    static size_t quarantinedFabricMappingCount(
+        const NvlinkTransport& transport) {
+        return transport.quarantined_fabric_mappings_.size();
+    }
+
+    static int publishIpcDescriptorForTesting(
+        NvlinkTransport& transport, void* registration_addr,
+        std::function<int(const TransferMetadata::BufferDesc&, bool)> add,
+        std::function<int(void*, bool)> remove) {
+        transport.use_fabric_mem_ = false;
+        transport.add_buffer_for_testing_ = std::move(add);
+        transport.remove_buffer_for_testing_ = std::move(remove);
+        NvlinkTransport::LocalRegistration registration;
+        registration.requested_addr = registration_addr;
+        registration.requested_length = 4096;
+        registration.mapped_base = registration_addr;
+        registration.mapped_length = 4096;
+        registration.remote_accessible = true;
+        transport.local_registrations_.emplace(registration_addr, registration);
+        TransferMetadata::BufferDesc descriptor;
+        descriptor.addr = reinterpret_cast<uint64_t>(registration_addr);
+        descriptor.length = 4096;
+        descriptor.shm_name = "fake-ipc-handle";
+        return transport.publishLocalRegistration(registration_addr, descriptor,
+                                                  true);
+    }
+
     static std::unique_ptr<NvlinkVmmAllocation> makeOwnedHostNumaRange(
         void* base, size_t length) {
         std::unique_ptr<NvlinkVmmAllocation> allocation(
@@ -156,6 +189,7 @@ class FakeFabricDriver {
         NONE,
         ALLOCATION_PROPERTIES,
         ADDRESS_RANGE,
+        EXPORT,
         IMPORT,
         RESERVE,
         MAP,
@@ -204,8 +238,10 @@ class FakeFabricDriver {
             return CUDA_SUCCESS;
         };
         api.mem_export_to_shareable_handle =
-            [](void* shareable, CUmemGenericAllocationHandle,
-               CUmemAllocationHandleType, unsigned long long) {
+            [this](void* shareable, CUmemGenericAllocationHandle,
+                   CUmemAllocationHandleType, unsigned long long) {
+                if (failure == Failure::EXPORT)
+                    return CUDA_ERROR_INVALID_HANDLE;
                 std::memset(shareable, 0, sizeof(CUmemFabricHandle));
                 return CUDA_SUCCESS;
             };
@@ -238,15 +274,37 @@ class FakeFabricDriver {
             return CUDA_SUCCESS;
         };
         api.mem_unmap = [this](CUdeviceptr, size_t) {
+            ++unmap_calls;
+            if (unmap_failures_remaining > 0) {
+                --unmap_failures_remaining;
+                return CUDA_ERROR_INVALID_VALUE;
+            }
             if (mapped_ranges > 0) --mapped_ranges;
             return CUDA_SUCCESS;
         };
         api.mem_address_free = [this](CUdeviceptr, size_t) {
+            ++address_free_calls;
+            if (address_free_failures_remaining > 0) {
+                --address_free_failures_remaining;
+                return CUDA_ERROR_INVALID_VALUE;
+            }
             if (reserved_ranges > 0) --reserved_ranges;
             return CUDA_SUCCESS;
         };
         api.mem_release = [this](CUmemGenericAllocationHandle handle) {
             ++release_calls;
+            if (handle == kRetainedHandle &&
+                retained_release_failures_remaining > 0) {
+                --retained_release_failures_remaining;
+                return CUDA_ERROR_INVALID_VALUE;
+            }
+            if (handle == kImportedHandle) {
+                ++imported_release_calls;
+                if (imported_release_failures_remaining > 0) {
+                    --imported_release_failures_remaining;
+                    return CUDA_ERROR_INVALID_VALUE;
+                }
+            }
             if (failure == Failure::POST_MAP_RELEASE &&
                 handle == kImportedHandle && !release_failed_once) {
                 release_failed_once = true;
@@ -278,6 +336,13 @@ class FakeFabricDriver {
     int import_calls = 0;
     int access_calls = 0;
     int release_calls = 0;
+    int unmap_calls = 0;
+    int address_free_calls = 0;
+    int imported_release_calls = 0;
+    int unmap_failures_remaining = 0;
+    int address_free_failures_remaining = 0;
+    int imported_release_failures_remaining = 0;
+    int retained_release_failures_remaining = 0;
     bool release_failed_once = false;
 };
 
@@ -457,6 +522,121 @@ TEST(NvlinkTransportUnitTest, LazyImportFailuresCleanUpAndRetry) {
 }
 
 TEST(NvlinkTransportUnitTest,
+     LazyImportCleanupIsStagedQuarantinedAndRetriedBeforeNewImport) {
+    enum class CleanupFailure { UNMAP, ADDRESS_FREE, RELEASE };
+    struct FailureCase {
+        const char* name;
+        CleanupFailure failure;
+        int expected_unmap_calls_after_first;
+        int expected_address_free_calls_after_first;
+        int expected_release_calls_after_first;
+        int expected_unmap_calls_after_retry;
+        int expected_address_free_calls_after_retry;
+        int expected_release_calls_after_retry;
+    };
+    const std::vector<FailureCase> cases = {
+        {"unmap", CleanupFailure::UNMAP, 1, 0, 0, 2, 0, 0},
+        {"address_free", CleanupFailure::ADDRESS_FREE, 1, 1, 0, 1, 2, 0},
+        {"release", CleanupFailure::RELEASE, 1, 1, 1, 1, 1, 2},
+    };
+
+    for (const auto& test_case : cases) {
+        SCOPED_TRACE(test_case.name);
+        FakeFabricDriver driver;
+        {
+            NvlinkTransport transport;
+            NvlinkTransportTestPeer::configureFabric(
+                transport, driver.api(), {}, {},
+                [](uint64_t) { return fakeFabricSegment(); });
+            driver.failure = FakeFabricDriver::Failure::ACCESS;
+            switch (test_case.failure) {
+                case CleanupFailure::UNMAP:
+                    driver.unmap_failures_remaining = 2;
+                    break;
+                case CleanupFailure::ADDRESS_FREE:
+                    driver.address_free_failures_remaining = 2;
+                    break;
+                case CleanupFailure::RELEASE:
+                    driver.imported_release_failures_remaining = 2;
+                    break;
+            }
+
+            uint64_t address = FakeFabricDriver::kPublishedBase + 128;
+            EXPECT_NE(
+                NvlinkTransportTestPeer::relocate(transport, address, 256, 7),
+                0);
+            EXPECT_EQ(NvlinkTransportTestPeer::mappingCount(transport), 0);
+            EXPECT_EQ(NvlinkTransportTestPeer::quarantinedFabricMappingCount(
+                          transport),
+                      1);
+            EXPECT_EQ(driver.import_calls, 1);
+            EXPECT_EQ(driver.unmap_calls,
+                      test_case.expected_unmap_calls_after_first);
+            EXPECT_EQ(driver.address_free_calls,
+                      test_case.expected_address_free_calls_after_first);
+            EXPECT_EQ(driver.imported_release_calls,
+                      test_case.expected_release_calls_after_first);
+
+            // A persistent earlier cleanup failure must stop at that stage and
+            // block a second import rather than accumulating more CUDA state.
+            address = FakeFabricDriver::kPublishedBase + 128;
+            EXPECT_NE(
+                NvlinkTransportTestPeer::relocate(transport, address, 256, 7),
+                0);
+            EXPECT_EQ(driver.import_calls, 1);
+            EXPECT_EQ(NvlinkTransportTestPeer::quarantinedFabricMappingCount(
+                          transport),
+                      1);
+            EXPECT_EQ(driver.unmap_calls,
+                      test_case.expected_unmap_calls_after_retry);
+            EXPECT_EQ(driver.address_free_calls,
+                      test_case.expected_address_free_calls_after_retry);
+            EXPECT_EQ(driver.imported_release_calls,
+                      test_case.expected_release_calls_after_retry);
+
+            driver.failure = FakeFabricDriver::Failure::NONE;
+            driver.unmap_failures_remaining = 0;
+            driver.address_free_failures_remaining = 0;
+            driver.imported_release_failures_remaining = 0;
+            address = FakeFabricDriver::kPublishedBase + 128;
+            ASSERT_EQ(
+                NvlinkTransportTestPeer::relocate(transport, address, 256, 7),
+                0);
+            EXPECT_EQ(address, FakeFabricDriver::kImportedBase + 128);
+            EXPECT_EQ(driver.import_calls, 2);
+            EXPECT_EQ(NvlinkTransportTestPeer::quarantinedFabricMappingCount(
+                          transport),
+                      0);
+            EXPECT_EQ(driver.live_handles, 0);
+            EXPECT_EQ(driver.reserved_ranges, 1);
+            EXPECT_EQ(driver.mapped_ranges, 1);
+        }
+        driver.expectNoResources();
+    }
+}
+
+TEST(NvlinkTransportUnitTest,
+     CachedFabricMappingTeardownRetriesWithoutFreeingMappedAddress) {
+    FakeFabricDriver driver;
+    {
+        NvlinkTransport transport;
+        NvlinkTransportTestPeer::configureFabric(
+            transport, driver.api(), {}, {},
+            [](uint64_t) { return fakeFabricSegment(); });
+
+        uint64_t address = FakeFabricDriver::kPublishedBase + 128;
+        ASSERT_EQ(NvlinkTransportTestPeer::relocate(transport, address, 256, 7),
+                  0);
+        ASSERT_EQ(NvlinkTransportTestPeer::mappingCount(transport), 1);
+        driver.unmap_failures_remaining = 1;
+    }
+
+    EXPECT_EQ(driver.unmap_calls, 2);
+    EXPECT_EQ(driver.address_free_calls, 1);
+    driver.expectNoResources();
+}
+
+TEST(NvlinkTransportUnitTest,
      RegistrationMetadataFailureRollsBackDescriptorAndHandle) {
     FakeFabricDriver driver;
     int add_calls = 0;
@@ -520,6 +700,221 @@ TEST(NvlinkTransportUnitTest,
 }
 
 TEST(NvlinkTransportUnitTest,
+     RegistrationMetadataExceptionRetainsSingleHandleOwnerUntilUnregister) {
+    FakeFabricDriver driver;
+    bool descriptor_present = false;
+    bool throw_unregistration = true;
+    int remove_calls = 0;
+    {
+        NvlinkTransport transport;
+        NvlinkTransportTestPeer::configureFabric(
+            transport, driver.api(),
+            [&](const TransferMetadata::BufferDesc&, bool) -> int {
+                descriptor_present = true;
+                throw std::runtime_error("injected metadata publication");
+            },
+            [&](void*, bool) {
+                ++remove_calls;
+                if (throw_unregistration) {
+                    throw std::runtime_error(
+                        "injected metadata unregistration");
+                }
+                descriptor_present = false;
+                return 0;
+            });
+
+        void* address =
+            reinterpret_cast<void*>(FakeFabricDriver::kPublishedBase);
+        EXPECT_EQ(NvlinkTransportTestPeer::registerRemote(
+                      transport, address, FakeFabricDriver::kMappedLength),
+                  ERR_MEMORY);
+        EXPECT_EQ(remove_calls, 0)
+            << "unknown remote publication state must not release eagerly";
+        EXPECT_TRUE(descriptor_present);
+        EXPECT_EQ(NvlinkTransportTestPeer::registrationCount(transport), 1);
+        EXPECT_EQ(driver.release_calls, 0)
+            << "the retained record, not the guard, owns the live handle";
+        EXPECT_EQ(driver.live_handles, 1);
+
+        EXPECT_EQ(NvlinkTransportTestPeer::unregister(transport, address),
+                  ERR_MEMORY);
+        EXPECT_TRUE(descriptor_present);
+        EXPECT_EQ(NvlinkTransportTestPeer::registrationCount(transport), 1);
+        EXPECT_EQ(driver.release_calls, 0)
+            << "a throwing deletion must preserve the retained handle";
+
+        throw_unregistration = false;
+        ASSERT_EQ(NvlinkTransportTestPeer::unregister(transport, address), 0);
+        EXPECT_EQ(remove_calls, 2);
+        EXPECT_FALSE(descriptor_present);
+        EXPECT_EQ(NvlinkTransportTestPeer::registrationCount(transport), 0);
+        EXPECT_EQ(driver.release_calls, 1);
+        driver.expectNoResources();
+    }
+    EXPECT_EQ(driver.release_calls, 1);
+    driver.expectNoResources();
+}
+
+TEST(NvlinkTransportUnitTest,
+     RegistrationErrorCleanupQuarantinesFailedHandleReleaseAndRetries) {
+    struct FailureCase {
+        const char* name;
+        FakeFabricDriver::Failure driver_failure;
+        bool metadata_failure;
+        int expected_error;
+    };
+    const std::vector<FailureCase> cases = {
+        {"allocation_properties",
+         FakeFabricDriver::Failure::ALLOCATION_PROPERTIES, false, ERR_MEMORY},
+        {"address_range", FakeFabricDriver::Failure::ADDRESS_RANGE, false,
+         ERR_MEMORY},
+        {"export", FakeFabricDriver::Failure::EXPORT, false, ERR_MEMORY},
+        {"metadata", FakeFabricDriver::Failure::NONE, true, ERR_METADATA},
+    };
+
+    for (const auto& test_case : cases) {
+        SCOPED_TRACE(test_case.name);
+        FakeFabricDriver driver;
+        driver.failure = test_case.driver_failure;
+        driver.retained_release_failures_remaining = 1;
+        bool metadata_failure = test_case.metadata_failure;
+        bool descriptor_present = false;
+
+        NvlinkTransport transport;
+        NvlinkTransportTestPeer::configureFabric(
+            transport, driver.api(),
+            [&](const TransferMetadata::BufferDesc&, bool) {
+                descriptor_present = true;
+                return metadata_failure ? ERR_METADATA : 0;
+            },
+            [&](void*, bool) {
+                descriptor_present = false;
+                return 0;
+            });
+
+        void* address =
+            reinterpret_cast<void*>(FakeFabricDriver::kPublishedBase);
+        EXPECT_EQ(NvlinkTransportTestPeer::registerRemote(
+                      transport, address, FakeFabricDriver::kMappedLength),
+                  test_case.expected_error);
+        EXPECT_EQ(NvlinkTransportTestPeer::registrationCount(transport), 0);
+        EXPECT_EQ(
+            NvlinkTransportTestPeer::quarantinedRetainedHandleCount(transport),
+            1);
+        EXPECT_FALSE(descriptor_present);
+        EXPECT_EQ(driver.live_handles, 1)
+            << "failed cuMemRelease must retain handle ownership";
+
+        driver.failure = FakeFabricDriver::Failure::NONE;
+        metadata_failure = false;
+        ASSERT_EQ(NvlinkTransportTestPeer::registerRemote(
+                      transport, address, FakeFabricDriver::kMappedLength),
+                  0);
+        EXPECT_EQ(
+            NvlinkTransportTestPeer::quarantinedRetainedHandleCount(transport),
+            0);
+        EXPECT_TRUE(descriptor_present);
+        EXPECT_EQ(driver.live_handles, 1);
+
+        ASSERT_EQ(NvlinkTransportTestPeer::unregister(transport, address), 0);
+        EXPECT_FALSE(descriptor_present);
+        EXPECT_EQ(driver.release_calls, 3);
+        driver.expectNoResources();
+    }
+}
+
+TEST(NvlinkTransportUnitTest,
+     RegistrationMetadataRollbackFailureRetainsStateForCallerRetry) {
+    FakeFabricDriver driver;
+    bool descriptor_present = false;
+    int remove_calls = 0;
+
+    NvlinkTransport transport;
+    NvlinkTransportTestPeer::configureFabric(
+        transport, driver.api(),
+        [&](const TransferMetadata::BufferDesc&, bool) {
+            descriptor_present = true;
+            return ERR_METADATA;
+        },
+        [&](void*, bool) {
+            ++remove_calls;
+            if (remove_calls == 1) return ERR_METADATA;
+            descriptor_present = false;
+            return 0;
+        });
+
+    void* address = reinterpret_cast<void*>(FakeFabricDriver::kPublishedBase);
+    EXPECT_EQ(NvlinkTransportTestPeer::registerRemote(
+                  transport, address, FakeFabricDriver::kMappedLength),
+              ERR_METADATA);
+    EXPECT_EQ(NvlinkTransportTestPeer::registrationCount(transport), 1);
+    EXPECT_EQ(
+        NvlinkTransportTestPeer::quarantinedRetainedHandleCount(transport), 0);
+    EXPECT_TRUE(descriptor_present);
+    EXPECT_EQ(driver.live_handles, 1);
+    EXPECT_EQ(driver.release_calls, 0);
+
+    ASSERT_EQ(NvlinkTransportTestPeer::unregister(transport, address), 0);
+    EXPECT_EQ(remove_calls, 2);
+    EXPECT_EQ(NvlinkTransportTestPeer::registrationCount(transport), 0);
+    EXPECT_FALSE(descriptor_present);
+    EXPECT_EQ(driver.release_calls, 1);
+    driver.expectNoResources();
+}
+
+TEST(NvlinkTransportUnitTest,
+     IpcMetadataRollbackFailureRetainsStateForCallerRetry) {
+    bool descriptor_present = false;
+    int remove_calls = 0;
+    void* address = reinterpret_cast<void*>(0xabc000);
+
+    NvlinkTransport transport;
+    EXPECT_EQ(NvlinkTransportTestPeer::publishIpcDescriptorForTesting(
+                  transport, address,
+                  [&](const TransferMetadata::BufferDesc&, bool) {
+                      descriptor_present = true;
+                      return ERR_METADATA;
+                  },
+                  [&](void*, bool) {
+                      ++remove_calls;
+                      if (remove_calls == 1) return ERR_METADATA;
+                      descriptor_present = false;
+                      return 0;
+                  }),
+              ERR_METADATA);
+    EXPECT_EQ(NvlinkTransportTestPeer::registrationCount(transport), 1);
+    EXPECT_TRUE(descriptor_present);
+
+    ASSERT_EQ(NvlinkTransportTestPeer::unregister(transport, address), 0);
+    EXPECT_EQ(remove_calls, 2);
+    EXPECT_EQ(NvlinkTransportTestPeer::registrationCount(transport), 0);
+    EXPECT_FALSE(descriptor_present);
+}
+
+TEST(NvlinkTransportUnitTest,
+     DestructorPersistentReleaseFailureKeepsHandleLiveForProcessLifetime) {
+    FakeFabricDriver driver;
+    driver.retained_release_failures_remaining = 2;
+    {
+        NvlinkTransport transport;
+        NvlinkTransportTestPeer::configureFabric(
+            transport, driver.api(),
+            [](const TransferMetadata::BufferDesc&, bool) { return 0; },
+            [](void*, bool) { return 0; });
+        void* address =
+            reinterpret_cast<void*>(FakeFabricDriver::kPublishedBase);
+        ASSERT_EQ(NvlinkTransportTestPeer::registerRemote(
+                      transport, address, FakeFabricDriver::kMappedLength),
+                  0);
+        EXPECT_EQ(driver.live_handles, 1);
+    }
+    EXPECT_EQ(driver.release_calls, 2);
+    EXPECT_EQ(driver.live_handles, 1)
+        << "persistent teardown failure must leave the CUDA handle live and "
+           "owned by the process-lifetime quarantine";
+}
+
+TEST(NvlinkTransportUnitTest,
      HostNumaRegistrationUsesExactRangeWhenLegacyQueryFails) {
     FakeFabricDriver driver;
     driver.failure = FakeFabricDriver::Failure::ADDRESS_RANGE;
@@ -574,8 +969,8 @@ TEST(NvlinkTransportUnitTest,
         });
 
     constexpr size_t kInteriorOffset = 4096;
-    void* interior = reinterpret_cast<void*>(
-        FakeFabricDriver::kPublishedBase + kInteriorOffset);
+    void* interior = reinterpret_cast<void*>(FakeFabricDriver::kPublishedBase +
+                                             kInteriorOffset);
     EXPECT_EQ(NvlinkTransportTestPeer::registerRemote(
                   transport, interior,
                   FakeFabricDriver::kMappedLength - kInteriorOffset),

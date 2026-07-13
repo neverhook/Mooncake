@@ -159,6 +159,8 @@ class NvlinkVmmAllocation {
     static bool RegisterOwnedRange(void* base, size_t length);
     static bool UnregisterOwnedRange(void* base, size_t length);
     static bool IsExactOwnedRange(void* base, size_t length);
+    static bool RetryCleanupPendingOwners();
+    static size_t CleanupPendingOwnerCount();
     void reset() noexcept;
 #endif
 
@@ -274,8 +276,33 @@ class NvlinkTransport : public Transport {
 
     std::mutex register_mutex_;
     std::unordered_map<void*, LocalRegistration> local_registrations_;
+    int publishLocalRegistration(void* registration_addr,
+                                 const BufferDesc& descriptor,
+                                 bool update_metadata);
 #if defined(USE_MNNVL) && defined(USE_CUDA)
     NvlinkVmmAllocation::DriverApi fabric_driver_api_;
+    struct FabricMappingCleanup {
+        CUmemGenericAllocationHandle handle = 0;
+        CUdeviceptr address = 0;
+        size_t length = 0;
+        bool handle_owned = false;
+        bool address_reserved = false;
+        bool mapped = false;
+    };
+    class FabricMappingAttempt;
+    bool CleanupFabricMapping(FabricMappingCleanup& cleanup,
+                              const char* failure_stage) noexcept;
+    bool RetryQuarantinedFabricMappings() noexcept;
+    void ReleaseOrQuarantineFabricMapping(FabricMappingCleanup cleanup,
+                                          const char* failure_stage) noexcept;
+    static void PreserveProcessLifetimeFabricCleanup(
+        FabricMappingCleanup cleanup) noexcept;
+    std::vector<FabricMappingCleanup> quarantined_fabric_mappings_;
+    class RetainedHandleGuard;
+    bool RetryQuarantinedRetainedHandles();
+    void ReleaseOrQuarantineRetainedHandle(CUmemGenericAllocationHandle handle,
+                                           const char* failure_stage) noexcept;
+    std::vector<uint64_t> quarantined_retained_handles_;
     static bool TrackPinnedVmmAllocation(
         std::unique_ptr<NvlinkVmmAllocation> owner);
     static bool ReleasePinnedVmmAllocation(void* ptr);

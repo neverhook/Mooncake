@@ -364,6 +364,8 @@ class ProductionNvlinkHostNumaAllocation final
     std::unique_ptr<NvlinkVmmAllocation> owner_;
 };
 
+}  // namespace
+
 class ProductionNvlinkHostNumaOperations final
     : public NvlinkHostNumaOperations {
    public:
@@ -373,8 +375,7 @@ class ProductionNvlinkHostNumaOperations final
     tl::expected<std::unique_ptr<NvlinkHostNumaAllocation>, ErrorCode> Allocate(
         const NvlinkHostNumaAllocationRequest& request) override {
         NvlinkVmmAllocation::Options options;
-        options.location_type =
-            NvlinkVmmAllocation::LocationType::HOST_NUMA;
+        options.location_type = NvlinkVmmAllocation::LocationType::HOST_NUMA;
         options.location_id = request.numa_node;
         options.requested_length = request.requested_length;
         options.fabric_exportable = request.fabric_exportable;
@@ -405,14 +406,15 @@ class ProductionNvlinkHostNumaOperations final
         NvlinkHostNumaAllocation* local_allocation,
         size_t configured_local_length) override {
         try {
+            std::shared_ptr<ClientBufferAllocator> allocator;
             if (local_allocation != nullptr) {
-                owner_.client_buffer_allocator_ = ClientBufferAllocator::create(
+                allocator = ClientBufferAllocator::create(
                     local_allocation->base(), configured_local_length,
                     "nvlink");
             } else {
-                owner_.client_buffer_allocator_ =
-                    ClientBufferAllocator::create(size_t{0}, "nvlink");
+                allocator = ClientBufferAllocator::create(size_t{0}, "nvlink");
             }
+            owner_.PublishClientBufferAllocator(std::move(allocator));
         } catch (const std::exception& error) {
             LOG(ERROR) << "NVLink HOST_NUMA allocator view creation failed: "
                        << error.what();
@@ -421,13 +423,8 @@ class ProductionNvlinkHostNumaOperations final
         return {};
     }
 
-    void ReleaseAllocatorView() override {
-        {
-            std::unique_lock<std::shared_mutex> lock(
-                owner_.registered_buffer_mutex_);
-            owner_.local_buffer_region_.reset();
-        }
-        owner_.client_buffer_allocator_.reset();
+    tl::expected<void, ErrorCode> ReleaseAllocatorView() override {
+        return owner_.ReleaseNvlinkHostNumaAllocatorView();
     }
 
     tl::expected<void, ErrorCode> RegisterLocal(
@@ -439,7 +436,8 @@ class ProductionNvlinkHostNumaOperations final
             base, length, kWildcardLocation, remote_accessible, false);
         if (!registered) return registered;
 
-        std::unique_lock<std::shared_mutex> lock(owner_.registered_buffer_mutex_);
+        std::unique_lock<std::shared_mutex> lock(
+            owner_.registered_buffer_mutex_);
         owner_.local_buffer_region_ = RealClient::WritableBufferRegion{
             .base = base,
             .size = length,
@@ -453,8 +451,8 @@ class ProductionNvlinkHostNumaOperations final
         if (!owner_.client_) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
-        return owner_.client_->MountSegmentAndGetId(
-            base, length, "nvlink", kWildcardLocation);
+        return owner_.client_->MountSegmentAndGetId(base, length, "nvlink",
+                                                    kWildcardLocation);
     }
 
     tl::expected<void, ErrorCode> UnmountGlobal(
@@ -471,7 +469,7 @@ class ProductionNvlinkHostNumaOperations final
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
         return owner_.client_->UnregisterLocalMemoryIfPresent(base,
-                                                               update_metadata);
+                                                              update_metadata);
     }
 
     tl::expected<void, ErrorCode> Destroy(
@@ -508,6 +506,8 @@ class ProductionNvlinkHostNumaOperations final
    private:
     RealClient& owner_;
 };
+
+namespace {
 
 NvlinkHostNumaStage ToMetricStage(NvlinkHostNumaOrchestrationStage stage) {
     switch (stage) {
@@ -1018,7 +1018,57 @@ bool RealClient::CleanupNvlinkHostNuma(bool rollback) {
     return success;
 }
 
-tl::expected<void, ErrorCode> RealClient::setup_internal(
+void RealClient::PublishClientBufferAllocator(
+    std::shared_ptr<ClientBufferAllocator> allocator) {
+    std::atomic_store_explicit(&client_buffer_allocator_, std::move(allocator),
+                               std::memory_order_release);
+}
+
+std::optional<BufferHandle> RealClient::AllocateClientBuffer(size_t size) {
+    auto allocator = SnapshotClientBufferAllocator();
+    if (!allocator) return std::nullopt;
+    // The snapshot remains alive through allocate(), and a successful handle
+    // takes its own shared_ptr lease before the local snapshot is released.
+    return allocator->allocate(size);
+}
+
+tl::expected<void, ErrorCode> RealClient::ReleaseNvlinkHostNumaAllocatorView(
+    const std::function<void()>& after_exchange_for_test) {
+    auto owner = std::atomic_exchange_explicit(
+        &client_buffer_allocator_, std::shared_ptr<ClientBufferAllocator>{},
+        std::memory_order_acq_rel);
+
+    if (after_exchange_for_test) {
+        try {
+            after_exchange_for_test();
+        } catch (...) {
+            std::atomic_store_explicit(&client_buffer_allocator_, owner,
+                                       std::memory_order_release);
+            throw;
+        }
+    }
+
+    // exchange() is the release linearization point. A reader either acquired
+    // a lease before it (and is counted here), or observes null afterwards.
+    if (owner && owner.use_count() > 1) {
+        const long outstanding_holders = owner.use_count() - 1;
+        std::atomic_store_explicit(&client_buffer_allocator_, owner,
+                                   std::memory_order_release);
+        LOG(ERROR) << "NVLink HOST_NUMA allocator view has "
+                   << outstanding_holders
+                   << " outstanding holder(s); cleanup must be retried after "
+                      "in-flight allocator users and BufferHandles release it";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    {
+        std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+        local_buffer_region_.reset();
+    }
+    return {};
+}
+
+tl::expected<void, ErrorCode> RealClient::setup_internal_with_nvlink_host_numa(
     const std::string& local_hostname, const std::string& metadata_server,
     size_t global_segment_size, size_t local_buffer_size,
     const std::string& protocol, const std::string& rdma_devices,
@@ -1175,14 +1225,15 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 #ifdef USE_NOF
         use_spdk_dma_for_client_buffer = true;
 #endif
-        client_buffer_allocator_ = ClientBufferAllocator::create(
+        auto client_buffer_allocator = ClientBufferAllocator::create(
             local_buffer_size, this->protocol, should_use_hugepage,
             use_spdk_dma_for_client_buffer);
+        PublishClientBufferAllocator(client_buffer_allocator);
         if (local_buffer_size > 0 && protocol != "cxl") {
             LOG(INFO) << "Registering local memory: " << local_buffer_size
                       << " bytes";
             auto result = client_->RegisterLocalMemory(
-                client_buffer_allocator_->getBase(), local_buffer_size,
+                client_buffer_allocator->getBase(), local_buffer_size,
                 kWildcardLocation, false, true);
             if (!result.has_value()) {
                 LOG(ERROR) << "Failed to register local memory: "
@@ -1193,7 +1244,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 std::unique_lock<std::shared_mutex> lock(
                     registered_buffer_mutex_);
                 local_buffer_region_ = WritableBufferRegion{
-                    .base = client_buffer_allocator_->getBase(),
+                    .base = client_buffer_allocator->getBase(),
                     .size = local_buffer_size,
                     .offset = 0,
                 };
@@ -1390,6 +1441,22 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     return {};
 }
 
+tl::expected<void, ErrorCode> RealClient::setup_internal(
+    const std::string& local_hostname, const std::string& metadata_server,
+    size_t global_segment_size, size_t local_buffer_size,
+    const std::string& protocol, const std::string& rdma_devices,
+    const std::string& master_server_addr,
+    const std::shared_ptr<TransferEngine>& transfer_engine,
+    const std::string& ipc_socket_path, int local_rpc_port,
+    bool enable_ssd_offload, bool start_offload_rpc_server,
+    const std::string& ssd_offload_path, const std::string& tenant_id) {
+    return setup_internal_with_nvlink_host_numa(
+        local_hostname, metadata_server, global_segment_size, local_buffer_size,
+        protocol, rdma_devices, master_server_addr, transfer_engine,
+        ipc_socket_path, local_rpc_port, enable_ssd_offload,
+        start_offload_rpc_server, ssd_offload_path, tenant_id, nullptr);
+}
+
 int RealClient::setup_real(
     const std::string& local_hostname, const std::string& metadata_server,
     size_t global_segment_size, size_t local_buffer_size,
@@ -1525,11 +1592,11 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
               << " node_selection="
               << (nvlink_host_numa_options->auto_nodes ? "auto" : "explicit");
 
-    return setup_internal(local_hostname, metadata_server, global_segment_size,
-                          local_buffer_size, protocol, rdma_devices,
-                          master_server_addr, nullptr, ipc_socket_path, 50052,
-                          enable_ssd_offload, true, ssd_offload_path, tenant_id,
-                          &*nvlink_host_numa_options);
+    return setup_internal_with_nvlink_host_numa(
+        local_hostname, metadata_server, global_segment_size, local_buffer_size,
+        protocol, rdma_devices, master_server_addr, nullptr, ipc_socket_path,
+        50052, enable_ssd_offload, true, ssd_offload_path, tenant_id,
+        &*nvlink_host_numa_options);
 }
 
 tl::expected<void, ErrorCode> RealClient::initAll_internal(
@@ -1576,24 +1643,27 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
     }
-    if (client_buffer_allocator_ && client_buffer_allocator_->size() > 0 &&
-        protocol != "cxl") {
-        auto unregister_result = client_->unregisterLocalMemory(
-            client_buffer_allocator_->getBase(), true);
-        if (!unregister_result) {
-            LOG(WARNING)
-                << "Failed to unregister client local buffer on tear down: "
-                << toString(unregister_result.error());
+    {
+        auto client_buffer_allocator = SnapshotClientBufferAllocator();
+        if (client_buffer_allocator && client_buffer_allocator->size() > 0 &&
+            protocol != "cxl") {
+            auto unregister_result = client_->unregisterLocalMemory(
+                client_buffer_allocator->getBase(), true);
+            if (!unregister_result) {
+                LOG(WARNING)
+                    << "Failed to unregister client local buffer on tear down: "
+                    << toString(unregister_result.error());
+            }
+            std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+            local_buffer_region_.reset();
         }
-        std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
-        local_buffer_region_.reset();
     }
 
     // Reset all resources
     client_.reset();
     ReleaseAllMountedSegmentRecords();
     ReleaseAllAllocatedSegmentRecords();
-    client_buffer_allocator_.reset();
+    PublishClientBufferAllocator(nullptr);
     port_binder_.reset();
     hugepage_segment_ptrs_.clear();
     ub_segment_ptrs_.clear();
@@ -2208,7 +2278,8 @@ int RealClient::put(const std::string& key, std::span<const char> value,
                     const ReplicateConfig& config) {
     auto result = execute_timed_operation<tl::expected<void, ErrorCode>>(
         [&]() {
-            return put_internal(key, value, config, client_buffer_allocator_);
+            return put_internal(key, value, config,
+                                SnapshotClientBufferAllocator());
         },
         [](const auto& ret) { return ret.has_value(); },
         [&](uint64_t latency_us, const auto&) {
@@ -2313,7 +2384,7 @@ int RealClient::put_batch(const std::vector<std::string>& keys,
     auto result = execute_timed_operation<tl::expected<void, ErrorCode>>(
         [&]() {
             return put_batch_internal(keys, values, config,
-                                      client_buffer_allocator_);
+                                      SnapshotClientBufferAllocator());
         },
         [](const auto& ret) { return ret.has_value(); },
         [&](uint64_t latency_us, const auto&) {
@@ -2409,7 +2480,7 @@ int RealClient::put_parts(const std::string& key,
     auto result = execute_timed_operation<tl::expected<void, ErrorCode>>(
         [&]() {
             return put_parts_internal(key, values, config,
-                                      client_buffer_allocator_);
+                                      SnapshotClientBufferAllocator());
         },
         [](const auto& ret) { return ret.has_value(); },
         [&](uint64_t latency_us, const auto&) {
@@ -3124,7 +3195,9 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
 // Implementation of get_buffer method
 std::shared_ptr<BufferHandle> RealClient::get_buffer(const std::string& key) {
     return execute_timed_operation<std::shared_ptr<BufferHandle>>(
-        [&]() { return get_buffer_internal(key, client_buffer_allocator_); },
+        [&]() {
+            return get_buffer_internal(key, SnapshotClientBufferAllocator());
+        },
         [](const auto& buffer) { return buffer != nullptr; },
         [&](uint64_t latency_us, const auto& buffer) {
             client_->ObserveTransferOperation(TransferOperationKind::kRead,
@@ -3345,6 +3418,13 @@ RealClient::batch_get_buffer_internal(
     std::vector<DiskKeyOp> disk_ops;
     valid_ops.reserve(keys.size());
 
+    auto allocator = client_buffer_allocator;
+    if (!allocator) allocator = SnapshotClientBufferAllocator();
+    if (!allocator) {
+        LOG(ERROR) << "Client buffer allocator is not provided";
+        return final_results;
+    }
+
     auto local_endpoints = client_->GetLocalEndpoints();
     for (size_t i = 0; i < keys.size(); ++i) {
         const auto& key = keys[i];
@@ -3378,8 +3458,6 @@ RealClient::batch_get_buffer_internal(
             continue;
         }
 
-        auto& allocator = client_buffer_allocator ? client_buffer_allocator
-                                                  : client_buffer_allocator_;
         auto alloc_result = allocator->allocate(total_size);
         if (!alloc_result) {
             LOG(ERROR) << "Failed to allocate buffer for key: " << key;
@@ -3657,7 +3735,7 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
         if (replica.is_disk_replica()) {
             // DISK full read: local file I/O (vector_read) cannot write to
             // GPU memory. Use temp CPU buffer, then scatter to dst.
-            auto alloc_result = client_buffer_allocator_->allocate(total_size);
+            auto alloc_result = AllocateClientBuffer(total_size);
             if (!alloc_result) {
                 LOG(ERROR) << "Failed to allocate temp buffer for DISK full "
                            << "read, key: " << key << ", size: " << total_size;
@@ -3707,7 +3785,7 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
     auto partial_disk_read =
         [&](auto&& read_op,
             size_t buf_size) -> tl::expected<int64_t, ErrorCode> {
-        auto alloc_result = client_buffer_allocator_->allocate(buf_size);
+        auto alloc_result = AllocateClientBuffer(buf_size);
         if (!alloc_result) {
             LOG(ERROR) << "Failed to allocate temp buffer for ranged disk "
                        << "read, key: " << key << ", size: " << buf_size;
@@ -4225,7 +4303,7 @@ int RealClient::upsert(const std::string& key, std::span<const char> value,
     auto result = execute_timed_operation<tl::expected<void, ErrorCode>>(
         [&]() {
             return upsert_internal(key, value, config,
-                                   client_buffer_allocator_);
+                                   SnapshotClientBufferAllocator());
         },
         [](const auto& ret) { return ret.has_value(); },
         [&](uint64_t latency_us, const auto&) {
@@ -4467,7 +4545,7 @@ int RealClient::upsert_parts(const std::string& key,
     auto result = execute_timed_operation<tl::expected<void, ErrorCode>>(
         [&]() {
             return upsert_parts_internal(key, values, config,
-                                         client_buffer_allocator_);
+                                         SnapshotClientBufferAllocator());
         },
         [](const auto& ret) { return ret.has_value(); },
         [&](uint64_t latency_us, const auto&) {
@@ -4586,7 +4664,7 @@ int RealClient::upsert_batch(const std::vector<std::string>& keys,
     auto result = execute_timed_operation<tl::expected<void, ErrorCode>>(
         [&]() {
             return upsert_batch_internal(keys, values, config,
-                                         client_buffer_allocator_);
+                                         SnapshotClientBufferAllocator());
         },
         [](const auto& ret) { return ret.has_value(); },
         [&](uint64_t latency_us, const auto&) {
@@ -5043,8 +5121,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string>& keys,
                     tl::unexpected(ErrorCode::INVALID_REPLICA);
                 continue;
             }
-            auto alloc_result =
-                client_buffer_allocator_->allocate(op.total_size);
+            auto alloc_result = AllocateClientBuffer(op.total_size);
             if (!alloc_result) {
                 LOG(ERROR) << "Failed to allocate temp buffer for DISK "
                            << "read, key: " << op.key
@@ -5587,8 +5664,7 @@ RealClient::batch_get_into_multi_buffers_internal(
 
             for (auto& [key, op] : valid_local_disk_ops) {
                 if (op.is_local_disk) continue;
-                auto alloc_result =
-                    client_buffer_allocator_->allocate(op.total_size);
+                auto alloc_result = AllocateClientBuffer(op.total_size);
                 if (!alloc_result) {
                     LOG(ERROR)
                         << "Failed to allocate temp buffer for DISK "

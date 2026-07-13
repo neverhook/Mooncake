@@ -19,8 +19,13 @@
 #include <gtest/gtest.h>
 #include <sys/time.h>
 
+#include <chrono>
+#include <condition_variable>
 #include <cstdlib>
+#include <future>
+#include <mutex>
 
+#include "transfer_metadata_plugin.h"
 #include "transport/transport.h"
 
 using namespace mooncake;
@@ -40,6 +45,107 @@ class TransferMetadataTestPeer {
         const std::string& segment_name) {
         return metadata.decodeSegmentDesc(encoded, segment_name);
     }
+
+    static void SetStoragePlugin(
+        TransferMetadata& metadata,
+        std::shared_ptr<MetadataStoragePlugin> storage_plugin) {
+        metadata.p2p_handshake_mode_ = false;
+        metadata.storage_plugin_ = std::move(storage_plugin);
+    }
+};
+
+class FailOnceMetadataStoragePlugin : public MetadataStoragePlugin {
+   public:
+    bool get(const std::string&, Json::Value& value) override {
+        value = last_successful_value;
+        return has_successful_value;
+    }
+
+    bool set(const std::string&, const Json::Value& value) override {
+        ++set_calls;
+        last_attempted_value = value;
+        if (fail_next_set) {
+            fail_next_set = false;
+            return false;
+        }
+        last_successful_value = value;
+        has_successful_value = true;
+        return true;
+    }
+
+    bool remove(const std::string&) override { return true; }
+
+    int set_calls = 0;
+    bool fail_next_set = false;
+    bool has_successful_value = false;
+    Json::Value last_attempted_value;
+    Json::Value last_successful_value;
+};
+
+class BlockingFailOnceMetadataStoragePlugin : public MetadataStoragePlugin {
+   public:
+    bool get(const std::string&, Json::Value& value) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        value = last_successful_value;
+        return has_successful_value;
+    }
+
+    bool set(const std::string&, const Json::Value& value) override {
+        std::unique_lock<std::mutex> lock(mutex_);
+        ++set_calls;
+        last_attempted_value = value;
+        if (block_and_fail_next_set_) {
+            block_and_fail_next_set_ = false;
+            blocked_ = true;
+            condition_.notify_all();
+            condition_.wait(lock, [this] { return release_blocked_set_; });
+            release_blocked_set_ = false;
+            return false;
+        }
+        last_successful_value = value;
+        has_successful_value = true;
+        return true;
+    }
+
+    bool remove(const std::string&) override { return true; }
+
+    void BlockAndFailNextSet() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        block_and_fail_next_set_ = true;
+        blocked_ = false;
+    }
+
+    void WaitUntilSetIsBlocked() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        condition_.wait(lock, [this] { return blocked_; });
+    }
+
+    void ReleaseBlockedSet() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        release_blocked_set_ = true;
+        condition_.notify_all();
+    }
+
+    int SetCalls() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return set_calls;
+    }
+
+    Json::Value LastSuccessfulValue() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return last_successful_value;
+    }
+
+   private:
+    mutable std::mutex mutex_;
+    std::condition_variable condition_;
+    int set_calls = 0;
+    bool block_and_fail_next_set_ = false;
+    bool blocked_ = false;
+    bool release_blocked_set_ = false;
+    bool has_successful_value = false;
+    Json::Value last_attempted_value;
+    Json::Value last_successful_value;
 };
 
 template <typename T>
@@ -129,6 +235,125 @@ TEST(TransferMetadataSchemaTest, NvlinkDescriptorMatchesV1GoldenJson) {
     ASSERT_FALSE(reencoded["timestamp"].asString().empty());
     reencoded["timestamp"] = "<timestamp>";
     EXPECT_EQ(reencoded, expected);
+}
+
+TEST(TransferMetadataRemovalTest,
+     FailedRemoteUpdateRestoresLocalDescriptorForRetry) {
+    TransferMetadata metadata(P2PHANDSHAKE);
+    auto storage = std::make_shared<FailOnceMetadataStoragePlugin>();
+    TransferMetadataTestPeer::SetStoragePlugin(metadata, storage);
+
+    auto segment = std::make_shared<TransferMetadata::SegmentDesc>();
+    segment->name = "provider:12345";
+    segment->protocol = "nvlink";
+    TransferMetadata::BufferDesc buffer{};
+    buffer.name = segment->name;
+    buffer.addr = 0x100000000ULL;
+    buffer.length = 0x20000ULL;
+    buffer.shm_name = "fabric-handle-v1";
+    segment->buffers.push_back(buffer);
+    auto original_segment = segment;
+    ASSERT_EQ(metadata.addLocalSegment(LOCAL_SEGMENT_ID, segment->name,
+                                       std::move(segment)),
+              0);
+
+    ASSERT_EQ(metadata.updateLocalSegmentDesc(), 0);
+    ASSERT_TRUE(storage->has_successful_value);
+    ASSERT_EQ(storage->last_successful_value["buffers"].size(), 1U);
+
+    storage->fail_next_set = true;
+    EXPECT_EQ(metadata.removeLocalMemoryBuffer(
+                  reinterpret_cast<void*>(buffer.addr), true),
+              ERR_METADATA);
+    EXPECT_EQ(storage->set_calls, 2);
+    EXPECT_EQ(storage->last_attempted_value["buffers"].size(), 0U);
+    EXPECT_EQ(storage->last_successful_value["buffers"].size(), 1U);
+
+    auto local = metadata.getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_NE(local, nullptr);
+    EXPECT_EQ(local, original_segment)
+        << "failed deletion must restore the previous descriptor snapshot";
+    ASSERT_EQ(local->buffers.size(), 1U);
+    EXPECT_EQ(local->buffers[0].addr, buffer.addr)
+        << "failed deletion must remain retryable in the local descriptor";
+
+    EXPECT_EQ(metadata.removeLocalMemoryBuffer(
+                  reinterpret_cast<void*>(buffer.addr), true),
+              0);
+    EXPECT_EQ(storage->set_calls, 3);
+    EXPECT_EQ(storage->last_successful_value["buffers"].size(), 0U);
+    local = metadata.getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_NE(local, nullptr);
+    EXPECT_TRUE(local->buffers.empty());
+}
+
+TEST(TransferMetadataRemovalTest,
+     FailedRemoteUpdateSerializesConcurrentCowMutationAndRetry) {
+    using namespace std::chrono_literals;
+
+    TransferMetadata metadata(P2PHANDSHAKE);
+    auto storage = std::make_shared<BlockingFailOnceMetadataStoragePlugin>();
+    TransferMetadataTestPeer::SetStoragePlugin(metadata, storage);
+
+    auto segment = std::make_shared<TransferMetadata::SegmentDesc>();
+    segment->name = "provider:concurrent";
+    segment->protocol = "nvlink";
+    TransferMetadata::BufferDesc first{};
+    first.name = segment->name;
+    first.addr = 0x100000000ULL;
+    first.length = 0x20000ULL;
+    first.shm_name = "fabric-handle-first";
+    segment->buffers.push_back(first);
+    ASSERT_EQ(metadata.addLocalSegment(LOCAL_SEGMENT_ID, segment->name,
+                                       std::move(segment)),
+              0);
+    ASSERT_EQ(metadata.updateLocalSegmentDesc(), 0);
+
+    TransferMetadata::BufferDesc second{};
+    second.name = first.name;
+    second.addr = 0x200000000ULL;
+    second.length = 0x40000ULL;
+    second.shm_name = "fabric-handle-second";
+
+    storage->BlockAndFailNextSet();
+    auto remove = std::async(std::launch::async, [&] {
+        return metadata.removeLocalMemoryBuffer(
+            reinterpret_cast<void*>(first.addr), true);
+    });
+    storage->WaitUntilSetIsBlocked();
+
+    std::promise<void> add_started_promise;
+    auto add_started = add_started_promise.get_future();
+    auto add = std::async(std::launch::async, [&] {
+        add_started_promise.set_value();
+        return metadata.addLocalMemoryBuffer(second, false);
+    });
+    add_started.wait();
+    EXPECT_EQ(add.wait_for(50ms), std::future_status::timeout)
+        << "concurrent COW mutation must wait for removal publication/rollback";
+
+    storage->ReleaseBlockedSet();
+    EXPECT_EQ(remove.get(), ERR_METADATA);
+    EXPECT_EQ(add.get(), 0);
+
+    auto local = metadata.getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_NE(local, nullptr);
+    ASSERT_EQ(local->buffers.size(), 2U);
+    EXPECT_EQ(local->buffers[0].addr, first.addr);
+    EXPECT_EQ(local->buffers[1].addr, second.addr);
+
+    EXPECT_EQ(metadata.removeLocalMemoryBuffer(
+                  reinterpret_cast<void*>(first.addr), true),
+              0);
+    EXPECT_EQ(storage->SetCalls(), 3);
+    Json::Value published = storage->LastSuccessfulValue();
+    ASSERT_EQ(published["buffers"].size(), 1U);
+    EXPECT_EQ(published["buffers"][0]["addr"].asUInt64(), second.addr);
+
+    local = metadata.getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_NE(local, nullptr);
+    ASSERT_EQ(local->buffers.size(), 1U);
+    EXPECT_EQ(local->buffers[0].addr, second.addr);
 }
 
 TEST(TransferTaskSubmissionFailureTest, ZeroSliceFailureIsExplicitlyTerminal) {

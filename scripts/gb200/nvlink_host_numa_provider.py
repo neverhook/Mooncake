@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import importlib
 import json
 import math
 import os
@@ -17,10 +18,11 @@ from nvlink_host_numa_metrics import provider_capacity
 
 def import_store_module():
     try:
-        from mooncake import store as store_module  # type: ignore
-    except ImportError:
-        import store as store_module  # type: ignore
-    return store_module
+        return importlib.import_module("store")
+    except ModuleNotFoundError as exc:
+        if exc.name != "store":
+            raise
+    return importlib.import_module("mooncake.store")
 
 
 def parse_size(value: str) -> int:
@@ -293,6 +295,17 @@ def main() -> int:
     )
 
     store_module = import_store_module()
+    print(
+        json.dumps(
+            {
+                "event": "store_module",
+                "run_id": args.run_id,
+                "path": getattr(store_module, "__file__", store_module.__name__),
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
     provider = store_module.MooncakeDistributedStore()
     exit_code = 0
     active_error = False

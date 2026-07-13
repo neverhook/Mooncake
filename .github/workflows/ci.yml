@@ -419,7 +419,7 @@ jobs:
         sudo bash -x dependencies.sh -y
         mkdir build
         cd build
-        cmake -G Ninja .. -DUSE_HTTP=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=OFF -DWITH_STORE_RUST=OFF -DBUILD_UNIT_TESTS=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
+        cmake -G Ninja .. -DUSE_HTTP=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DUSE_EVENT_DRIVEN_COMPLETION=ON -DWITH_EP=OFF -DWITH_STORE_RUST=OFF -DBUILD_UNIT_TESTS=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
       shell: bash
 
     - name: Build project
@@ -475,6 +475,7 @@ jobs:
         expected_tests=(
           client_integration_test
           client_metrics_test
+          nvlink_event_driven_completion_test
           nvlink_host_numa_config_test
           nvlink_host_numa_orchestrator_test
           nvlink_host_numa_setup_test

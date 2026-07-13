@@ -232,7 +232,12 @@ bool CleanupNvlinkHostNumaOrchestration(
     // also used when only a local workspace or only global Provider chunks
     // exist.
     if (allocator_installed) {
-        operations.ReleaseAllocatorView();
+        auto released = operations.ReleaseAllocatorView();
+        if (!released) {
+            LOG(ERROR) << "NVLink HOST_NUMA allocator view release failed; "
+                          "retaining VMM ownership for cleanup retry";
+            return false;
+        }
         allocator_installed = false;
     }
 

@@ -5,6 +5,8 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 build_dir="${BUILD_DIR:-${repo_root}/build-nvlink-host-numa}"
 jobs="${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 8)}"
+run_hardware_tests="${RUN_HARDWARE_TESTS:-0}"
+skip_preflight="${SKIP_PREFLIGHT:-0}"
 extra_args=()
 if [[ -n "${CMAKE_EXTRA_ARGS:-}" ]]; then
   read -r -a extra_args <<<"${CMAKE_EXTRA_ARGS}"
@@ -20,22 +22,51 @@ if ! grep -Fq -- '--output-junit' <<<"$ctest_help"; then
   exit 1
 fi
 
-if [[ "${SKIP_PREFLIGHT:-0}" != "1" ]]; then
+case "$run_hardware_tests" in
+  0|1) ;;
+  *)
+    printf 'RUN_HARDWARE_TESTS must be 0 or 1, got: %s\n' "$run_hardware_tests" >&2
+    exit 2
+    ;;
+esac
+case "$skip_preflight" in
+  0|1) ;;
+  *)
+    printf 'SKIP_PREFLIGHT must be 0 or 1, got: %s\n' "$skip_preflight" >&2
+    exit 2
+    ;;
+esac
+
+# A unit-only invocation can reject obvious host prerequisites before spending
+# time on the build. Hardware validation is different: its strict probe is one
+# of the binaries produced below, so that preflight runs after the build.
+if [[ "$run_hardware_tests" == "0" && "$skip_preflight" != "1" ]]; then
   "${repo_root}/scripts/gb200/nvlink_host_numa_preflight.sh"
 fi
 
 cmake -S "$repo_root" -B "$build_dir" -G Ninja \
   -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}" \
+  "${extra_args[@]}" \
   -DBUILD_UNIT_TESTS=ON \
   -DBUILD_EXAMPLES=OFF \
   -DBUILD_BENCHMARK=OFF \
   -DWITH_STORE_RUST=OFF \
   -DWITH_EP=OFF \
   -DUSE_CUDA=ON \
-  -DUSE_MNNVL=ON \
-  "${extra_args[@]}"
+  -DUSE_MNNVL=ON
 
 cmake --build "$build_dir" --parallel "$jobs"
+
+# Hardware validation must execute an actual Fabric allocation/export probe.
+# Default to the just-built test while preserving an explicit operator override.
+if [[ "$run_hardware_tests" == "1" ]]; then
+  export MC_REQUIRE_MNNVL_FABRIC=1
+  export MC_REQUIRE_NVLINK_HOST_NUMA_RDMA=1
+  export MC_MNNVL_FABRIC_PROBE="${MC_MNNVL_FABRIC_PROBE:-${build_dir}/mooncake-transfer-engine/tests/nvlink_host_numa_fabric_test}"
+  if [[ "$skip_preflight" != "1" ]]; then
+    "${repo_root}/scripts/gb200/nvlink_host_numa_preflight.sh"
+  fi
+fi
 
 ctest_in_build() {
   (
@@ -59,6 +90,17 @@ assert_label_exact() {
       <(printf '%s\n' "$actual_names") >&2 || true
     return 1
   fi
+}
+
+cmake_cache_bool_is_true() {
+  local name="$1"
+  local cache_file="$2"
+  local value
+  value="$(sed -n "s/^${name}:[^=]*=//p" "$cache_file" | tail -n 1)"
+  case "${value^^}" in
+    ""|0|OFF|NO|FALSE|N|IGNORE|NOTFOUND|*-NOTFOUND) return 1 ;;
+    *) return 0 ;;
+  esac
 }
 
 validate_junit() {
@@ -90,7 +132,7 @@ for raw_path in sys.argv[2:]:
 PY
 }
 
-assert_label_exact nvlink_host_numa_unit \
+unit_tests=(
   client_integration_test \
   client_metrics_test \
   nvlink_host_numa_config_test \
@@ -102,15 +144,32 @@ assert_label_exact nvlink_host_numa_unit \
   nvlink_vmm_allocation_test \
   nvlink_host_numa_transfer_metadata_test \
   serializer_test
+)
+if cmake_cache_bool_is_true USE_EVENT_DRIVEN_COMPLETION \
+    "${build_dir}/CMakeCache.txt"; then
+  unit_tests+=(nvlink_event_driven_completion_test)
+fi
+assert_label_exact nvlink_host_numa_unit "${unit_tests[@]}"
 
 unit_junit="${build_dir}/nvlink-host-numa-unit.xml"
 ctest_in_build -L nvlink_host_numa_unit \
   --output-on-failure --output-junit "$unit_junit"
 validate_junit allow "$unit_junit"
 
-if [[ "${RUN_HARDWARE_TESTS:-0}" == "1" ]]; then
-  export MC_REQUIRE_MNNVL_FABRIC=1
-  export MC_REQUIRE_NVLINK_HOST_NUMA_RDMA=1
+# The GB200 data-plane harness deliberately has no Torch dependency. Exercise
+# its fake CUDA/store round trip and verify that this CUDA build environment can
+# load the same libcudart API used by the real Consumer.
+(
+  cd "$repo_root"
+  export PYTHONPYCACHEPREFIX="${build_dir}/python-cache"
+  python3 -m unittest discover -s scripts/gb200 \
+    -p 'test_nvlink_host_numa_harness.py' -v
+  python3 -m py_compile scripts/gb200/*.py
+  PYTHONPATH=scripts/gb200 python3 -c \
+    'from nvlink_host_numa_consumer import CudaRuntime; runtime = CudaRuntime(); print("CUDA runtime", runtime.library_path, runtime.runtime_version())'
+)
+
+if [[ "$run_hardware_tests" == "1" ]]; then
   assert_label_exact nvlink_host_numa_hardware \
     nvlink_host_numa_fabric_test \
     nvlink_host_numa_store_hardware_test \

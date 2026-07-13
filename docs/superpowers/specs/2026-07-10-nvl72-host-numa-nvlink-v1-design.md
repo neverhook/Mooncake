@@ -1,6 +1,6 @@
 # NVL72 HOST_NUMA NVLink KV Pool V1 Design
 
-- **Status:** Approved design, pending implementation plan
+- **Status:** Implemented in the design worktree; GB200/Fabric/RDMA acceptance pending
 - **Date:** 2026-07-10
 - **Baseline:** `origin/main` at `98ff4e4787e99265d25938139551841350ca5f4e`
 - **Scope:** Mooncake Store and the legacy `NvlinkTransport` on GB200/NVL72-class systems

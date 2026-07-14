@@ -262,6 +262,24 @@ pid_is_live() {
     pid_command_matches "$pid" "$expected"
 }
 
+pid_exists() {
+  local file="$1" pid
+  [[ -r "$file" ]] || return 1
+  read -r pid <"$file"
+  [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null
+}
+
+wait_for_pid_command() {
+  local file="$1" expected="$2" timeout="$3" deadline
+  deadline=$((SECONDS + timeout))
+  while pid_exists "$file"; do
+    pid_is_live "$file" "$expected" && return 0
+    (( SECONDS < deadline )) || return 1
+    sleep 0.1
+  done
+  return 1
+}
+
 show_port_owner() {
   local port="$1"
   if command -v ss >/dev/null 2>&1; then
@@ -285,7 +303,8 @@ PY
 }
 
 wait_for_tcp() {
-  local host="$1" port="$2" timeout="$3" deadline=$((SECONDS + timeout))
+  local host="$1" port="$2" timeout="$3" deadline
+  deadline=$((SECONDS + timeout))
   until tcp_reachable "$host" "$port"; do
     (( SECONDS < deadline )) || return 1
     sleep 1
@@ -478,6 +497,18 @@ case "$action" in
       --readiness-timeout-sec "$PROVIDER_READINESS_TIMEOUT_SEC" \
       >"$PROVIDER_LOG" 2>&1 &
     printf '%s\n' "$!" >"$PROVIDER_PID_FILE"
+    if ! wait_for_pid_command "$PROVIDER_PID_FILE" \
+        "nvlink_host_numa_provider.py" 5; then
+      if pid_exists "$PROVIDER_PID_FILE"; then
+        printf 'Provider PID did not enter the expected command within 5s:\n' >&2
+        ps -p "$(<"$PROVIDER_PID_FILE")" -o pid=,stat=,command= >&2 || true
+      else
+        printf 'Provider exited before its Python command became active.\n' >&2
+      fi
+      tail -n 120 "$PROVIDER_LOG" >&2 || true
+      rm -f "$PROVIDER_PID_FILE" "$PROVIDER_READY_FILE"
+      fail "Provider process failed during launcher handoff"
+    fi
     deadline=$((SECONDS + PROVIDER_READINESS_TIMEOUT_SEC + 5))
     diagnostic_at=$((SECONDS + PROVIDER_DIAGNOSTIC_DELAY_SEC))
     diagnosed=0

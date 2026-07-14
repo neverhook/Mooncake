@@ -149,6 +149,52 @@ if 'unit_tests+=(nvlink_event_driven_completion_test)' not in source:
     raise SystemExit("event-completion unit test is missing from dynamic membership")
 PY
 
+python3 - "$wrapper" <<'PY'
+import pathlib
+import sys
+
+source = pathlib.Path(sys.argv[1]).read_text()
+launch = source.index('printf \'%s\\n\' "$!" >"$PROVIDER_PID_FILE"')
+handoff = source.index(
+    'wait_for_pid_command "$PROVIDER_PID_FILE"', launch
+)
+readiness = source.index(
+    'deadline=$((SECONDS + PROVIDER_READINESS_TIMEOUT_SEC + 5))', handoff
+)
+if not launch < handoff < readiness:
+    raise SystemExit("Provider launcher handoff is not gated before readiness")
+if 'sleep 0.1' not in source[source.index('wait_for_pid_command()') : handoff]:
+    raise SystemExit("Provider launcher handoff has no retry interval")
+PY
+
+pid_helpers=""
+for helper in pid_command_matches pid_is_live pid_exists wait_for_pid_command; do
+  definition="$(sed -n "/^${helper}() {$/,/^}$/p" "$wrapper")"
+  [[ -n "$definition" ]] || {
+    printf 'could not extract wrapper PID helper: %s\n' "$helper" >&2
+    exit 1
+  }
+  pid_helpers+="${definition}"$'\n'
+done
+eval "$pid_helpers"
+handoff_pid_file="${tmp_dir}/handoff.pid"
+TARGET_COMMAND=nvlink_host_numa_provider.py \
+  bash -c 'sleep 0.3; exec -a "$TARGET_COMMAND" sleep 5' &
+handoff_pid=$!
+printf '%s\n' "$handoff_pid" >"$handoff_pid_file"
+if pid_is_live "$handoff_pid_file" nvlink_host_numa_provider.py; then
+  printf 'launcher race fixture entered the final command too early\n' >&2
+  kill "$handoff_pid" 2>/dev/null || true
+  exit 1
+fi
+if ! wait_for_pid_command "$handoff_pid_file" nvlink_host_numa_provider.py 2; then
+  printf 'wrapper did not tolerate the launcher-to-Provider exec handoff\n' >&2
+  kill "$handoff_pid" 2>/dev/null || true
+  exit 1
+fi
+kill "$handoff_pid" 2>/dev/null || true
+wait "$handoff_pid" 2>/dev/null || true
+
 bool_helper="$(sed -n \
   '/^cmake_cache_bool_is_true() {$/,/^}$/p' "$build_script")"
 if [[ -z "$bool_helper" ]]; then

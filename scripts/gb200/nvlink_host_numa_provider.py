@@ -88,7 +88,9 @@ def fetch_master_publication(
 ) -> tuple[str, str]:
     base = master_admin_url.rstrip("/")
     segments = fetch_text(f"{base}/get_all_segments")
-    query = urllib.parse.urlencode({"segment": segment_name})
+    # MasterAdmin's query_segment handler currently matches the raw host:port
+    # segment name and does not decode an escaped colon (%3A) before lookup.
+    query = urllib.parse.urlencode({"segment": segment_name}, safe=":")
     detail = fetch_text(f"{base}/query_segment?{query}")
     return segments, detail
 

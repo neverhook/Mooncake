@@ -66,8 +66,10 @@ grep -Fq 'GET http://127.0.0.1:65431/get_all_segments' "$diagnostic_log"
 grep -Fq 'GET http://127.0.0.1:65431/get_segments_detail' "$diagnostic_log"
 grep -Fq 'GET http://127.0.0.1:65431/query_segment?segment=127.0.0.1:12345' \
   "$diagnostic_log"
-grep -Fq 'GET http://127.0.0.1:65431/query_segment?segment=127.0.0.1%3A12345' \
-  "$diagnostic_log"
+if grep -Fq '%3A' "$diagnostic_log"; then
+  printf 'diagnostics escaped the segment colon used for Master lookup\n' >&2
+  exit 1
+fi
 if grep -Eq 'No host part|failed to set query|Could not parse the URL' "$diagnostic_log"; then
   printf 'diagnostics still depend on missing shell URL variables\n' >&2
   exit 1

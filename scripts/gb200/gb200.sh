@@ -361,15 +361,10 @@ diagnose() {
   print_http 'admin health' "${MASTER_ADMIN_URL}/health"
   print_http 'all segments' "${MASTER_ADMIN_URL}/get_all_segments"
   print_http 'segment details' "${MASTER_ADMIN_URL}/get_segments_detail"
-  print_http 'raw colon query' "${MASTER_ADMIN_URL}/query_segment?segment=${PROVIDER_HOSTNAME}"
-  local encoded
-  encoded="$(python3 - "$PROVIDER_HOSTNAME" <<'PY'
-import sys
-import urllib.parse
-print(urllib.parse.urlencode({"segment": sys.argv[1]}))
-PY
-)"
-  print_http 'URL-encoded query' "${MASTER_ADMIN_URL}/query_segment?${encoded}"
+  # Keep the segment's colon literal: MasterAdmin currently performs lookup
+  # without decoding %3A, and the Provider readiness path uses this same URL.
+  print_http 'readiness segment query' \
+    "${MASTER_ADMIN_URL}/query_segment?segment=${PROVIDER_HOSTNAME}"
 }
 
 stop_pid_file() {
@@ -511,6 +506,8 @@ case "$action" in
     fi
     deadline=$((SECONDS + PROVIDER_READINESS_TIMEOUT_SEC + 5))
     diagnostic_at=$((SECONDS + PROVIDER_DIAGNOSTIC_DELAY_SEC))
+    started_at=$SECONDS
+    next_progress=$((SECONDS + 10))
     diagnosed=0
     while [[ ! -s "$PROVIDER_READY_FILE" ]] && \
         pid_is_live "$PROVIDER_PID_FILE" "nvlink_host_numa_provider.py"; do
@@ -519,6 +516,15 @@ case "$action" in
           "$PROVIDER_DIAGNOSTIC_DELAY_SEC"
         diagnose | tee "${RESULT_DIR}/provider-start-diagnose.log"
         diagnosed=1
+      fi
+      if (( SECONDS >= next_progress )); then
+        latest_log="$(tail -n 1 "$PROVIDER_LOG" 2>/dev/null || true)"
+        printf 'Provider still initializing after %ss (pid=%s).\n' \
+          "$((SECONDS - started_at))" "$(<"$PROVIDER_PID_FILE")"
+        if [[ -n "$latest_log" ]]; then
+          printf 'Latest Provider log: %s\n' "$latest_log"
+        fi
+        next_progress=$((SECONDS + 10))
       fi
       (( SECONDS < deadline )) || break
       sleep 1
@@ -540,7 +546,13 @@ case "$action" in
     pid_is_live "$PROVIDER_PID_FILE" "nvlink_host_numa_provider.py" || \
       fail "Provider PID is not live: $PROVIDER_PID_FILE"
     printf 'Provider PID is live: %s\n' "$(<"$PROVIDER_PID_FILE")"
-    [[ -s "$PROVIDER_READY_FILE" ]] || fail "Provider ready file is missing: $PROVIDER_READY_FILE"
+    if [[ ! -s "$PROVIDER_READY_FILE" ]]; then
+      printf 'Provider state: INITIALIZING (ready file not written yet)\n'
+      printf '%s\n' '--- latest Provider log ---'
+      tail -n 20 "$PROVIDER_LOG" || true
+      exit 2
+    fi
+    printf 'Provider state: READY\n'
     cat "$PROVIDER_READY_FILE"
     diagnose
     ;;

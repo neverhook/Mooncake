@@ -323,6 +323,21 @@ class HarnessTest(unittest.TestCase):
                 detail.replace("576", "575"),
             )
 
+    def test_master_query_preserves_segment_colon(self):
+        with mock.patch.object(
+            provider, "fetch_text", side_effect=["segments", "detail"]
+        ) as fetch:
+            self.assertEqual(
+                provider.fetch_master_publication(
+                    "http://127.0.0.1:9003", "10.0.0.1:12345"
+                ),
+                ("segments", "detail"),
+            )
+        self.assertEqual(
+            fetch.call_args_list[1].args[0],
+            "http://127.0.0.1:9003/query_segment?segment=10.0.0.1:12345",
+        )
+
     def test_consumer_counter_delta_proves_miss_then_hit(self):
         before = consumer_metrics(consumer_metrics_text(7, 3, 3, 40))
         after_first = consumer_metrics(consumer_metrics_text(7, 4, 4, 51))

@@ -258,7 +258,7 @@ def main() -> int:
         required=True,
         help="Master admin HTTP base URL (metrics_port, default 9003)",
     )
-    parser.add_argument("--global-segment-size", default="600 GB")
+    parser.add_argument("--global-segment-size", default="600 MB")
     parser.add_argument("--local-buffer-size", default="0")
     parser.add_argument("--nodes", default="auto")
     parser.add_argument("--metrics-url", default="", help=argparse.SUPPRESS)

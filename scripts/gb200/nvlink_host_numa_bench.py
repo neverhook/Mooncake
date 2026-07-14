@@ -13,6 +13,7 @@ import uuid
 
 
 CACHE_DELTA_FIELDS = ("hit", "miss", "lazy_imports", "lazy_import_duration_us")
+MAX_PAYLOAD_SIZE = 128 * 1024 * 1024
 
 
 def safe_identifier(value: str) -> str:
@@ -169,7 +170,9 @@ def main() -> int:
     parser.add_argument("--metadata-server", required=True)
     parser.add_argument("--master-server", required=True)
     parser.add_argument("--devices", default="0,1,2,3")
-    parser.add_argument("--payload-sizes", default="4096,1048576,16777216")
+    parser.add_argument(
+        "--payload-sizes", default="4096,1048576,16777216,134217728"
+    )
     parser.add_argument("--iterations", type=int, default=4)
     parser.add_argument("--key-prefix", default="nvlink-host-numa-bench")
     parser.add_argument("--run-id", type=safe_identifier, default=uuid.uuid4().hex)
@@ -184,6 +187,8 @@ def main() -> int:
         parser.error("--devices values must be unique")
     if any(size <= 0 for size in sizes):
         parser.error("--payload-sizes values must be greater than zero")
+    if any(size > MAX_PAYLOAD_SIZE for size in sizes):
+        parser.error("--payload-sizes values must not exceed 128 MB")
     if args.iterations < 2:
         parser.error("--iterations must be at least two (cold and warm)")
     endpoints = {device: f"{args.local_hostname_prefix}{device}" for device in devices}

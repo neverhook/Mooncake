@@ -29,6 +29,19 @@ RUN_ID="gb200-20260713-01"
 BUILD_DIR="/workspace/Mooncake/build-nvlink-host-numa"
 ```
 
+For a config copied from an earlier revision, also replace the former 600 GB
+values with the current bounded test settings:
+
+```bash
+GLOBAL_SEGMENT_SIZE="600 MB"
+MC_MAX_MR_SIZE_BYTES=157286400
+PAYLOAD_SIZES="4096,1048576,16777216,134217728"
+SINGLE_PAYLOAD_SIZE=134217728
+```
+
+The wrapper rejects the old 600 GB registration setting and any payload above
+128 MB, so a stale config cannot accidentally start the large registration.
+
 Keep the default `METADATA_PORT=8079` unless that port is also occupied. Copy
 the completed `gb200.conf` to `/workspace/Mooncake/gb200.conf` on Node B. The
 two copies must have the same `NODE_A_IP`, `NODE_B_IP`, `RUN_ID`, ports, and
@@ -67,6 +80,11 @@ The configured default is strict hardware mode (`RUN_HARDWARE_TESTS=1`). It
 builds all targets with `WITH_EP=OFF`, `USE_CUDA=ON`, and `USE_MNNVL=ON`, then
 runs unit, Fabric, and RDMA suites with zero skips. Set `SKIP_PREFLIGHT=1` only
 when a preflight result for the same build and host has already been captured.
+
+The validation pool is intentionally limited to `600 MB`, split with a
+`150 MB` maximum MR size. Payloads are capped at `128 MB`; the default four-GPU
+peak is therefore at most `512 MB`, and each iteration removes its object
+before the next one starts.
 
 ### 2. Start the control plane on Node A
 

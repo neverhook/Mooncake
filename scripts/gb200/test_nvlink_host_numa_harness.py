@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import argparse
 import http.server
 import io
 import json
@@ -144,6 +145,13 @@ class _FakeConsumerStore:
 
 
 class HarnessTest(unittest.TestCase):
+    def test_payload_size_is_capped_at_128_mb(self):
+        maximum = 128 * 1024 * 1024
+        self.assertEqual(consumer.payload_size(str(maximum)), maximum)
+        with self.assertRaisesRegex(argparse.ArgumentTypeError, "128 MB"):
+            consumer.payload_size(str(maximum + 1))
+        self.assertEqual(bench.MAX_PAYLOAD_SIZE, maximum)
+
     def test_harness_prefers_source_build_store_module_with_packaged_fallback(self):
         for harness_module in (consumer, provider):
             with self.subTest(module=harness_module.__name__, path="source-build"):

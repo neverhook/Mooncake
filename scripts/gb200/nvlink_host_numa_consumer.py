@@ -22,6 +22,9 @@ from nvlink_host_numa_metrics import (
 )
 
 
+MAX_PAYLOAD_SIZE = 128 * 1024 * 1024
+
+
 def import_store_module():
     try:
         return importlib.import_module("store")
@@ -176,6 +179,13 @@ def positive_int(value: str) -> int:
     number = int(value)
     if number <= 0:
         raise argparse.ArgumentTypeError("value must be greater than zero")
+    return number
+
+
+def payload_size(value: str) -> int:
+    number = positive_int(value)
+    if number > MAX_PAYLOAD_SIZE:
+        raise argparse.ArgumentTypeError("payload size must not exceed 128 MB")
     return number
 
 
@@ -394,7 +404,7 @@ def main() -> int:
     parser.add_argument("--metadata-server", required=True)
     parser.add_argument("--master-server", required=True)
     parser.add_argument("--device", type=int, required=True)
-    parser.add_argument("--payload-size", type=positive_int, default=16 * 1024 * 1024)
+    parser.add_argument("--payload-size", type=payload_size, default=MAX_PAYLOAD_SIZE)
     parser.add_argument("--iterations", type=at_least_two, default=2)
     parser.add_argument("--key-prefix", default="nvlink-host-numa")
     parser.add_argument("--run-id", type=safe_identifier, default=uuid.uuid4().hex)

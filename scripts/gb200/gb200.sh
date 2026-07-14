@@ -67,16 +67,16 @@ MASTER_ADMIN_PORT=9003
 METADATA_PORT=8079
 PROVIDER_PORT=12345
 CONSUMER_PORT_BASE=12400
-GLOBAL_SEGMENT_SIZE="600 GB"
+GLOBAL_SEGMENT_SIZE="600 MB"
 LOCAL_BUFFER_SIZE="0"
 HOST_NUMA_NODES="auto"
-MC_MAX_MR_SIZE_BYTES=161061273600
+MC_MAX_MR_SIZE_BYTES=157286400
 MC_IMEX_DAEMON_EXTERNAL=0
 MC_CUDART_LIBRARY=""
 DEVICES="0,1,2,3"
-PAYLOAD_SIZES="4096,1048576,16777216"
+PAYLOAD_SIZES="4096,1048576,16777216,134217728"
 ITERATIONS=4
-SINGLE_PAYLOAD_SIZE=16777216
+SINGLE_PAYLOAD_SIZE=134217728
 RUN_HARDWARE_TESTS=1
 SKIP_PREFLIGHT=0
 BUILD_JOBS=""
@@ -147,6 +147,10 @@ done
 if [[ -n "$BUILD_JOBS" ]]; then
   require_positive_uint BUILD_JOBS
 fi
+[[ "$GLOBAL_SEGMENT_SIZE" == "600 MB" || "$GLOBAL_SEGMENT_SIZE" == "600MB" ]] || \
+  fail "GLOBAL_SEGMENT_SIZE must be 600 MB for this validation run"
+(( MC_MAX_MR_SIZE_BYTES == 150 * 1024 * 1024 )) || \
+  fail "MC_MAX_MR_SIZE_BYTES must be 157286400 (150 MB)"
 (( CONSUMER_PORT_BASE % 10 == 0 )) || \
   fail "CONSUMER_PORT_BASE must end in 0 so benchmark ports can append GPU IDs"
 [[ "$MASTER_RPC_PORT" != "$MASTER_ADMIN_PORT" && \
@@ -165,6 +169,13 @@ for device in "${configured_devices[@]}"; do
 done
 [[ "$PAYLOAD_SIZES" =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]] || \
   fail "PAYLOAD_SIZES must be a comma-separated list of positive integers"
+(( SINGLE_PAYLOAD_SIZE <= 128 * 1024 * 1024 )) || \
+  fail "SINGLE_PAYLOAD_SIZE must not exceed 128 MB"
+IFS=, read -r -a configured_payload_sizes <<<"$PAYLOAD_SIZES"
+for payload_size in "${configured_payload_sizes[@]}"; do
+  (( payload_size <= 128 * 1024 * 1024 )) || \
+    fail "PAYLOAD_SIZES entry must not exceed 128 MB: $payload_size"
+done
 
 MASTER_SERVER="${NODE_A_IP}:${MASTER_RPC_PORT}"
 METADATA_BASE_URL="http://${NODE_A_IP}:${METADATA_PORT}"
@@ -372,6 +383,8 @@ case "$action" in
     printf 'PYTHONPATH=%s\nLD_LIBRARY_PATH=%s\n' "$python_path" "$ld_library_path"
     printf 'GLOBAL_SEGMENT_SIZE=%s\nHOST_NUMA_NODES=%s\nDEVICES=%s\n' \
       "$GLOBAL_SEGMENT_SIZE" "$HOST_NUMA_NODES" "$DEVICES"
+    printf 'PAYLOAD_SIZES=%s\nSINGLE_PAYLOAD_SIZE=%s\n' \
+      "$PAYLOAD_SIZES" "$SINGLE_PAYLOAD_SIZE"
     printf 'MC_MS_AUTO_DISC=0\nMC_FORCE_MNNVL=1\nMC_MAX_MR_SIZE=%s\n' \
       "$MC_MAX_MR_SIZE_BYTES"
     ;;

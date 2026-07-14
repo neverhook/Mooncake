@@ -35,8 +35,20 @@ grep -Fq 'METADATA_SERVER=http://192.0.2.10:8079/metadata' "$resolved"
 grep -Fq 'MASTER_ADMIN_URL=http://192.0.2.10:9003' "$resolved"
 grep -Fq 'CONSUMER_HOSTNAME_PREFIX=192.0.2.11:1240' "$resolved"
 grep -Fq 'MC_FORCE_MNNVL=1' "$resolved"
+grep -Fq 'GLOBAL_SEGMENT_SIZE=600 MB' "$resolved"
+grep -Fq 'MC_MAX_MR_SIZE=157286400' "$resolved"
+grep -Fq 'PAYLOAD_SIZES=4096,1048576,16777216,134217728' "$resolved"
+grep -Fq 'SINGLE_PAYLOAD_SIZE=134217728' "$resolved"
 if grep -Fq '/bad' "$resolved"; then
   printf 'wrapper inherited an ad-hoc shell environment variable\n' >&2
+  exit 1
+fi
+
+oversized_config="${tmp_dir}/oversized.conf"
+sed 's/SINGLE_PAYLOAD_SIZE=134217728/SINGLE_PAYLOAD_SIZE=134217729/' \
+  "$config" >"$oversized_config"
+if "$wrapper" --config "$oversized_config" print-config >/dev/null 2>&1; then
+  printf 'wrapper unexpectedly accepted a payload above 128 MB\n' >&2
   exit 1
 fi
 

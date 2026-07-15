@@ -231,6 +231,7 @@ class FakeFabricDriver {
             };
         api.mem_get_address_range = [this](CUdeviceptr* base, size_t* length,
                                            CUdeviceptr) {
+            ++address_range_calls;
             if (failure == Failure::ADDRESS_RANGE)
                 return CUDA_ERROR_INVALID_CONTEXT;
             *base = kPublishedBase;
@@ -334,6 +335,7 @@ class FakeFabricDriver {
     int reserved_ranges = 0;
     int mapped_ranges = 0;
     int import_calls = 0;
+    int address_range_calls = 0;
     int access_calls = 0;
     int release_calls = 0;
     int unmap_calls = 0;
@@ -914,8 +916,7 @@ TEST(NvlinkTransportUnitTest,
            "owned by the process-lifetime quarantine";
 }
 
-TEST(NvlinkTransportUnitTest,
-     HostNumaRegistrationUsesExactRangeWhenLegacyQueryFails) {
+TEST(NvlinkTransportUnitTest, OwnedHostNumaRegistrationSkipsAddressRangeQuery) {
     FakeFabricDriver driver;
     driver.failure = FakeFabricDriver::Failure::ADDRESS_RANGE;
     driver.allocation_location_type = CU_MEM_LOCATION_TYPE_HOST_NUMA;
@@ -943,6 +944,7 @@ TEST(NvlinkTransportUnitTest,
     EXPECT_EQ(add_calls, 1);
     EXPECT_EQ(published.addr, FakeFabricDriver::kPublishedBase);
     EXPECT_EQ(published.length, FakeFabricDriver::kMappedLength);
+    EXPECT_EQ(driver.address_range_calls, 0);
     EXPECT_EQ(driver.live_handles, 1);
 
     ASSERT_EQ(NvlinkTransportTestPeer::unregister(transport, address), 0);
@@ -950,9 +952,8 @@ TEST(NvlinkTransportUnitTest,
 }
 
 TEST(NvlinkTransportUnitTest,
-     HostNumaRangeFallbackRejectsInteriorSubrangeWithoutProvenance) {
+     OwnedHostNumaRegistrationRejectsInteriorSubrange) {
     FakeFabricDriver driver;
-    driver.failure = FakeFabricDriver::Failure::ADDRESS_RANGE;
     driver.allocation_location_type = CU_MEM_LOCATION_TYPE_HOST_NUMA;
     int add_calls = 0;
     auto owner = NvlinkTransportTestPeer::makeOwnedHostNumaRange(
@@ -977,7 +978,65 @@ TEST(NvlinkTransportUnitTest,
               ERR_INVALID_ARGUMENT);
     EXPECT_EQ(add_calls, 0);
     EXPECT_EQ(NvlinkTransportTestPeer::registrationCount(transport), 0);
+    EXPECT_EQ(driver.address_range_calls, 1);
     EXPECT_EQ(driver.release_calls, 1);
+    driver.expectNoResources();
+}
+
+TEST(NvlinkTransportUnitTest,
+     ExternalHostNumaRegistrationRejectsAddressRangeQueryFailure) {
+    FakeFabricDriver driver;
+    driver.failure = FakeFabricDriver::Failure::ADDRESS_RANGE;
+    driver.allocation_location_type = CU_MEM_LOCATION_TYPE_HOST_NUMA;
+    int add_calls = 0;
+
+    NvlinkTransport transport;
+    NvlinkTransportTestPeer::configureFabric(
+        transport, driver.api(),
+        [&](const TransferMetadata::BufferDesc&, bool) {
+            ++add_calls;
+            return 0;
+        });
+
+    void* address = reinterpret_cast<void*>(FakeFabricDriver::kPublishedBase);
+    EXPECT_EQ(NvlinkTransportTestPeer::registerRemote(
+                  transport, address, FakeFabricDriver::kMappedLength),
+              ERR_MEMORY);
+    EXPECT_EQ(add_calls, 0);
+    EXPECT_EQ(NvlinkTransportTestPeer::registrationCount(transport), 0);
+    EXPECT_EQ(driver.address_range_calls, 1);
+    EXPECT_EQ(driver.release_calls, 1);
+    driver.expectNoResources();
+}
+
+TEST(NvlinkTransportUnitTest,
+     ExternalHostNumaRegistrationUsesSuccessfulAddressRangeQuery) {
+    FakeFabricDriver driver;
+    driver.allocation_location_type = CU_MEM_LOCATION_TYPE_HOST_NUMA;
+    int add_calls = 0;
+    TransferMetadata::BufferDesc published;
+
+    NvlinkTransport transport;
+    NvlinkTransportTestPeer::configureFabric(
+        transport, driver.api(),
+        [&](const TransferMetadata::BufferDesc& descriptor, bool) {
+            ++add_calls;
+            published = descriptor;
+            return 0;
+        },
+        [](void*, bool) { return 0; });
+
+    void* address = reinterpret_cast<void*>(FakeFabricDriver::kPublishedBase);
+    ASSERT_EQ(NvlinkTransportTestPeer::registerRemote(
+                  transport, address, FakeFabricDriver::kMappedLength),
+              0);
+    EXPECT_EQ(add_calls, 1);
+    EXPECT_EQ(driver.address_range_calls, 1);
+    EXPECT_EQ(published.addr, FakeFabricDriver::kPublishedBase);
+    EXPECT_EQ(published.length, FakeFabricDriver::kMappedLength);
+    EXPECT_EQ(driver.live_handles, 1);
+
+    ASSERT_EQ(NvlinkTransportTestPeer::unregister(transport, address), 0);
     driver.expectNoResources();
 }
 
@@ -1006,7 +1065,7 @@ TEST(NvlinkTransportUnitTest,
 }
 
 TEST(NvlinkTransportUnitTest,
-     DeviceRegistrationStillRejectsLegacyRangeQueryFailure) {
+     DeviceRegistrationStillRejectsAddressRangeQueryFailure) {
     FakeFabricDriver driver;
     driver.failure = FakeFabricDriver::Failure::ADDRESS_RANGE;
     driver.allocation_location_type = CU_MEM_LOCATION_TYPE_DEVICE;
@@ -1026,6 +1085,7 @@ TEST(NvlinkTransportUnitTest,
               ERR_MEMORY);
     EXPECT_EQ(add_calls, 0);
     EXPECT_EQ(NvlinkTransportTestPeer::registrationCount(transport), 0);
+    EXPECT_EQ(driver.address_range_calls, 1);
     EXPECT_EQ(driver.release_calls, 1);
     driver.expectNoResources();
 }

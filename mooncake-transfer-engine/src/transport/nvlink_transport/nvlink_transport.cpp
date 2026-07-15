@@ -2052,7 +2052,6 @@ int NvlinkTransport::registerLocalMemory(void* addr, size_t length,
 #if defined(USE_MNNVL) && defined(USE_CUDA)
         if (!fabric_driver_api_.mem_retain_allocation_handle ||
             !fabric_driver_api_.mem_get_allocation_properties_from_handle ||
-            !fabric_driver_api_.mem_get_address_range ||
             !fabric_driver_api_.mem_export_to_shareable_handle ||
             !fabric_driver_api_.mem_release) {
             LOG(ERROR) << "NvlinkTransport: incomplete Fabric driver adapter "
@@ -2109,51 +2108,51 @@ int NvlinkTransport::registerLocalMemory(void* addr, size_t length,
         }
         const bool is_host_numa =
             allocation_prop.location.type == CU_MEM_LOCATION_TYPE_HOST_NUMA;
+        const bool is_exact_owned_range =
+            NvlinkVmmAllocation::IsExactOwnedRange(addr, length);
 
         CUdeviceptr real_address = 0;
         size_t real_size = 0;
-        result = fabric_driver_api_.mem_get_address_range(
-            &real_address, &real_size, reinterpret_cast<CUdeviceptr>(addr));
-        if (result != CUDA_SUCCESS) {
+        if (is_exact_owned_range) {
             if (!is_host_numa) {
+                LOG(ERROR)
+                    << "NvlinkTransport: Mooncake-owned HOST_NUMA provenance "
+                       "does not match retained allocation properties";
+                return ERR_INVALID_ARGUMENT;
+            }
+
+            // NvlinkVmmAllocation created and owns this exact base/length
+            // mapping. cuMemRetainAllocationHandle above independently
+            // verified that addr is still backed by a cuMemMap allocation, so
+            // querying the range again would add only a current-context
+            // dependency and no new range information.
+            real_address = reinterpret_cast<CUdeviceptr>(addr);
+            real_size = length;
+        } else {
+            if (!fabric_driver_api_.mem_get_address_range) {
+                LOG(ERROR) << "NvlinkTransport: incomplete Fabric driver "
+                              "adapter for external range registration";
+                return ERR_CONTEXT;
+            }
+            result = fabric_driver_api_.mem_get_address_range(
+                &real_address, &real_size, reinterpret_cast<CUdeviceptr>(addr));
+            if (result != CUDA_SUCCESS) {
                 LOG(ERROR) << "NvlinkTransport: cuMemGetAddressRange failed: "
                            << result;
                 return ERR_MEMORY;
             }
-
-            if (!NvlinkVmmAllocation::IsExactOwnedRange(addr, length)) {
-                LOG(ERROR)
-                    << "NvlinkTransport: HOST_NUMA range-query fallback "
-                       "requires an exact Mooncake-owned VMM base and length";
+            if (real_address == 0) {
+                LOG(ERROR) << "NvlinkTransport: cuMemGetAddressRange returned "
+                              "a null allocation base";
+                return ERR_MEMORY;
+            }
+            if (is_host_numa &&
+                NvlinkVmmAllocation::IsExactOwnedRange(
+                    reinterpret_cast<void*>(real_address), real_size)) {
+                LOG(ERROR) << "NvlinkTransport: Mooncake-owned HOST_NUMA VMM "
+                              "registration requires its exact base and length";
                 return ERR_INVALID_ARGUMENT;
             }
-
-            // CUDA's legacy address-range query may reject HOST_NUMA VMM
-            // mappings even though retaining and exporting their allocation
-            // handle is supported. Store registers the exact base and aligned
-            // length owned by NvlinkVmmAllocation, so preserve that complete
-            // mapping instead of guessing a page size.
-            LOG(WARNING) << "NvlinkTransport: cuMemGetAddressRange failed for "
-                            "HOST_NUMA VMM allocation: "
-                         << result
-                         << "; using exact registered mapping addr=" << addr
-                         << " length=" << length;
-            real_address = reinterpret_cast<CUdeviceptr>(addr);
-            real_size = length;
-        } else if (real_address == 0 && is_host_numa) {
-            if (!NvlinkVmmAllocation::IsExactOwnedRange(addr, length)) {
-                LOG(ERROR)
-                    << "NvlinkTransport: HOST_NUMA null-base fallback "
-                       "requires an exact Mooncake-owned VMM base and length";
-                return ERR_INVALID_ARGUMENT;
-            }
-            LOG(WARNING)
-                << "NvlinkTransport: cuMemGetAddressRange returned a null "
-                   "base for HOST_NUMA VMM allocation; using exact registered "
-                   "mapping addr="
-                << addr << " length=" << length;
-            real_address = reinterpret_cast<CUdeviceptr>(addr);
-            real_size = length;
         }
         const uint64_t requested = reinterpret_cast<uint64_t>(addr);
         const uint64_t real = static_cast<uint64_t>(real_address);

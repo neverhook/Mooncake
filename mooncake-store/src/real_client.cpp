@@ -20,6 +20,8 @@
 
 #include "real_client.h"
 #include "client_buffer.h"
+#include "egm_store_pool.h"
+#include "egm_store_pool_orchestrator.h"
 #include "replica_selection.h"
 #include "common.h"
 #include "config.h"
@@ -33,6 +35,7 @@
 #include "uds_transport.h"
 #include "shm_helper.h"
 #include "memory_location.h"
+#include "transport/nvlink_transport/nvlink_vmm_allocation.h"
 #ifdef USE_NOF
 #include "spdk/spdk_wrapper.h"
 #endif
@@ -48,8 +51,87 @@ DEFINE_int32(http_port, 9300,
              "(only effective when --enable_http_server=true).");
 
 namespace mooncake {
+
+struct EgmStorePoolState {
+    std::vector<EgmStorePoolGlobalRecord> records;
+};
+
 namespace {
 constexpr std::chrono::seconds kIpcRequestRecvTimeout{5};
+
+class ProductionEgmStorePoolAllocation final : public EgmStorePoolAllocation {
+   public:
+    explicit ProductionEgmStorePoolAllocation(
+        std::unique_ptr<NvlinkVmmAllocation> owner)
+        : owner_(std::move(owner)) {}
+
+    void *base() const override { return owner_->base(); }
+    size_t length() const override { return owner_->length(); }
+
+    Status Release() { return owner_->Release(); }
+
+   private:
+    std::unique_ptr<NvlinkVmmAllocation> owner_;
+};
+
+class ProductionEgmStorePoolOperations final : public EgmStorePoolOperations {
+   public:
+    explicit ProductionEgmStorePoolOperations(std::shared_ptr<Client> client)
+        : client_(std::move(client)) {}
+
+    tl::expected<std::unique_ptr<EgmStorePoolAllocation>, ErrorCode> Allocate(
+        const EgmStorePoolAllocationRequest &request) override {
+        NvlinkVmmAllocation::Options options;
+        options.location_type = NvlinkVmmAllocation::LocationType::HOST_NUMA;
+        options.location_id = request.numa_node;
+        options.requested_length = request.length;
+        options.fabric_exportable = true;
+        options.required_va_alignment = request.required_va_alignment;
+
+        std::unique_ptr<NvlinkVmmAllocation> allocation;
+        Status status = NvlinkVmmAllocation::Create(options, allocation);
+        if (!status.ok() || !allocation) {
+            LOG(ERROR) << "EGM Store Pool VMM allocation failed: " << status;
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        return std::unique_ptr<EgmStorePoolAllocation>(
+            new ProductionEgmStorePoolAllocation(std::move(allocation)));
+    }
+
+    tl::expected<UUID, ErrorCode> MountGlobal(void *base,
+                                              size_t length) override {
+        return client_->MountSegmentAndGetId(base, length, "nvlink",
+                                             kWildcardLocation);
+    }
+
+    tl::expected<void, ErrorCode> UnmountGlobal(
+        const UUID &segment_id) override {
+        return client_->UnmountSegmentById(segment_id);
+    }
+
+    tl::expected<void, ErrorCode> UnregisterIfPresent(void *base) override {
+        return client_->UnregisterLocalMemoryIfPresent(base, true);
+    }
+
+    tl::expected<void, ErrorCode> Destroy(
+        std::unique_ptr<EgmStorePoolAllocation> &allocation) override {
+        auto *production =
+            dynamic_cast<ProductionEgmStorePoolAllocation *>(allocation.get());
+        if (!production) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        Status status = production->Release();
+        if (!status.ok()) {
+            LOG(ERROR) << "EGM Store Pool VMM release failed: " << status;
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        allocation.reset();
+        return {};
+    }
+
+   private:
+    std::shared_ptr<Client> client_;
+};
 
 #ifdef USE_ASCEND_DIRECT
 bool checkAcl(aclError result, const char *message) {
@@ -572,7 +654,15 @@ RealClient::~RealClient() {
     }
     // Ensure resources are cleaned even if not explicitly closed
     stop_http_server();
-    tearDownAll_internal();
+    auto teardown = tearDownAll_internal();
+    if (!teardown && egm_store_pool_state_ &&
+        !egm_store_pool_state_->records.empty()) {
+        LOG(ERROR) << "EGM Store Pool cleanup failed during destruction; "
+                      "intentionally leaking VMM owners to prevent virtual "
+                      "address reuse";
+        AbandonEgmStorePoolOwnership(egm_store_pool_state_->records);
+        (void)tearDownAll_internal();
+    }
 }
 
 std::shared_ptr<RealClient> RealClient::create() {
@@ -1046,6 +1136,91 @@ inline std::optional<int> get_config_int(const ConfigDict &config,
 }
 }  // namespace
 
+tl::expected<void, ErrorCode> RealClient::setup_egm_store_pool(
+    const EgmStorePoolOptions &options, size_t global_segment_size) {
+    if (!client_ || !options.enabled || global_segment_size == 0 ||
+        protocol != "nvlink") {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (!egm_store_pool_state_) {
+        egm_store_pool_state_ = std::make_unique<EgmStorePoolState>();
+    }
+    auto &records = egm_store_pool_state_->records;
+    if (!records.empty()) {
+        LOG(ERROR) << "EGM Store Pool setup refused non-empty ownership state";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (!client_->SupportsNvlinkFabricMemory()) {
+        LOG(ERROR) << "EGM Store Pool requires NVLink Fabric memory support";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    Status capability = NvlinkVmmAllocation::CheckStrictFabricCapability();
+    if (!capability.ok()) {
+        LOG(ERROR) << "EGM Store Pool Fabric preflight failed: " << capability;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto environment = CreateProductionEgmStorePoolEnvironment();
+    auto nodes =
+        DiscoverEgmStorePoolNodes(options, global_segment_size, *environment);
+    if (!nodes) {
+        LOG(ERROR) << "EGM Store Pool NUMA discovery failed: " << nodes.error();
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    std::vector<std::pair<int, size_t>> node_granularities;
+    node_granularities.reserve(nodes->size());
+    for (int node : *nodes) {
+        size_t granularity = 0;
+        Status status = NvlinkVmmAllocation::GetAllocationGranularity(
+            NvlinkVmmAllocation::LocationType::HOST_NUMA, node, true,
+            granularity);
+        if (!status.ok()) {
+            LOG(ERROR) << "EGM Store Pool granularity query failed for NUMA "
+                          "node "
+                       << node << ": " << status;
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        node_granularities.emplace_back(node, granularity);
+    }
+
+    auto plan = PlanEgmStorePoolCapacity(
+        global_segment_size, node_granularities,
+        static_cast<size_t>(globalConfig().max_mr_size));
+    if (!plan) {
+        LOG(ERROR) << "EGM Store Pool capacity planning failed: "
+                   << plan.error();
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    ProductionEgmStorePoolOperations operations(client_);
+    auto setup = SetupEgmStorePoolOrchestration(operations, *plan, records);
+    if (!setup) {
+        LOG(ERROR) << "EGM Store Pool setup failed at stage "
+                   << static_cast<int>(setup.error().stage);
+        if (!CleanupEgmStorePoolOrchestration(operations, records)) {
+            LOG(ERROR) << "EGM Store Pool setup rollback is incomplete";
+        }
+        return tl::make_unexpected(setup.error().error);
+    }
+
+    LOG(INFO) << "EGM Store Pool ready: requested=" << global_segment_size
+              << " effective=" << plan->effective_total
+              << " chunks=" << plan->chunks.size();
+    return {};
+}
+
+bool RealClient::cleanup_egm_store_pool() {
+    if (!egm_store_pool_state_ || egm_store_pool_state_->records.empty()) {
+        return true;
+    }
+    if (!client_) return false;
+    ProductionEgmStorePoolOperations operations(client_);
+    return CleanupEgmStorePoolOrchestration(operations,
+                                            egm_store_pool_state_->records);
+}
+
 tl::expected<void, ErrorCode> RealClient::setup_internal(
     const ConfigDict &config) {
     // Extract required parameters (no defaults)
@@ -1125,11 +1300,29 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     }
     int client_http_port = client_http_port_opt.value();
 
-    return setup_internal(local_hostname, metadata_server, global_segment_size,
-                          local_buffer_size, protocol, rdma_devices,
-                          master_server_addr, nullptr, ipc_socket_path, 50052,
-                          enable_ssd_offload, true, ssd_offload_path, tenant_id,
-                          enable_client_http_server, client_http_port);
+    auto egm_options = ParseEgmStorePoolOptions(config, global_segment_size);
+    if (!egm_options) {
+        LOG(ERROR) << "Invalid EGM Store Pool configuration: "
+                   << egm_options.error();
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto egm_validation = ValidateEgmStorePoolConfiguration(
+        *egm_options, protocol, global_segment_size, local_buffer_size);
+    if (!egm_validation) {
+        LOG(ERROR) << "Invalid EGM Store Pool configuration: "
+                   << egm_validation.error();
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto setup = setup_internal(
+        local_hostname, metadata_server,
+        egm_options->enabled ? 0 : global_segment_size, local_buffer_size,
+        protocol, rdma_devices, master_server_addr, nullptr, ipc_socket_path,
+        50052, enable_ssd_offload, true, ssd_offload_path, tenant_id,
+        enable_client_http_server, client_http_port);
+    if (!setup || !egm_options->enabled) return setup;
+
+    return setup_egm_store_pool(*egm_options, global_segment_size);
 }
 
 tl::expected<void, ErrorCode> RealClient::initAll_internal(
@@ -1153,6 +1346,10 @@ int RealClient::initAll(const std::string &protocol_,
 }
 
 tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
+    if (!cleanup_egm_store_pool()) {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
     // Ensure cleanup executes once across destructor/close/signal paths
     bool expected = false;
     if (!closed_.compare_exchange_strong(expected, true,

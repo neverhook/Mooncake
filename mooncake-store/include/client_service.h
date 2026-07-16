@@ -347,6 +347,11 @@ class Client {
     tl::expected<void, ErrorCode> unregisterLocalMemory(
         void* addr, bool update_metadata = true);
 
+    // Idempotent unregister used by setup rollback. A buffer already removed
+    // by an inner compensation step is considered successfully cleaned.
+    tl::expected<void, ErrorCode> UnregisterLocalMemoryIfPresent(
+        void* addr, bool update_metadata = true);
+
     /**
      * @brief Checks if an object exists
      * @param key Key to check
@@ -571,6 +576,11 @@ class Client {
 
     [[nodiscard]] const std::string& GetProtocol() const { return protocol_; }
 
+    [[nodiscard]] bool SupportsNvlinkFabricMemory() const {
+        return transfer_engine_ != nullptr &&
+               transfer_engine_->supportsNvlinkFabricMemory();
+    }
+
     /**
      * @brief Get the endpoint address for segment operations.
      * @return For P2PHANDSHAKE mode, returns the actual RPC endpoint (IP:Port).
@@ -792,6 +802,10 @@ class Client {
     // Mutex to protect mounted_segments_
     mutable std::mutex mounted_segments_mutex_;
     std::unordered_map<UUID, Segment, boost::hash<UUID>> mounted_segments_;
+    // Unmount can succeed at Master and fail while removing the TE
+    // registration. Remember that partial progress so a retry does not repeat
+    // the non-idempotent Master operation.
+    std::unordered_set<UUID, boost::hash<UUID>> master_unmounted_segments_;
 
     // Segments in graceful unmount: readable by remote peers, not allocatable
     // locally. TE MR remains registered until master confirms removal.

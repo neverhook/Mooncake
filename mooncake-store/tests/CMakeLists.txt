@@ -91,6 +91,19 @@ add_store_test(segment_test segment_test.cpp)
 add_store_test(offset_allocator_test offset_allocator_test.cpp)
 add_store_test(utils_test utils_test.cpp)
 add_store_test(client_buffer_test client_buffer_test.cpp)
+add_store_test(egm_store_pool_config_test egm_store_pool_config_test.cpp)
+add_store_test(egm_store_pool_orchestrator_test
+               egm_store_pool_orchestrator_test.cpp)
+add_store_test(egm_store_pool_planner_test egm_store_pool_planner_test.cpp)
+target_include_directories(
+  egm_store_pool_config_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_include_directories(
+  egm_store_pool_orchestrator_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_include_directories(
+  egm_store_pool_planner_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+set_tests_properties(
+  egm_store_pool_config_test egm_store_pool_orchestrator_test
+  egm_store_pool_planner_test PROPERTIES LABELS "egm_store_pool_unit")
 add_store_test(client_local_hot_cache_test client_local_hot_cache_test.cpp)
 add_store_test(client_tcp_local_memcpy_test client_tcp_local_memcpy_test.cpp)
 add_store_test(pybind_client_test pybind_client_test.cpp)

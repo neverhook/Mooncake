@@ -795,6 +795,25 @@ ErrorCode Client::InitTransferEngine(
                 LOG(ERROR) << "Failed to install TCP transport";
                 return ErrorCode::INTERNAL_ERROR;
             }
+        } else if (protocol == "nvlink") {
+            if (device_names.has_value()) {
+                LOG(WARNING)
+                    << "NVLink protocol does not use device names, ignoring";
+            }
+            try {
+                transport =
+                    transfer_engine_->installTransport("nvlink", nullptr);
+            } catch (std::exception& e) {
+                LOG(ERROR) << "nvlink_transport_install_failed "
+                              "error_message=\""
+                           << e.what() << "\"";
+                return ErrorCode::INTERNAL_ERROR;
+            }
+            if (!transport) {
+                LOG(ERROR) << "Failed to install NVLink transport; ensure "
+                              "Mooncake is built with USE_MNNVL";
+                return ErrorCode::INTERNAL_ERROR;
+            }
         } else if (protocol == "ascend" || protocol == "ubshmem" ||
                    protocol == "sunrise_link") {
             if (device_names.has_value()) {
@@ -2732,12 +2751,16 @@ tl::expected<void, ErrorCode> Client::MountSegment(
 
 tl::expected<void, ErrorCode> Client::UnmountSegmentImpl(
     std::unordered_map<UUID, Segment, boost::hash<UUID>>::iterator it) {
-    auto unmount_result = master_client_.UnmountSegment(it->second.id);
-    if (!unmount_result) {
-        ErrorCode err = unmount_result.error();
-        LOG(ERROR) << "Failed to unmount segment from master: "
-                   << toString(err);
-        return tl::unexpected(err);
+    const UUID segment_id = it->first;
+    if (master_unmounted_segments_.count(segment_id) == 0) {
+        auto unmount_result = master_client_.UnmountSegment(it->second.id);
+        if (!unmount_result) {
+            ErrorCode err = unmount_result.error();
+            LOG(ERROR) << "Failed to unmount segment from master: "
+                       << toString(err);
+            return tl::unexpected(err);
+        }
+        master_unmounted_segments_.insert(segment_id);
     }
 
     int rc = transfer_engine_->unregisterLocalMemory(
@@ -2753,6 +2776,7 @@ tl::expected<void, ErrorCode> Client::UnmountSegmentImpl(
         // engine, we can continue
     }
 
+    master_unmounted_segments_.erase(segment_id);
     mounted_segments_.erase(it);
     return {};
 }
@@ -2981,6 +3005,16 @@ tl::expected<void, ErrorCode> Client::unregisterLocalMemory(
     void* addr, bool update_metadata) {
     if (this->transfer_engine_->unregisterLocalMemory(addr, update_metadata) !=
         0) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return {};
+}
+
+tl::expected<void, ErrorCode> Client::UnregisterLocalMemoryIfPresent(
+    void* addr, bool update_metadata) {
+    const int rc =
+        transfer_engine_->unregisterLocalMemory(addr, update_metadata);
+    if (rc != 0 && rc != ERR_ADDRESS_NOT_REGISTERED) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     return {};

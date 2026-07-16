@@ -31,6 +31,8 @@ namespace mooncake {
 class RealClient;
 class UdsAcceptor;
 class UdsConnection;
+struct EgmStorePoolOptions;
+struct EgmStorePoolState;
 
 // Global resource tracker to handle cleanup on abnormal termination
 class ResourceTracker {
@@ -519,6 +521,9 @@ class RealClient : public PyClient {
 
     // Overload that accepts a configuration dictionary
     tl::expected<void, ErrorCode> setup_internal(const ConfigDict &config);
+    tl::expected<void, ErrorCode> setup_egm_store_pool(
+        const EgmStorePoolOptions &options, size_t global_segment_size);
+    bool cleanup_egm_store_pool();
 
     tl::expected<void, ErrorCode> initAll_internal(
         const std::string &protocol, const std::string &device_name,
@@ -809,6 +814,7 @@ class RealClient : public PyClient {
     std::vector<std::unique_ptr<void, HugepageSegmentDeleter>>
         hugepage_segment_ptrs_;
     std::vector<std::unique_ptr<void, SegmentDeleter>> segment_ptrs_;
+    std::unique_ptr<EgmStorePoolState> egm_store_pool_state_;
     std::vector<std::unique_ptr<void, AscendSegmentDeleter>>
         ascend_segment_ptrs_;
     std::vector<std::unique_ptr<void, UbSegmentDeleter>> ub_segment_ptrs_;

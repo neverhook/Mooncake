@@ -1102,6 +1102,19 @@ store.setup("localhost", "http://localhost:8080/metadata", 512*1024*1024, 128*10
 
 </details>
 
+The class also provides a configuration-dictionary overload:
+
+```python
+def setup(self, config: Dict[str, object]) -> int
+```
+
+This is currently the only public binding that exposes
+`enable_egm_store_pool` and `egm_numa_nodes`. The fixed-argument
+overload above, C ABI, Rust API, and Go API do not expose EGM Store Pool
+controls. V1 also requires `protocol="nvlink"` and `local_buffer_size=0`. See
+[EGM Store Pool](../deployment/egm-store-pool.md) for the complete contract and
+an example.
+
 ---
 #### setup_dummy()
 Initialize the store with a dummy client for testing purposes.
@@ -2002,19 +2015,33 @@ store.close()
 ---
 
 #### close()
-Clean up all resources and terminate connections.
+Clean up all resources and terminate connections. If cleanup fails, the Store
+object remains attached so the same method can be called again.
 
 ```python
 def close(self) -> int
 ```
 
 **Returns:**
-- `int`: Status code (0 = success, non-zero = error code)
+- `int`: Status code (0 = success, non-zero = error code). A nonzero result
+  must not be ignored: retain the object and retry `close()` after the blocking
+  condition clears.
 
 **Example:**
 ```python
-store.close()
+import time
+
+for attempt in range(3):
+    if store.close() == 0:
+        break
+    time.sleep(1)
+else:
+    raise RuntimeError("store cleanup is still pending")
 ```
+
+For EGM Store Pool, a nonzero result means publication cleanup still owns VMM
+allocations. Retry `close()` on the same object after the blocking condition
+clears.
 
 ---
 #### put_from_with_metadata()

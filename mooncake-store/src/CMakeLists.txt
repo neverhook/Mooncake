@@ -26,6 +26,8 @@ set(MOONCAKE_STORE_SOURCES
     posix_file.cpp
     client_buffer.cpp
     aligned_client_buffer.cpp
+    egm_store_pool.cpp
+    egm_store_pool_orchestrator.cpp
     real_client.cpp
     dummy_client.cpp
     uds_transport.cpp

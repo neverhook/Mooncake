@@ -395,7 +395,7 @@ jobs:
         sudo cmake --install .
       shell: bash
 
-    - name: Build and gate NVLink VMM unit tests
+    - name: Build and gate NVLink VMM and EGM Store unit tests
       run: |
         cuda_driver_stub=""
         for stub_dir in /usr/local/cuda/lib64/stubs /usr/local/cuda/targets/*/lib/stubs; do
@@ -421,6 +421,9 @@ jobs:
           -DENABLE_SCCACHE=ON \
           -DCMAKE_BUILD_TYPE=Release
         cmake --build build-nvlink-vmm-tests --target \
+          egm_store_pool_config_test \
+          egm_store_pool_orchestrator_test \
+          egm_store_pool_planner_test \
           nvlink_transport_test \
           nvlink_vmm_allocation_test
 
@@ -441,6 +444,18 @@ jobs:
           exit 1
         fi
         ctest -L nvlink_vmm_unit --output-on-failure
+
+        discovered_tests="$(ctest -N -L egm_store_pool_unit)"
+        printf '%s\n' "$discovered_tests"
+        test_count="$(
+          awk '$1 == "Total" && $2 == "Tests:" {print $3}' \
+            <<<"$discovered_tests"
+        )"
+        if [[ ! "$test_count" =~ ^[1-9][0-9]*$ ]]; then
+          echo "::error::No egm_store_pool_unit tests were discovered"
+          exit 1
+        fi
+        ctest -L egm_store_pool_unit --output-on-failure
       shell: bash
 
     - name: Run sccache stat for check

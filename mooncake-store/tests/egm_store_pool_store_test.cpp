@@ -47,28 +47,32 @@ class EgmStorePoolStoreTestPeer {
     using MasterMountFailureHook =
         std::function<std::optional<ErrorCode>(const Segment&)>;
 
-    static void SetMasterMountFailureHook(RealClient& client,
-                                          MasterMountFailureHook hook) {
-        client.egm_store_pool_master_mount_failure_for_test_ = std::move(hook);
-    }
-
-    static void ClearMasterMountFailureHook(RealClient& client) {
-        client.egm_store_pool_master_mount_failure_for_test_ = {};
+    static tl::expected<void, ErrorCode> SetupWithMasterMountFailure(
+        RealClient& client, const ConfigDict& config,
+        MasterMountFailureHook hook) {
+        RealClient::EgmStorePoolRuntimeDependencies dependencies;
+        dependencies.master_mount_failure = std::move(hook);
+        return client.setup_internal_impl(config, &dependencies);
     }
 
     static void MarkAllocatorCleanupPending(RealClient& client) {
         client.egm_store_pool_allocator_installed_ = true;
     }
 
+    static bool Cleanup(RealClient& client, bool rollback) {
+        return client.cleanup_egm_store_pool(rollback);
+    }
+
     static tl::expected<void, ErrorCode> ReleaseAllocatorView(
         RealClient& client,
         const std::function<void()>& after_exchange_for_test = {}) {
-        return client.ReleaseEgmStorePoolAllocatorView(after_exchange_for_test);
+        return client.release_egm_store_pool_allocator_view(
+            after_exchange_for_test);
     }
 
     static void PublishAllocatorView(
         RealClient& client, std::shared_ptr<ClientBufferAllocator> allocator) {
-        client.PublishClientBufferAllocator(std::move(allocator));
+        client.publish_client_buffer_allocator(std::move(allocator));
     }
 
     static std::shared_ptr<ClientBufferAllocator> SnapshotAllocatorView(
@@ -78,7 +82,7 @@ class EgmStorePoolStoreTestPeer {
 
     static std::optional<BufferHandle> AllocateFromAllocatorView(
         RealClient& client, size_t size) {
-        return client.AllocateClientBuffer(size);
+        return client.allocate_client_buffer(size);
     }
 
     static bool HasLocalTeBuffer(Client& client, uintptr_t base) {
@@ -437,8 +441,8 @@ TEST(EgmStorePoolStoreTest, EmptyPartialSetupCleanupIsIdempotent) {
     auto client = RealClient::create();
     client->egm_store_pool_enabled_ = true;
 
-    EXPECT_TRUE(client->CleanupEgmStorePool(true));
-    EXPECT_TRUE(client->CleanupEgmStorePool(true));
+    EXPECT_TRUE(EgmStorePoolStoreTestPeer::Cleanup(*client, true));
+    EXPECT_TRUE(EgmStorePoolStoreTestPeer::Cleanup(*client, true));
     EXPECT_FALSE(client->egm_store_pool_enabled_);
     EXPECT_TRUE(client->egm_store_pool_globals_.empty());
     EXPECT_FALSE(client->egm_store_pool_local_.has_value());
@@ -482,12 +486,12 @@ TEST(EgmStorePoolStoreTest,
         EgmStorePoolStoreTestPeer::AllocateFromAllocatorView(*client, 1024);
     ASSERT_TRUE(allocation.has_value());
 
-    EXPECT_FALSE(client->CleanupEgmStorePool(false));
+    EXPECT_FALSE(EgmStorePoolStoreTestPeer::Cleanup(*client, false));
     EXPECT_EQ(client->health_check(), HC_CLEANUP_PENDING);
     EXPECT_TRUE(client->egm_store_pool_enabled_);
 
     allocation.reset();
-    EXPECT_TRUE(client->CleanupEgmStorePool(false));
+    EXPECT_TRUE(EgmStorePoolStoreTestPeer::Cleanup(*client, false));
     EXPECT_EQ(client->health_check(), HC_NOT_INITIALIZED);
     EXPECT_FALSE(client->egm_store_pool_enabled_);
 }
@@ -567,7 +571,7 @@ TEST(EgmStorePoolStoreTest,
      CleanupPendingOwnershipRejectsEnabledAndDisabledSetupBeforeMutation) {
     auto client = RealClient::create();
 
-    // This is the state CleanupEgmStorePool deliberately retains when any
+    // This is the state EGM Store Pool cleanup deliberately retains when any
     // unmount/unregister step fails. Null allocation records are sufficient for
     // this CPU-only guard test; no CUDA operation is reached.
     client->egm_store_pool_enabled_ = true;
@@ -602,7 +606,7 @@ TEST(EgmStorePoolStoreTest,
     EXPECT_EQ(client->local_hostname, "cleanup-pending-host");
 
     retained_allocator.reset();
-    EXPECT_TRUE(client->CleanupEgmStorePool(true));
+    EXPECT_TRUE(EgmStorePoolStoreTestPeer::Cleanup(*client, true));
 }
 
 #if !defined(USE_MNNVL) || !defined(USE_CUDA)
@@ -722,8 +726,8 @@ TEST(EgmStorePoolStoreHardwareTest,
     auto local_base = std::make_shared<void*>(nullptr);
     auto te_descriptor_visible_before_failure = std::make_shared<bool>(false);
     RealClient* client_ptr = client.get();
-    EgmStorePoolStoreTestPeer::SetMasterMountFailureHook(
-        *client,
+    auto setup = EgmStorePoolStoreTestPeer::SetupWithMasterMountFailure(
+        *client, HardwareConfig(master, failure_context, hostname),
         [client_ptr, mount_calls, failed_global_base, local_base,
          te_descriptor_visible_before_failure,
          fail_nth](const Segment& segment) -> std::optional<ErrorCode> {
@@ -742,8 +746,6 @@ TEST(EgmStorePoolStoreHardwareTest,
             return std::nullopt;
         });
 
-    auto setup = client->setup_internal(
-        HardwareConfig(master, failure_context, hostname));
     if (*mount_calls < fail_nth) {
         REQUIRE_FABRIC_OR_SKIP(
             *strict,
@@ -816,7 +818,6 @@ TEST(EgmStorePoolStoreHardwareTest,
     ::testing::Test::RecordProperty("injected_mount_ordinal",
                                     std::to_string(fail_nth));
     ::testing::Test::RecordProperty("rollback_result", "success");
-    EgmStorePoolStoreTestPeer::ClearMasterMountFailureHook(*client);
     EXPECT_TRUE(client->tearDownAll_internal());
 }
 

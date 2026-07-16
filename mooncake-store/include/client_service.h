@@ -33,6 +33,7 @@ namespace mooncake {
 class PutOperation;
 class RealClient;
 class EgmStorePoolStoreTestPeer;
+class ProductionEgmStorePoolOperations;
 
 /**
  * @brief Result of a query operation containing replica information and lease
@@ -736,6 +737,7 @@ class Client {
    private:
     friend class RealClient;
     friend class EgmStorePoolStoreTestPeer;
+    friend class ProductionEgmStorePoolOperations;
 
     /**
      * @brief Internal helper functions for initialization and data transfer
@@ -869,12 +871,12 @@ class Client {
     // Mutex to protect mounted_segments_
     mutable std::mutex mounted_segments_mutex_;
     std::unordered_map<UUID, Segment, boost::hash<UUID>> mounted_segments_;
-    // Test-binary-only seam used to fail the Master step after the real TE
-    // registration has completed. An empty optional continues with the real
-    // Master RPC. This remains private so production callers cannot alter
-    // mount behavior.
-    std::function<std::optional<ErrorCode>(const Segment&)>
-        mount_segment_master_failure_for_test_;
+    using MountSegmentMasterFailure =
+        std::function<std::optional<ErrorCode>(const Segment&)>;
+    tl::expected<UUID, ErrorCode> MountSegmentAndGetIdImpl(
+        const void* buffer, size_t size, const std::string& protocol,
+        const std::string& location,
+        const MountSegmentMasterFailure& master_failure);
     // A normal unmount can complete at Master and then fail while removing the
     // local TE registration. Remember that partial progress so a retry does
     // not issue a second non-idempotent Master unmount.

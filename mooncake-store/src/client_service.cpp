@@ -2808,6 +2808,13 @@ tl::expected<void, ErrorCode> Client::UnmountSegment(const void* buffer,
 tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
     const void* buffer, size_t size, const std::string& protocol,
     const std::string& location) {
+    return MountSegmentAndGetIdImpl(buffer, size, protocol, location, {});
+}
+
+tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetIdImpl(
+    const void* buffer, size_t size, const std::string& protocol,
+    const std::string& location,
+    const MountSegmentMasterFailure& master_failure) {
     auto check_result = CheckRegisterMemoryParams(buffer, size);
     if (!check_result) {
         return tl::unexpected(check_result.error());
@@ -2854,9 +2861,8 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
         }
 
         auto mount_result = [&]() -> tl::expected<void, ErrorCode> {
-            if (mount_segment_master_failure_for_test_) {
-                auto injected_failure =
-                    mount_segment_master_failure_for_test_(segment);
+            if (master_failure) {
+                auto injected_failure = master_failure(segment);
                 if (injected_failure.has_value()) {
                     return tl::make_unexpected(*injected_failure);
                 }

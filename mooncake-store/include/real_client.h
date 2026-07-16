@@ -869,11 +869,6 @@ class RealClient : public PyClient {
     std::unique_ptr<EgmStorePoolProcessQuarantineNode>
         egm_store_pool_quarantine_node_;
 
-    tl::expected<void, ErrorCode> SetupEgmStorePool(
-        const EgmStorePoolOptions &options, size_t global_segment_size,
-        size_t local_buffer_size);
-    bool CleanupEgmStorePool(bool rollback);
-
     // Dummy VA -> real VA using mapped_shms; last_hit_shm caches locality.
     bool map_dummy_range_in_shm(const MappedShm &shm, uint64_t dummy_addr,
                                 size_t offset, size_t size,
@@ -946,6 +941,19 @@ class RealClient : public PyClient {
     friend class ProductionEgmStorePoolOperations;
     friend class EgmStorePoolStoreTestPeer;
 
+    struct EgmStorePoolRuntimeDependencies {
+        std::function<std::optional<ErrorCode>(const Segment &)>
+            master_mount_failure;
+    };
+
+    void prepare_egm_store_pool_runtime();
+    void quarantine_egm_store_pool_on_destroy(bool teardown_succeeded);
+    tl::expected<void, ErrorCode> setup_egm_store_pool(
+        const EgmStorePoolOptions &options, size_t global_segment_size,
+        size_t local_buffer_size,
+        const EgmStorePoolRuntimeDependencies &dependencies);
+    bool cleanup_egm_store_pool(bool rollback);
+
     tl::expected<void, ErrorCode> setup_internal_with_egm_store_pool(
         const std::string &local_hostname, const std::string &metadata_server,
         size_t global_segment_size, size_t local_buffer_size,
@@ -956,24 +964,21 @@ class RealClient : public PyClient {
         bool enable_ssd_offload, bool start_offload_rpc_server,
         const std::string &ssd_offload_path, const std::string &tenant_id,
         bool enable_client_http_server, int client_http_port,
-        const EgmStorePoolOptions *egm_store_pool_options);
+        const EgmStorePoolOptions *egm_store_pool_options,
+        const EgmStorePoolRuntimeDependencies *runtime_dependencies = nullptr);
+    tl::expected<void, ErrorCode> setup_internal_impl(
+        const ConfigDict &config,
+        const EgmStorePoolRuntimeDependencies *runtime_dependencies);
 
-    void PublishClientBufferAllocator(
+    void publish_client_buffer_allocator(
         std::shared_ptr<ClientBufferAllocator> allocator);
-    std::optional<BufferHandle> AllocateClientBuffer(size_t size);
-    tl::expected<void, ErrorCode> ReleaseEgmStorePoolAllocatorView(
+    std::optional<BufferHandle> allocate_client_buffer(size_t size);
+    tl::expected<void, ErrorCode> release_egm_store_pool_allocator_view(
         const std::function<void()> &after_exchange_for_test = {});
 
     // Tracks allocator ownership independently of the exported allocation
     // records so setup cannot overwrite a cleanup-pending allocator.
     bool egm_store_pool_allocator_installed_ = false;
-
-    // Test-binary-only fault injection forwarded to Client immediately before
-    // EGM Store Pool mount publication. Client invokes it only after the real
-    // TE registration succeeds and before the Master RPC. It is deliberately
-    // private and has no ConfigDict/environment surface.
-    std::function<std::optional<ErrorCode>(const Segment &)>
-        egm_store_pool_master_mount_failure_for_test_;
 
     std::unordered_map<std::string, MountedSegmentRecord>
         mounted_segment_records_;

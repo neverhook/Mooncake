@@ -43,10 +43,14 @@ class TransferEngineOperationStateTestPeer {
         bool requires_periodic_status_polling,
         std::function<Status(BatchID, size_t, TransferStatus&)> status_query,
         std::function<Status(BatchID)> batch_releaser) {
+        TransferEngineOperationState::TestDependencies dependencies;
+        dependencies.requires_periodic_status_polling =
+            requires_periodic_status_polling;
+        dependencies.status_query = std::move(status_query);
+        dependencies.batch_releaser = std::move(batch_releaser);
         auto state =
             std::shared_ptr<OperationState>(new TransferEngineOperationState(
-                batch_id, batch_size, requires_periodic_status_polling,
-                std::move(status_query), std::move(batch_releaser)));
+                batch_id, batch_size, std::move(dependencies)));
         return TransferFuture(std::move(state));
     }
 };

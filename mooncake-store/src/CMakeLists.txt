@@ -28,6 +28,7 @@ set(MOONCAKE_STORE_SOURCES
     aligned_client_buffer.cpp
     egm_store_pool.cpp
     egm_store_pool_orchestrator.cpp
+    egm_store_pool_runtime.cpp
     real_client.cpp
     dummy_client.cpp
     uds_transport.cpp

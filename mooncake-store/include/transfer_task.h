@@ -221,8 +221,8 @@ class TransferEngineOperationState : public OperationState {
 
     ~TransferEngineOperationState() {
 #ifdef USE_EVENT_DRIVEN_COMPLETION
-        if (batch_releaser_for_test_) {
-            batch_releaser_for_test_(batch_id_);
+        if (test_dependencies_) {
+            test_dependencies_->batch_releaser(batch_id_);
             return;
         }
 #endif
@@ -241,22 +241,22 @@ class TransferEngineOperationState : public OperationState {
 #ifdef USE_EVENT_DRIVEN_COMPLETION
     friend class TransferEngineOperationStateTestPeer;
 
+    struct TestDependencies {
+        bool requires_periodic_status_polling = false;
+        std::function<Status(BatchID, size_t, TransferStatus&)> status_query;
+        std::function<Status(BatchID)> batch_releaser;
+    };
+
     // Narrow dependency seam for the event-driven Future/CV unit tests. The
     // production constructor above continues to call TransferEngine directly.
-    TransferEngineOperationState(
-        BatchID batch_id, size_t batch_size,
-        bool requires_periodic_status_polling_for_test,
-        std::function<Status(BatchID, size_t, TransferStatus&)>
-            status_query_for_test,
-        std::function<Status(BatchID)> batch_releaser_for_test)
+    TransferEngineOperationState(BatchID batch_id, size_t batch_size,
+                                 TestDependencies dependencies)
         : engine_(nullptr),
           batch_id_(batch_id),
           batch_size_(batch_size),
           start_ts_(getCurrentTimeInMilli()),
-          requires_periodic_status_polling_for_test_(
-              requires_periodic_status_polling_for_test),
-          status_query_for_test_(std::move(status_query_for_test)),
-          batch_releaser_for_test_(std::move(batch_releaser_for_test)) {}
+          test_dependencies_(
+              std::make_unique<TestDependencies>(std::move(dependencies))) {}
 #endif
 
     /**
@@ -273,10 +273,7 @@ class TransferEngineOperationState : public OperationState {
     size_t batch_size_;
     const int64_t start_ts_;
 #ifdef USE_EVENT_DRIVEN_COMPLETION
-    bool requires_periodic_status_polling_for_test_ = false;
-    std::function<Status(BatchID, size_t, TransferStatus&)>
-        status_query_for_test_;
-    std::function<Status(BatchID)> batch_releaser_for_test_;
+    std::unique_ptr<TestDependencies> test_dependencies_;
 #endif
 };
 

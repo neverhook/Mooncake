@@ -94,7 +94,7 @@ if(USE_EVENT_DRIVEN_COMPLETION)
            COMMAND $<TARGET_FILE:transfer_task_test>
                    --gtest_filter=TransferEngineEventDrivenCompletionTest.*)
   set_tests_properties(nvlink_event_driven_completion_test
-                       PROPERTIES LABELS "egm_store_pool_unit")
+                       PROPERTIES LABELS "nvlink_event_driven_completion")
 endif()
 add_store_test(tenant_quota_test tenant_quota_test.cpp)
 add_store_test(segment_test segment_test.cpp)
@@ -132,7 +132,23 @@ target_include_directories(egm_store_pool_orchestrator_test
 set_tests_properties(
   egm_store_pool_config_test egm_store_pool_setup_test
   egm_store_pool_orchestrator_test egm_store_pool_store_test
-  client_integration_test PROPERTIES LABELS "egm_store_pool_unit")
+  PROPERTIES LABELS "egm_store_pool_unit")
+add_test(
+  NAME egm_store_pool_client_compensation_test
+  COMMAND
+    $<TARGET_FILE:client_integration_test>
+    --gtest_filter=ClientIntegrationTest.MountSegmentMasterFailureCompensatesTransferEngineRegistration
+)
+set_tests_properties(egm_store_pool_client_compensation_test
+                     PROPERTIES LABELS "egm_store_pool_unit")
+add_test(
+  NAME nvlink_initialization_test
+  COMMAND
+    $<TARGET_FILE:client_integration_test>
+    --gtest_filter=ClientIntegrationTest.NvlinkInitializationWithAutoDiscoveryEnabled:ClientIntegrationTest.NvlinkInitializationWithAutoDiscoveryDisabled:ClientIntegrationTest.NvlinkInitializationWithAutoDiscoveryDisabledRejectsUnsupportedBuild
+)
+set_tests_properties(nvlink_initialization_test
+                     PROPERTIES LABELS "nvlink_initialization")
 if(USE_MNNVL
    AND USE_CUDA
    AND NOT USE_HIP)
@@ -150,7 +166,13 @@ add_store_test(host_port_fix_test host_port_fix_test.cpp)
 add_store_test(client_metrics_test client_metrics_test.cpp)
 add_store_test(ssd_metrics_test ssd_metrics_test.cpp)
 add_store_test(serializer_test serializer_test.cpp)
-set_tests_properties(client_metrics_test serializer_test
+add_test(
+  NAME egm_store_pool_metrics_test
+  COMMAND
+    $<TARGET_FILE:client_metrics_test>
+    --gtest_filter=ClientMetricsTest.EgmStorePoolMetricsUseBoundedLabels:ClientMetricsTest.EgmStorePoolMetricsIgnoreAmbientClientLabels:ClientMetricsTest.ZeroDurationStagePreservesEarlierMetrics:ClientMetricsTest.MountCompensationFailureMetricIsUnlabelled
+)
+set_tests_properties(egm_store_pool_metrics_test
                      PROPERTIES LABELS "egm_store_pool_unit")
 add_store_test(
   embedded_snapshot_catalog_store_test

@@ -192,19 +192,39 @@ jobs:
       run: |
         cd build
         export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
-        discovered_tests="$(ctest -N -L egm_store_pool_unit)"
-        printf '%s\n' "$discovered_tests"
-        test_count="$(
-          awk '$1 == "Total" && $2 == "Tests:" {print $3}' \
-            <<<"$discovered_tests"
-        )"
-        if [[ ! "$test_count" =~ ^[1-9][0-9]*$ ]]; then
-          echo "::error::No egm_store_pool_unit tests were discovered"
-          exit 1
-        fi
+        assert_ctest_names() {
+          local label="$1"
+          shift
+          local discovered actual expected
+          discovered="$(ctest -N -L "$label")"
+          printf '%s\n' "$discovered"
+          actual="$(
+            sed -nE 's/^[[:space:]]*Test +#[0-9]+: (.*)$/\1/p' \
+              <<<"$discovered" | sort
+          )"
+          expected="$(printf '%s\n' "$@" | sort)"
+          if [[ "$actual" != "$expected" ]]; then
+            echo "::error::$label discovered an unexpected test set"
+            diff -u <(printf '%s\n' "$expected") \
+              <(printf '%s\n' "$actual") || true
+            exit 1
+          fi
+        }
+        assert_ctest_names egm_store_pool_unit \
+          egm_store_pool_client_compensation_test \
+          egm_store_pool_config_test \
+          egm_store_pool_metrics_test \
+          egm_store_pool_orchestrator_test \
+          egm_store_pool_setup_test \
+          egm_store_pool_store_test
+        assert_ctest_names nvlink_initialization \
+          nvlink_initialization_test
         MC_METADATA_SERVER=http://127.0.0.1:8080/metadata \
           DEFAULT_KV_LEASE_TTL=500 \
           ctest -L egm_store_pool_unit --output-on-failure
+        MC_METADATA_SERVER=http://127.0.0.1:8080/metadata \
+          DEFAULT_KV_LEASE_TTL=500 \
+          ctest -L nvlink_initialization --output-on-failure
       shell: bash
 
     - name: Test (in build env) with coverage
@@ -212,7 +232,7 @@ jobs:
         cd build
         export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
         ldconfig -v || echo "always continue"
-        MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 ctest -j -LE egm_store_pool_unit --output-on-failure
+        MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 ctest -j -LE 'egm_store_pool_unit|nvlink_initialization' --output-on-failure
       shell: bash
 
     - name: Drain HTTP E2E test
@@ -465,17 +485,42 @@ jobs:
         export LD_LIBRARY_PATH="$cuda_driver_stub_runtime:$(dirname "$cuda_driver_stub"):/usr/local/cuda/lib64:/usr/local/lib:${LD_LIBRARY_PATH:-}"
 
         cd build
-        for label in nvlink_vmm_unit egm_store_pool_unit; do
-          discovered_tests="$(ctest -N -L "$label")"
-          printf '%s\n' "$discovered_tests"
-          test_count="$(
-            awk '$1 == "Total" && $2 == "Tests:" {print $3}' \
-              <<<"$discovered_tests"
+        assert_ctest_names() {
+          local label="$1"
+          shift
+          local discovered actual expected
+          discovered="$(ctest -N -L "$label")"
+          printf '%s\n' "$discovered"
+          actual="$(
+            sed -nE 's/^[[:space:]]*Test +#[0-9]+: (.*)$/\1/p' \
+              <<<"$discovered" | sort
           )"
-          if [[ ! "$test_count" =~ ^[1-9][0-9]*$ ]]; then
-            echo "::error::No $label tests were discovered"
+          expected="$(printf '%s\n' "$@" | sort)"
+          if [[ "$actual" != "$expected" ]]; then
+            echo "::error::$label discovered an unexpected test set"
+            diff -u <(printf '%s\n' "$expected") \
+              <(printf '%s\n' "$actual") || true
             exit 1
           fi
+        }
+        assert_ctest_names nvlink_vmm_unit \
+          nvlink_transport_fake_driver_test \
+          nvlink_transport_metrics_test \
+          nvlink_vmm_allocation_test \
+          nvlink_vmm_transfer_metadata_test
+        assert_ctest_names egm_store_pool_unit \
+          egm_store_pool_client_compensation_test \
+          egm_store_pool_config_test \
+          egm_store_pool_metrics_test \
+          egm_store_pool_orchestrator_test \
+          egm_store_pool_setup_test \
+          egm_store_pool_store_test
+        assert_ctest_names nvlink_initialization \
+          nvlink_initialization_test
+        assert_ctest_names nvlink_event_driven_completion \
+          nvlink_event_driven_completion_test
+        for label in nvlink_vmm_unit egm_store_pool_unit \
+          nvlink_initialization nvlink_event_driven_completion; do
           MC_METADATA_SERVER=http://127.0.0.1:8080/metadata \
             ctest -L "$label" --output-on-failure
         done

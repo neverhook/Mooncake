@@ -745,8 +745,8 @@ void TransferEngineOperationState::check_task_status() {
     for (size_t i = 0; i < batch_size_; ++i) {
         TransferStatus status;
 #ifdef USE_EVENT_DRIVEN_COMPLETION
-        Status s = status_query_for_test_
-                       ? status_query_for_test_(batch_id_, i, status)
+        Status s = test_dependencies_
+                       ? test_dependencies_->status_query(batch_id_, i, status)
                        : engine_->getTransferStatus(batch_id_, i, status);
 #else
         Status s = engine_->getTransferStatus(batch_id_, i, status);
@@ -838,8 +838,8 @@ void TransferEngineOperationState::wait_for_completion() {
     constexpr std::chrono::milliseconds progress_interval(1);
 
     const bool requires_periodic_status_polling =
-        status_query_for_test_
-            ? requires_periodic_status_polling_for_test_
+        test_dependencies_
+            ? test_dependencies_->requires_periodic_status_polling
             : std::any_of(batch_desc.task_list.begin(),
                           batch_desc.task_list.end(),
                           [](const Transport::TransferTask& task) {

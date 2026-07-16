@@ -15,100 +15,23 @@
 #include <gtest/gtest.h>
 #include <infiniband/verbs.h>
 
-#include <algorithm>
 #include <cerrno>
-#include <cctype>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
-#include <limits>
 #include <memory>
 #include <set>
 #include <string>
 
-#include <sys/stat.h>
-
 #include "cuda_alike.h"
+#include "nvlink_hardware_test_utils.h"
 #include "transport/nvlink_transport/nvlink_transport.h"
 
 namespace mooncake {
 namespace {
 
 constexpr size_t kRegistrationBytes = 2U << 20;
-
-bool ParseStrictMode(const char* name, bool& strict, std::string& error) {
-    strict = false;
-    const char* value = std::getenv(name);
-    if (value == nullptr || std::string(value) == "0") return true;
-    if (std::string(value) == "1") {
-        strict = true;
-        return true;
-    }
-    error = std::string(name) + " must be 0 or 1";
-    return false;
-}
-
-bool ParseNonNegativeInt(const std::string& text, int& value) {
-    if (text.empty()) return false;
-    size_t parsed = 0;
-    try {
-        const long result = std::stol(text, &parsed, 10);
-        if (parsed != text.size() || result < 0 ||
-            result > std::numeric_limits<int>::max()) {
-            return false;
-        }
-        value = static_cast<int>(result);
-        return true;
-    } catch (...) {
-        return false;
-    }
-}
-
-bool IsOnlineNumaNode(int node, std::string& error) {
-    const std::string node_path =
-        "/sys/devices/system/node/node" + std::to_string(node);
-    struct stat node_stat{};
-    if (stat(node_path.c_str(), &node_stat) != 0 ||
-        !S_ISDIR(node_stat.st_mode)) {
-        error = "NUMA node " + std::to_string(node) + " is absent from sysfs";
-        return false;
-    }
-
-    std::ifstream online(node_path + "/online");
-    if (!online.is_open()) return true;
-    int flag = 0;
-    if (!(online >> flag) || flag != 1) {
-        error = "NUMA node " + std::to_string(node) + " is not online";
-        return false;
-    }
-    return true;
-}
-
-bool DeviceNumaNodeFromSysfs(int device, int& node, std::string& error) {
-    char pci_bus_id[64] = {};
-    cudaError_t result =
-        cudaDeviceGetPCIBusId(pci_bus_id, sizeof(pci_bus_id), device);
-    if (result != cudaSuccess) {
-        error = "cudaDeviceGetPCIBusId failed for visible GPU " +
-                std::to_string(device) + ": " + cudaGetErrorString(result);
-        return false;
-    }
-
-    std::string bdf(pci_bus_id);
-    std::transform(bdf.begin(), bdf.end(), bdf.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
-    if (std::count(bdf.begin(), bdf.end(), ':') == 1) bdf = "0000:" + bdf;
-
-    std::ifstream numa_file("/sys/bus/pci/devices/" + bdf + "/numa_node");
-    if (!numa_file.is_open() || !(numa_file >> node) || node < 0) {
-        error = "visible GPU " + std::to_string(device) +
-                " has no usable PCI-to-NUMA mapping in sysfs";
-        return false;
-    }
-    return IsOnlineNumaNode(node, error);
-}
 
 bool SelectHostNumaNode(int& node, std::string& source, std::string& error) {
     int device_count = 0;
@@ -125,13 +48,13 @@ bool SelectHostNumaNode(int& node, std::string& source, std::string& error) {
 
     const char* override_node = std::getenv("MC_NVLINK_VMM_TEST_NODE");
     if (override_node != nullptr && *override_node != '\0') {
-        if (!ParseNonNegativeInt(override_node, node)) {
+        if (!nvlink_test::parseNonNegativeInt(override_node, node)) {
             error =
                 "MC_NVLINK_VMM_TEST_NODE must be a non-negative "
                 "integer";
             return false;
         }
-        if (!IsOnlineNumaNode(node, error)) return false;
+        if (!nvlink_test::isOnlineNumaNode(node, error)) return false;
         source = "MC_NVLINK_VMM_TEST_NODE";
         return true;
     }
@@ -139,7 +62,8 @@ bool SelectHostNumaNode(int& node, std::string& source, std::string& error) {
     std::set<int> gpu_nodes;
     for (int device = 0; device < device_count; ++device) {
         int gpu_node = -1;
-        if (!DeviceNumaNodeFromSysfs(device, gpu_node, error)) return false;
+        if (!nvlink_test::deviceNumaNodeFromSysfs(device, gpu_node, error))
+            return false;
         gpu_nodes.insert(gpu_node);
     }
     if (gpu_nodes.empty()) {
@@ -297,8 +221,8 @@ int ReadRdmaDeviceNumaNode(const std::string& device_name) {
 TEST(NvlinkVmmRdmaSmokeTest, VerbsCanRegisterProviderVmmAllocation) {
     bool strict = false;
     std::string prerequisite_error;
-    ASSERT_TRUE(ParseStrictMode("MC_REQUIRE_NVLINK_VMM_RDMA", strict,
-                                prerequisite_error))
+    ASSERT_TRUE(nvlink_test::parseStrictMode("MC_REQUIRE_NVLINK_VMM_RDMA",
+                                             strict, prerequisite_error))
         << prerequisite_error;
 
     int host_numa_node = -1;

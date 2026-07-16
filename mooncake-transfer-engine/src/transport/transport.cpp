@@ -20,6 +20,28 @@
 namespace mooncake {
 thread_local static Transport::ThreadLocalSliceCache tl_slice_cache;
 
+void Transport::markSubmissionFailed(TransferTask &task) {
+    if (__atomic_exchange_n(&task.submission_failed, true, __ATOMIC_ACQ_REL)) {
+        return;
+    }
+    __atomic_store_n(&task.is_finished, true, __ATOMIC_RELEASE);
+
+    if (task.batch_id == 0) return;
+    auto &batch_desc = toBatchDesc(task.batch_id);
+    batch_desc.has_failure.store(true, std::memory_order_release);
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+    auto previous =
+        batch_desc.finished_task_count.fetch_add(1, std::memory_order_relaxed);
+    if (previous + 1 == batch_desc.batch_size) {
+        {
+            std::lock_guard<std::mutex> lock(batch_desc.completion_mutex);
+            batch_desc.is_finished.store(true, std::memory_order_release);
+        }
+        batch_desc.completion_cv.notify_all();
+    }
+#endif
+}
+
 Transport::ThreadLocalSliceCache &Transport::getSliceCache() {
     return tl_slice_cache;
 }

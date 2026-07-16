@@ -138,11 +138,7 @@ if(USE_MNNVL
   set_tests_properties(
     nvlink_transport_fabric_hbm_test nvlink_transport_ipc_cuda_malloc_test
     PROPERTIES LABELS "nvlink_hbm_regression;nvlink_vmm_hardware")
-endif()
 
-if(USE_MNNVL
-   AND USE_CUDA
-   AND NOT USE_HIP)
   add_executable(nvlink_vmm_allocation_test
                  ${WORKSPACE}/nvlink_vmm_allocation_test.cpp)
   target_link_libraries(nvlink_vmm_allocation_test PUBLIC transfer_engine gtest

@@ -88,6 +88,11 @@ class NvlinkTransport : public Transport {
     };
 
     struct ConsumerMetrics;
+    struct ConsumerMetricsDeleter {
+        void operator()(ConsumerMetrics* metrics) const;
+    };
+    using ConsumerMetricsPtr =
+        std::unique_ptr<ConsumerMetrics, ConsumerMetricsDeleter>;
 
     void observeCacheLookup(bool hit);
     void observeLazyImportLatency(uint64_t duration_us);
@@ -95,6 +100,7 @@ class NvlinkTransport : public Transport {
     void observeTransferResult(TransferRequest::OpCode operation, bool success);
     bool observeTransferResultOnce(TransferTask& task, bool success);
     void finalizeSubmissionFailure(TransferTask& task, bool copy_failure);
+    static ConsumerMetricsPtr createConsumerMetrics();
 
     std::atomic_bool running_;
 
@@ -127,6 +133,10 @@ class NvlinkTransport : public Transport {
     int publishLocalRegistration(void* registration_addr,
                                  const BufferDesc& descriptor,
                                  bool update_metadata);
+    int addMetadataBuffer(const BufferDesc& descriptor, bool update_metadata);
+    int removeMetadataBuffer(void* addr, bool update_metadata);
+    std::shared_ptr<SegmentDesc> getSegmentDesc(uint64_t target_id);
+    static bool supportsFabricMemory();
 #if defined(USE_MNNVL) && defined(USE_CUDA)
     NvlinkVmmAllocation::DriverApi fabric_driver_api_;
     struct FabricMappingCleanup {
@@ -138,29 +148,31 @@ class NvlinkTransport : public Transport {
         bool mapped = false;
     };
     class FabricMappingAttempt;
-    bool CleanupFabricMapping(FabricMappingCleanup& cleanup,
+    bool cleanupFabricMapping(FabricMappingCleanup& cleanup,
                               const char* failure_stage) noexcept;
-    bool RetryQuarantinedFabricMappings() noexcept;
-    void ReleaseOrQuarantineFabricMapping(FabricMappingCleanup cleanup,
+    bool retryQuarantinedFabricMappings() noexcept;
+    void releaseOrQuarantineFabricMapping(FabricMappingCleanup cleanup,
                                           const char* failure_stage) noexcept;
-    static void PreserveProcessLifetimeFabricCleanup(
+    static void preserveProcessLifetimeFabricCleanup(
         FabricMappingCleanup cleanup) noexcept;
     std::vector<FabricMappingCleanup> quarantined_fabric_mappings_;
     class RetainedHandleGuard;
-    bool RetryQuarantinedRetainedHandles();
-    void ReleaseOrQuarantineRetainedHandle(CUmemGenericAllocationHandle handle,
+    bool retryQuarantinedRetainedHandles();
+    void releaseOrQuarantineRetainedHandle(CUmemGenericAllocationHandle handle,
                                            const char* failure_stage) noexcept;
     std::vector<uint64_t> quarantined_retained_handles_;
-    static bool TrackPinnedVmmAllocation(
+    static bool trackPinnedVmmAllocation(
         std::unique_ptr<NvlinkVmmAllocation> owner);
-    static bool ReleasePinnedVmmAllocation(void* ptr);
+    static bool releasePinnedVmmAllocation(void* ptr);
 #endif
 
-    std::function<int(const BufferDesc&, bool)> add_buffer_for_testing_;
-    std::function<int(void*, bool)> remove_buffer_for_testing_;
-    std::function<std::shared_ptr<SegmentDesc>(uint64_t)>
-        get_segment_for_testing_;
-    std::unique_ptr<ConsumerMetrics> consumer_metrics_;
+    struct TestDependencies {
+        std::function<int(const BufferDesc&, bool)> addBuffer;
+        std::function<int(void*, bool)> removeBuffer;
+        std::function<std::shared_ptr<SegmentDesc>(uint64_t)> getSegment;
+    };
+    std::unique_ptr<TestDependencies> test_dependencies_;
+    ConsumerMetricsPtr consumer_metrics_;
 };
 
 }  // namespace mooncake

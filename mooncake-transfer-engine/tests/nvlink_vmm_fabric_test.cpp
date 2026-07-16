@@ -17,13 +17,10 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
-#include <fstream>
 #include <functional>
-#include <limits>
 #include <memory>
 #include <set>
 #include <sstream>
@@ -32,10 +29,9 @@
 #include <utility>
 #include <vector>
 
-#include <sys/stat.h>
-
 #include "cuda_alike.h"
 #include "error.h"
+#include "nvlink_hardware_test_utils.h"
 #include "transfer_engine.h"
 #include "transfer_metadata.h"
 #include "transport/nvlink_transport/nvlink_transport.h"
@@ -136,34 +132,6 @@ struct HardwareSelection {
     std::string source;
 };
 
-bool ParseStrictMode(const char* name, bool& strict, std::string& error) {
-    strict = false;
-    const char* value = std::getenv(name);
-    if (value == nullptr || std::string(value) == "0") return true;
-    if (std::string(value) == "1") {
-        strict = true;
-        return true;
-    }
-    error = std::string(name) + " must be 0 or 1";
-    return false;
-}
-
-bool ParseNonNegativeInt(const std::string& text, int& value) {
-    if (text.empty()) return false;
-    size_t parsed = 0;
-    try {
-        const long result = std::stol(text, &parsed, 10);
-        if (parsed != text.size() || result < 0 ||
-            result > std::numeric_limits<int>::max()) {
-            return false;
-        }
-        value = static_cast<int>(result);
-        return true;
-    } catch (...) {
-        return false;
-    }
-}
-
 bool ParseNumaNodeList(const std::string& text, std::vector<int>& nodes,
                        std::string& error) {
     if (text.empty()) {
@@ -176,7 +144,7 @@ bool ParseNumaNodeList(const std::string& text, std::vector<int>& nodes,
     std::string token;
     while (std::getline(input, token, ',')) {
         int node = -1;
-        if (!ParseNonNegativeInt(token, node)) {
+        if (!nvlink_test::parseNonNegativeInt(token, node)) {
             error =
                 "NUMA node list must contain comma-separated "
                 "non-negative integers";
@@ -190,56 +158,6 @@ bool ParseNumaNodeList(const std::string& text, std::vector<int>& nodes,
     }
     nodes.assign(unique_nodes.begin(), unique_nodes.end());
     return true;
-}
-
-bool IsOnlineNumaNode(int node, std::string& error) {
-    const std::string node_path =
-        "/sys/devices/system/node/node" + std::to_string(node);
-    struct stat node_stat{};
-    if (stat(node_path.c_str(), &node_stat) != 0 ||
-        !S_ISDIR(node_stat.st_mode)) {
-        error = "NUMA node " + std::to_string(node) + " is absent from sysfs";
-        return false;
-    }
-
-    std::ifstream online(node_path + "/online");
-    if (!online.is_open()) {
-        // Linux commonly omits node0/online. An existing node directory is
-        // online in that case.
-        return true;
-    }
-    int flag = 0;
-    if (!(online >> flag) || flag != 1) {
-        error = "NUMA node " + std::to_string(node) + " is not online";
-        return false;
-    }
-    return true;
-}
-
-bool DeviceNumaNodeFromSysfs(int device, int& node, std::string& error) {
-    char pci_bus_id[64] = {};
-    cudaError_t result =
-        cudaDeviceGetPCIBusId(pci_bus_id, sizeof(pci_bus_id), device);
-    if (result != cudaSuccess) {
-        error = "cudaDeviceGetPCIBusId failed for visible GPU " +
-                std::to_string(device) + ": " + cudaGetErrorString(result);
-        return false;
-    }
-
-    std::string bdf(pci_bus_id);
-    std::transform(bdf.begin(), bdf.end(), bdf.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
-    if (std::count(bdf.begin(), bdf.end(), ':') == 1) bdf = "0000:" + bdf;
-
-    const std::string numa_path = "/sys/bus/pci/devices/" + bdf + "/numa_node";
-    std::ifstream numa_file(numa_path);
-    if (!numa_file.is_open() || !(numa_file >> node) || node < 0) {
-        error = "visible GPU " + std::to_string(device) +
-                " has no usable PCI-to-NUMA mapping in sysfs";
-        return false;
-    }
-    return IsOnlineNumaNode(node, error);
 }
 
 bool SelectHardware(HardwareSelection& selection, std::string& error) {
@@ -274,20 +192,20 @@ bool SelectHardware(HardwareSelection& selection, std::string& error) {
         if (!ParseNumaNodeList(override_nodes, selection.numa_nodes, error))
             return false;
         for (int node : selection.numa_nodes) {
-            if (!IsOnlineNumaNode(node, error)) return false;
+            if (!nvlink_test::isOnlineNumaNode(node, error)) return false;
         }
         selection.source = "MC_NVLINK_VMM_TEST_NODES";
         return true;
     }
     if (has_single_node) {
         int node = -1;
-        if (!ParseNonNegativeInt(override_node, node)) {
+        if (!nvlink_test::parseNonNegativeInt(override_node, node)) {
             error =
                 "MC_NVLINK_VMM_TEST_NODE must be a non-negative "
                 "integer";
             return false;
         }
-        if (!IsOnlineNumaNode(node, error)) return false;
+        if (!nvlink_test::isOnlineNumaNode(node, error)) return false;
         selection.numa_nodes = {node};
         selection.source = "MC_NVLINK_VMM_TEST_NODE";
         return true;
@@ -296,7 +214,8 @@ bool SelectHardware(HardwareSelection& selection, std::string& error) {
     std::set<int> gpu_nodes;
     for (int device : selection.devices) {
         int node = -1;
-        if (!DeviceNumaNodeFromSysfs(device, node, error)) return false;
+        if (!nvlink_test::deviceNumaNodeFromSysfs(device, node, error))
+            return false;
         gpu_nodes.insert(node);
     }
     if (gpu_nodes.empty()) {
@@ -531,8 +450,8 @@ std::string RunTransfer(TransferEngine& engine, TransferRequest::OpCode opcode,
 TEST(NvlinkVmmFabricTest, CpuAllVisibleGpusAndColdWarmFabricPath) {
     bool strict = false;
     std::string prerequisite_error;
-    ASSERT_TRUE(
-        ParseStrictMode("MC_REQUIRE_MNNVL_FABRIC", strict, prerequisite_error))
+    ASSERT_TRUE(nvlink_test::parseStrictMode("MC_REQUIRE_MNNVL_FABRIC", strict,
+                                             prerequisite_error))
         << prerequisite_error;
 
     HardwareSelection hardware;

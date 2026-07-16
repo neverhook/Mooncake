@@ -99,9 +99,11 @@ class NvlinkTransportTestPeer {
             get_segment = {}) {
         transport.use_fabric_mem_ = true;
         transport.fabric_driver_api_ = std::move(driver_api);
-        transport.add_buffer_for_testing_ = std::move(add);
-        transport.remove_buffer_for_testing_ = std::move(remove);
-        transport.get_segment_for_testing_ = std::move(get_segment);
+        transport.test_dependencies_ =
+            std::make_unique<NvlinkTransport::TestDependencies>();
+        transport.test_dependencies_->addBuffer = std::move(add);
+        transport.test_dependencies_->removeBuffer = std::move(remove);
+        transport.test_dependencies_->getSegment = std::move(get_segment);
     }
 
     static int registerRemote(NvlinkTransport& transport, void* addr,
@@ -148,8 +150,10 @@ class NvlinkTransportTestPeer {
         std::function<int(const TransferMetadata::BufferDesc&, bool)> add,
         std::function<int(void*, bool)> remove) {
         transport.use_fabric_mem_ = false;
-        transport.add_buffer_for_testing_ = std::move(add);
-        transport.remove_buffer_for_testing_ = std::move(remove);
+        transport.test_dependencies_ =
+            std::make_unique<NvlinkTransport::TestDependencies>();
+        transport.test_dependencies_->addBuffer = std::move(add);
+        transport.test_dependencies_->removeBuffer = std::move(remove);
         NvlinkTransport::LocalRegistration registration;
         registration.requested_addr = registration_addr;
         registration.requested_length = 4096;

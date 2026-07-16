@@ -56,7 +56,7 @@ class NvlinkTransportTestPeer {
 
     static bool TrackPinnedVmmAllocation(
         std::unique_ptr<NvlinkVmmAllocation> allocation) {
-        return NvlinkTransport::TrackPinnedVmmAllocation(std::move(allocation));
+        return NvlinkTransport::trackPinnedVmmAllocation(std::move(allocation));
     }
 
     static bool RetryCleanupPendingOwners() {

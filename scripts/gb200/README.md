@@ -1,0 +1,215 @@
+# GB200/NVL72 Store EGM Provider/Consumer validation
+
+This directory is validation-only. It lives on the dedicated
+`codex/egm-store-pool-gb200-validation` branch and is not part of the Store PR.
+The branch is based directly on the Store PR head, which in turn contains the
+full #2966 HOST_NUMA/NvlinkTransport prerequisite.
+
+The harness proves these real Store paths on two GB200 nodes in one NVL72
+supernode:
+
+1. Consumer HBM -> Provider EGM through `put_from`.
+2. Provider EGM -> Consumer HBM through `get_into`.
+3. SHA-256 and byte-for-byte correctness for every transfer.
+4. Consumer buffer unregister/close and Provider pool teardown/unpublication.
+5. Per-transfer elapsed time, per-stream GiB/s, and multi-GPU concurrent-window
+   GiB/s in machine-readable JSONL.
+
+The Provider uses `enable_egm_store_pool=true`, `protocol=nvlink`, a nonzero
+`global_segment_size`, and `local_buffer_size=0`. Consumers contribute no Store
+capacity and also use `local_buffer_size=0`. The harness starts Mooncake Master
+with its embedded HTTP metadata service, so it does not require etcd.
+
+## Prerequisites
+
+- Two GB200 nodes in the same NVL72 supernode, with Fabric/IMEX working across
+  the nodes.
+- The same checkout, branch head, absolute build path, and config file contents
+  on both nodes.
+- CUDA toolkit, Ninja, CMake, Python 3, curl, and Mooncake build dependencies.
+- The configured Master RPC, metadata HTTP, admin HTTP, Provider, and Consumer
+  ports must be reachable between the two nodes.
+
+The default 600 MiB Provider pool is sufficient for four simultaneous 128 MiB
+objects. If `DEVICES` or the maximum payload grows, increase the pool so its
+effective capacity remains above `device_count * maximum_payload`.
+
+## 1. Check out the validation branch on both nodes
+
+```bash
+git fetch neverhook codex/egm-store-pool-gb200-validation
+git switch -c codex/egm-store-pool-gb200-validation \
+  --track neverhook/codex/egm-store-pool-gb200-validation
+git rev-parse HEAD
+```
+
+The SHA printed on Node A and Node B must be identical. The harness records this
+SHA in Provider and Consumer evidence and refuses to combine mismatched runs.
+
+Create the same config on both nodes:
+
+```bash
+cp scripts/gb200/egm_store_gb200.conf.example egm-store-gb200.conf
+vim egm-store-gb200.conf
+```
+
+Required edits are `NODE_A_IP`, `NODE_B_IP`, `RUN_ID`, and normally
+`BUILD_DIR`. Use a new `RUN_ID` for every acceptance run.
+
+Inspect the fully resolved configuration on both nodes:
+
+```bash
+scripts/gb200/egm_store_gb200.sh \
+  --config ./egm-store-gb200.conf print-config
+```
+
+## 2. Build and preflight both nodes
+
+Run on Node A and Node B:
+
+```bash
+scripts/gb200/egm_store_gb200.sh \
+  --config ./egm-store-gb200.conf build
+
+scripts/gb200/egm_store_gb200.sh \
+  --config ./egm-store-gb200.conf preflight
+```
+
+`build` compiles the Master, Python Store binding, Store EGM pool test, and the
+two #2966 focused tests, then runs `nvlink_vmm_unit`, `egm_store_pool_unit`, and
+the script-level tests. `preflight` records visible GPUs, topology, Fabric
+state, GPU NUMA locality, IMEX devices/daemon, and conflicting environment
+overrides.
+
+When the IMEX daemon runs outside a test container, set
+`MC_IMEX_DAEMON_EXTERNAL=1` only after independently confirming that the host
+daemon is active.
+
+## 3. Start Master and Provider on Node A
+
+```bash
+scripts/gb200/egm_store_gb200.sh \
+  --config ./egm-store-gb200.conf master-start
+
+scripts/gb200/egm_store_gb200.sh \
+  --config ./egm-store-gb200.conf provider-start
+
+scripts/gb200/egm_store_gb200.sh \
+  --config ./egm-store-gb200.conf provider-status
+```
+
+`provider-start` returns only after Store setup succeeds and Master reports the
+mounted EGM chunks and effective capacity. With the default `RESULT_ROOT`, the
+readiness JSON is stored at:
+
+```text
+/tmp/mooncake-egm-gb200/<RUN_ID>/provider.ready.json
+```
+
+If setup fails, collect `provider.log` and `provider-start-diagnose.log` from
+the same directory. Provider setup itself is the strict CUDA Fabric
+allocation/export/registration/publication probe for this Store implementation.
+
+## 4. Run concurrent Consumers on Node B
+
+An optional single-GPU smoke run is useful before the full concurrent gate:
+
+```bash
+scripts/gb200/egm_store_gb200.sh \
+  --config ./egm-store-gb200.conf consumer 0
+```
+
+It uses `THRESHOLD_PAYLOAD_SIZE`, writes separate JSONL/native-log files for
+that GPU, and removes its objects before the full benchmark starts.
+
+Run the full validation:
+
+```bash
+scripts/gb200/egm_store_gb200.sh \
+  --config ./egm-store-gb200.conf bench
+```
+
+Defaults run GPUs `0,1,2,3`, payloads 4 KiB, 1 MiB, 16 MiB, and 128 MiB, with
+four iterations per size. Each result includes fields such as:
+
+```json
+{
+  "event": "transfer_result",
+  "put_duration_ns": 1234567,
+  "put_bandwidth_gib_s": 101.25,
+  "get_duration_ns": 765432,
+  "get_bandwidth_gib_s": 163.31,
+  "sha256": "...",
+  "status": "PASS"
+}
+```
+
+The benchmark writes pure JSONL to `bench.jsonl` and native Store/CUDA logs to
+`bench.stderr.log`. It emits:
+
+- Raw `transfer_result` records for every GPU, size, and iteration.
+- `performance_summary` records with p50/p95/p99 time and per-stream bandwidth.
+- `aggregate_iteration` records where total bytes are divided by the common
+  earliest-start/latest-end operation window across Consumer processes.
+- One final `benchmark_gate` record.
+
+`first` and `steady` mean sequence position only. They do not claim a directly
+observed transport-cache state.
+
+No arbitrary bandwidth threshold is enabled by default. To turn performance
+into a numerical gate, set `MIN_PUT_GIB_S` and `MIN_GET_GIB_S`; they apply to
+steady per-stream p50 at `THRESHOLD_PAYLOAD_SIZE`. Correctness and cleanup are
+always hard gates.
+
+## 5. Stop Provider, verify teardown, and stop Master on Node A
+
+After Node B reports `benchmark_gate: PASS`:
+
+```bash
+scripts/gb200/egm_store_gb200.sh \
+  --config ./egm-store-gb200.conf provider-stop
+
+scripts/gb200/egm_store_gb200.sh \
+  --config ./egm-store-gb200.conf master-stop
+```
+
+`provider-stop` waits for Store `close()`, requires a PASS cleanup record, then
+queries Master and appends a `provider_unpublished: PASS` record only when no
+Provider chunks remain.
+
+## 6. Generate the PR-ready report
+
+Copy the Node A evidence to Node B without modifying it:
+
+```bash
+RUN_ID=egm-gb200-20260807  # replace with the value from your config
+RESULT_DIR=/tmp/mooncake-egm-gb200/${RUN_ID}
+scp NODE_A:${RESULT_DIR}/provider.ready.json \
+  ${RESULT_DIR}/provider.ready.node-a.json
+scp NODE_A:${RESULT_DIR}/provider.log \
+  ${RESULT_DIR}/provider.node-a.log
+```
+
+Then run on Node B:
+
+```bash
+scripts/gb200/egm_store_gb200.sh \
+  --config ./egm-store-gb200.conf report \
+  ${RESULT_DIR}/provider.ready.node-a.json \
+  ${RESULT_DIR}/provider.node-a.log
+```
+
+The generated `${RESULT_DIR}/pr-report.md` is ready to paste into the
+Store PR. Report generation fails if Provider/Consumer SHA or run ID differs,
+the benchmark gate is not PASS, Provider cleanup is missing, or Master still
+contained Provider chunks after teardown.
+
+Keep these raw artifacts with the report:
+
+- Node A: `preflight-*.log`, `master.log`, `provider.log`,
+  `provider.ready.json`, and `provider-start-diagnose.log` when present.
+- Node B: `preflight-*.log`, `bench.jsonl`, `bench.stderr.log`, and
+  `pr-report.md`.
+
+Do not paste a terminal transcript in place of `bench.jsonl`; the report parser
+requires one pure JSONL stream and exactly one final benchmark gate.

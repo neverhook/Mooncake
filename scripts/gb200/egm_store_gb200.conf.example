@@ -1,0 +1,38 @@
+# Copy this file to <repo>/egm-store-gb200.conf on both nodes and edit the
+# required values. Keep the absolute paths and RUN_ID identical on both nodes.
+
+# REQUIRED: Node A runs Master + EGM Provider; Node B runs HBM Consumers.
+NODE_A_IP="CHANGE_ME"
+NODE_B_IP="CHANGE_ME"
+RUN_ID="egm-gb200-CHANGE_ME"
+
+BUILD_DIR="/workspace/Mooncake/build-egm-store-gb200"
+RESULT_ROOT="/tmp/mooncake-egm-gb200"
+
+MASTER_RPC_PORT=50051
+MASTER_ADMIN_PORT=9003
+METADATA_PORT=8079
+PROVIDER_PORT=12345
+CONSUMER_PORT_BASE=12400
+
+EGM_POOL_SIZE="600 MB"
+EGM_NUMA_NODES="auto"
+MC_MAX_MR_SIZE_BYTES=157286400
+MC_IMEX_DAEMON_EXTERNAL=0
+MC_CUDART_LIBRARY=""
+
+DEVICES="0,1,2,3"
+PAYLOAD_SIZES="4096,1048576,16777216,134217728"
+ITERATIONS=4
+
+# Zero records performance without imposing an arbitrary numerical gate.
+# If set, thresholds apply to steady per-stream p50 at THRESHOLD_PAYLOAD_SIZE.
+THRESHOLD_PAYLOAD_SIZE=134217728
+MIN_PUT_GIB_S=0
+MIN_GET_GIB_S=0
+
+BUILD_JOBS=""
+CMAKE_EXTRA_ARGS=""
+MASTER_START_TIMEOUT_SEC=30
+PROVIDER_READINESS_TIMEOUT_SEC=120
+EXTRA_LD_LIBRARY_PATH=""

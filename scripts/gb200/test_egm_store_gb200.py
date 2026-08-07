@@ -1,0 +1,358 @@
+#!/usr/bin/env python3
+
+import argparse
+import contextlib
+import io
+import json
+import pathlib
+import subprocess
+import tempfile
+import unittest
+from unittest import mock
+
+from scripts.gb200 import egm_store_bench as bench
+from scripts.gb200 import egm_store_consumer as consumer
+from scripts.gb200 import egm_store_provider as provider
+
+
+SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent.parent
+
+
+class FakeCuda:
+    def __init__(self):
+        self.memory: dict[int, bytes] = {}
+
+    def copy_from_host(self, pointer: int, payload: bytes) -> None:
+        self.memory[pointer] = payload
+
+    def memset(self, pointer: int, value: int, size: int) -> None:
+        self.memory[pointer] = bytes([value]) * size
+
+    def synchronize(self) -> None:
+        pass
+
+    def copy_to_host(self, pointer: int, size: int) -> bytes:
+        return self.memory[pointer][:size]
+
+
+class FakeStore:
+    def __init__(self, cuda: FakeCuda):
+        self.cuda = cuda
+        self.objects: dict[str, bytes] = {}
+
+    def put_from(self, key: str, pointer: int, size: int) -> int:
+        self.objects[key] = self.cuda.memory[pointer][:size]
+        return 0
+
+    def get_into(self, key: str, pointer: int, size: int) -> int:
+        payload = self.objects[key]
+        self.cuda.memory[pointer] = payload
+        return len(payload)
+
+    def remove(self, key: str, force: bool) -> int:
+        self.objects.pop(key)
+        return 0 if force else -1
+
+
+class EgmStoreGb200Test(unittest.TestCase):
+    def test_bandwidth_conversion(self):
+        self.assertEqual(consumer.bandwidth_gib_s(1024**3, 1_000_000_000), 1.0)
+
+    def test_fake_hbm_egm_round_trip_emits_timed_results(self):
+        cuda = FakeCuda()
+        store = FakeStore(cuda)
+        args = argparse.Namespace(
+            iterations=2,
+            payload_size=4096,
+            device=1,
+            key_prefix="test",
+            run_id="run",
+            source_sha="a" * 40,
+        )
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            records = consumer.run_transfers(store, cuda, args, 100, 200)
+        self.assertEqual(len(records), 2)
+        self.assertEqual(records[0]["sequence_phase"], "first")
+        self.assertEqual(records[1]["sequence_phase"], "steady")
+        self.assertGreater(records[0]["put_duration_ns"], 0)
+        self.assertGreater(records[0]["get_bandwidth_gib_s"], 0)
+        self.assertEqual(store.objects, {})
+        self.assertEqual(len(output.getvalue().splitlines()), 2)
+
+    def test_master_segment_detail_parser(self):
+        detail = "node-a:12345\nUsed(bytes): 0\nCapacity(bytes): 629145600\n"
+        self.assertEqual(
+            provider.parse_segment_detail(detail, "node-a:12345"),
+            (0, 629145600),
+        )
+        with self.assertRaises(ValueError):
+            provider.parse_segment_detail(detail, "wrong:12345")
+
+    def test_failed_setup_still_closes_provider_and_consumer(self):
+        class FailedStore:
+            def __init__(self):
+                self.closed = 0
+
+            def setup(self, _config):
+                return -1
+
+            def close(self):
+                self.closed += 1
+                return 0
+
+        class Module:
+            __file__ = "fake-store.so"
+
+            def __init__(self, instance):
+                self.instance = instance
+
+            def MooncakeDistributedStore(self):
+                return self.instance
+
+        provider_store = FailedStore()
+        with tempfile.TemporaryDirectory() as directory:
+            argv = [
+                "egm_store_provider.py",
+                "--local-hostname",
+                "node-a:12345",
+                "--metadata-server",
+                "http://node-a:8079/metadata",
+                "--master-server",
+                "node-a:50051",
+                "--master-admin-url",
+                "http://node-a:9003",
+                "--run-id",
+                "run",
+                "--source-sha",
+                "a" * 40,
+                "--ready-file",
+                str(pathlib.Path(directory) / "ready.json"),
+            ]
+            with (
+                mock.patch.object(
+                    provider, "import_store_module", return_value=Module(provider_store)
+                ),
+                mock.patch("sys.argv", argv),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(provider.main(), 2)
+        self.assertEqual(provider_store.closed, 1)
+
+        consumer_store = FailedStore()
+        fake_runtime = mock.Mock()
+        argv = [
+            "egm_store_consumer.py",
+            "--local-hostname",
+            "node-b:12400",
+            "--metadata-server",
+            "http://node-a:8079/metadata",
+            "--master-server",
+            "node-a:50051",
+            "--device",
+            "0",
+            "--payload-size",
+            "4096",
+            "--run-id",
+            "run",
+            "--source-sha",
+            "a" * 40,
+        ]
+        with (
+            mock.patch.object(consumer, "CudaRuntime", return_value=fake_runtime),
+            mock.patch.object(
+                consumer, "import_store_module", return_value=Module(consumer_store)
+            ),
+            mock.patch("sys.argv", argv),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(consumer.main(), 1)
+        self.assertEqual(consumer_store.closed, 1)
+
+    def make_child_records(self, cleanup_status: str = "PASS"):
+        run_id = "run"
+        sha = "b" * 40
+        records: list[dict[str, object]] = []
+        for iteration in range(2):
+            start = 1_000_000 + iteration * 100_000
+            records.append(
+                {
+                    "event": "transfer_result",
+                    "status": "PASS",
+                    "run_id": run_id,
+                    "source_sha": sha,
+                    "device": 0,
+                    "iteration": iteration,
+                    "sequence_phase": "first" if iteration == 0 else "steady",
+                    "bytes": 4096,
+                    "sha256": "c" * 64,
+                    "put_path": "consumer_hbm_to_provider_egm",
+                    "put_started_ns": start,
+                    "put_ended_ns": start + 1000,
+                    "put_duration_ns": 1000,
+                    "put_bandwidth_gib_s": 3.0,
+                    "get_path": "provider_egm_to_consumer_hbm",
+                    "get_started_ns": start + 2000,
+                    "get_ended_ns": start + 4000,
+                    "get_duration_ns": 2000,
+                    "get_bandwidth_gib_s": 2.0,
+                }
+            )
+        records.extend(
+            [
+                {"event": "consumer_gate", "status": "PASS"},
+                {"event": "consumer_cleanup", "status": cleanup_status},
+            ]
+        )
+        return records
+
+    def test_benchmark_validation_requires_cleanup(self):
+        records = self.make_child_records()
+        results = bench.validate_consumer_records(records, 0, 4096, 2, "run", "b" * 40)
+        aggregate = bench.aggregate_iteration([results[0]], "put")
+        self.assertEqual(aggregate["window_duration_ns"], 1000)
+        self.assertGreater(aggregate["aggregate_window_gib_s"], 0)
+        with self.assertRaisesRegex(RuntimeError, "clean up"):
+            bench.validate_consumer_records(
+                self.make_child_records("FAIL"), 0, 4096, 2, "run", "b" * 40
+            )
+
+    def test_shell_scripts_parse_and_wrapper_config_is_deterministic(self):
+        scripts = [
+            SCRIPT_DIR / "egm_store_build.sh",
+            SCRIPT_DIR / "egm_store_preflight.sh",
+            SCRIPT_DIR / "egm_store_gb200.sh",
+        ]
+        for script in scripts:
+            subprocess.run(["bash", "-n", str(script)], check=True)
+        wrapper = SCRIPT_DIR / "egm_store_gb200.sh"
+        help_result = subprocess.run(
+            ["bash", str(wrapper), "--help"],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+        )
+        self.assertIn("provider-start", help_result.stdout)
+
+        source = (SCRIPT_DIR / "egm_store_gb200.conf.example").read_text()
+        source = source.replace('NODE_A_IP="CHANGE_ME"', 'NODE_A_IP="192.0.2.10"')
+        source = source.replace('NODE_B_IP="CHANGE_ME"', 'NODE_B_IP="192.0.2.11"')
+        source = source.replace(
+            'RUN_ID="egm-gb200-CHANGE_ME"', 'RUN_ID="egm-gb200-script-test"'
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            config = pathlib.Path(directory) / "config"
+            config.write_text(source)
+            result = subprocess.run(
+                ["bash", str(wrapper), "--config", str(config), "print-config"],
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+                cwd=REPO_ROOT,
+                env={"PATH": str(pathlib.Path("/usr/bin")) + ":/bin"},
+            )
+        self.assertIn("NODE_A_IP=192.0.2.10", result.stdout)
+        self.assertIn("NODE_B_IP=192.0.2.11", result.stdout)
+        self.assertIn("SOURCE_SHA=", result.stdout)
+        self.assertIn("EGM_NUMA_NODES=auto", result.stdout)
+
+    def test_report_requires_matching_teardown_and_renders_performance(self):
+        run_id = "report-run"
+        sha = "d" * 40
+        provider_ready = {
+            "event": "provider_ready",
+            "status": "PASS",
+            "run_id": run_id,
+            "source_sha": sha,
+            "requested_capacity_bytes": 600 * 1024**2,
+            "effective_capacity_bytes": 600 * 1024**2,
+            "master_chunk_count": 4,
+        }
+        provider_records = [
+            {
+                "event": "provider_cleanup",
+                "status": "PASS",
+                "run_id": run_id,
+                "source_sha": sha,
+                "duration_ns": 2_000_000,
+            },
+            {
+                "event": "provider_unpublished",
+                "status": "PASS",
+                "run_id": run_id,
+                "source_sha": sha,
+            },
+        ]
+        benchmark_records = [
+            {
+                "event": "performance_summary",
+                "run_id": run_id,
+                "source_sha": sha,
+                "operation": "put",
+                "path": "consumer_hbm_to_provider_egm",
+                "sequence_phase": "steady",
+                "bytes": 128 * 1024**2,
+                "samples": 4,
+                "duration_p50_us": 1000.0,
+                "bandwidth_p50_gib_s": 125.0,
+            },
+            {
+                "event": "aggregate_iteration",
+                "run_id": run_id,
+                "source_sha": sha,
+                "operation": "put",
+                "sequence_phase": "steady",
+                "bytes_per_device": 128 * 1024**2,
+                "aggregate_window_gib_s": 400.0,
+            },
+            {
+                "event": "benchmark_gate",
+                "status": "PASS",
+                "run_id": run_id,
+                "source_sha": sha,
+                "devices": [0, 1, 2, 3],
+                "transfer_samples": 4,
+                "threshold_payload_size": 128 * 1024**2,
+                "min_put_gib_s": 0,
+                "min_get_gib_s": 0,
+            },
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            ready_path = root / "ready.json"
+            provider_log = root / "provider.log"
+            benchmark_log = root / "bench.jsonl"
+            ready_path.write_text(json.dumps(provider_ready) + "\n")
+            provider_log.write_text(
+                "native log line\n"
+                + "\n".join(json.dumps(record) for record in provider_records)
+                + "\n"
+            )
+            benchmark_log.write_text(
+                "\n".join(json.dumps(record) for record in benchmark_records) + "\n"
+            )
+            result = subprocess.run(
+                [
+                    "python3",
+                    str(SCRIPT_DIR / "egm_store_report.py"),
+                    "--provider-ready",
+                    str(ready_path),
+                    "--provider-log",
+                    str(provider_log),
+                    "--benchmark-log",
+                    str(benchmark_log),
+                    "--branch",
+                    "codex/test",
+                ],
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+            )
+        self.assertIn("Result: **PASS**", result.stdout)
+        self.assertIn("Provider teardown: `PASS`", result.stdout)
+        self.assertIn("125.0000", result.stdout)
+
+
+if __name__ == "__main__":
+    unittest.main()

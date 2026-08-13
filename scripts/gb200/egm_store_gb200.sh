@@ -226,7 +226,8 @@ pid_exists() {
   [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null
 }
 wait_for_pid_command() {
-  local file="$1" expected="$2" timeout="$3" deadline=$((SECONDS + timeout))
+  local file="$1" expected="$2" timeout="$3"
+  local deadline=$((SECONDS + timeout))
   while pid_exists "$file"; do
     pid_live "$file" "$expected" && return 0
     (( SECONDS < deadline )) || return 1
@@ -259,7 +260,8 @@ except OSError:
 PY
 }
 wait_for_tcp() {
-  local host="$1" port="$2" timeout="$3" deadline=$((SECONDS + timeout))
+  local host="$1" port="$2" timeout="$3"
+  local deadline=$((SECONDS + timeout))
   until tcp_reachable "$host" "$port"; do
     (( SECONDS < deadline )) || return 1
     sleep 1

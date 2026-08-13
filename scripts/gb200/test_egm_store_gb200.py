@@ -56,6 +56,30 @@ class FakeStore:
 
 
 class EgmStoreGb200Test(unittest.TestCase):
+    def test_wait_helpers_initialize_timeouts_under_nounset(self):
+        source = (SCRIPT_DIR / "egm_store_gb200.sh").read_text()
+
+        def function_source(name: str) -> str:
+            start = source.index(f"{name}() {{")
+            end = source.index("\n}", start) + 2
+            return source[start:end]
+
+        cases = [
+            (
+                "wait_for_tcp",
+                "tcp_reachable() { return 0; }\nwait_for_tcp 127.0.0.1 1 1",
+            ),
+            (
+                "wait_for_pid_command",
+                "pid_exists() { return 0; }\n"
+                "pid_live() { return 0; }\n"
+                "wait_for_pid_command /tmp/test-pid expected 1",
+            ),
+        ]
+        for name, invocation in cases:
+            script = f"set -u\n{function_source(name)}\n{invocation}\n"
+            subprocess.run(["bash", "-c", script], check=True)
+
     def test_bandwidth_conversion(self):
         self.assertEqual(consumer.bandwidth_gib_s(1024**3, 1_000_000_000), 1.0)
 

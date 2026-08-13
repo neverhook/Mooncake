@@ -328,12 +328,11 @@ def main() -> int:
         device=args.device,
         payload_size=args.payload_size,
         iterations=args.iterations,
+        hbm_allocation="cudaMalloc local endpoint (not published)",
         config=config,
     )
 
     pointers: list[int] = []
-    registered: list[int] = []
-    unregister_failed: set[int] = set()
     setup_attempted = False
     exit_code = 0
     try:
@@ -348,11 +347,6 @@ def main() -> int:
             **process_context(cuda, args.device, module),
         )
         pointers = [cuda.malloc(args.payload_size), cuda.malloc(args.payload_size)]
-        for name, pointer in zip(("source", "destination"), pointers):
-            result = store.register_buffer(pointer, args.payload_size)
-            if result != 0:
-                raise RuntimeError(f"{name} HBM registration failed: {result}")
-            registered.append(pointer)
         records = run_transfers(store, cuda, args, pointers[0], pointers[1])
         emit(
             "consumer_gate",
@@ -375,19 +369,6 @@ def main() -> int:
         )
         exit_code = 1
     finally:
-        for pointer in reversed(registered):
-            try:
-                result = store.unregister_buffer(pointer)
-            except Exception as exc:
-                result = f"exception: {exc}"
-            if result not in (None, 0):
-                unregister_failed.add(pointer)
-                emit(
-                    "consumer_cleanup_error",
-                    device=args.device,
-                    stage="unregister_buffer",
-                    result=result,
-                )
         close_result: object = 0
         if setup_attempted:
             try:
@@ -397,16 +378,11 @@ def main() -> int:
         close_ok = close_result in (None, 0)
         free_errors: list[str] = []
         for pointer in reversed(pointers):
-            if pointer in unregister_failed and not close_ok:
-                free_errors.append(
-                    f"preserved pointer {pointer:#x} until process exit after cleanup failure"
-                )
-                continue
             try:
                 cuda.free(pointer)
             except Exception as exc:
                 free_errors.append(f"cudaFree({pointer:#x}) failed: {exc}")
-        cleanup_ok = close_ok and not unregister_failed and not free_errors
+        cleanup_ok = close_ok and not free_errors
         emit(
             "consumer_cleanup",
             status="PASS" if cleanup_ok else "FAIL",
@@ -414,7 +390,6 @@ def main() -> int:
             source_sha=args.source_sha,
             device=args.device,
             close_result=close_result,
-            unregister_failures=len(unregister_failed),
             errors=free_errors,
         )
         if not cleanup_ok and exit_code == 0:

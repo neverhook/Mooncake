@@ -11,14 +11,22 @@ supernode:
 1. Consumer HBM -> Provider EGM through `put_from`.
 2. Provider EGM -> Consumer HBM through `get_into`.
 3. SHA-256 and byte-for-byte correctness for every transfer.
-4. Consumer buffer unregister/close and Provider pool teardown/unpublication.
+4. Consumer HBM cleanup and Provider pool teardown/unpublication.
 5. Per-transfer elapsed time, per-stream GiB/s, and multi-GPU concurrent-window
    GiB/s in machine-readable JSONL.
 
 The Provider uses `enable_egm_store_pool=true`, `protocol=nvlink`, a nonzero
 `global_segment_size`, and `local_buffer_size=0`. Consumers contribute no Store
-capacity and also use `local_buffer_size=0`. The harness starts Mooncake Master
-with its embedded HTTP metadata service, so it does not require etcd.
+capacity and also use `local_buffer_size=0`. MEMORY reads therefore submit the
+Consumer HBM pointer directly to the selected transport instead of allocating a
+Consumer host staging buffer. The harness starts Mooncake Master with its
+embedded HTTP metadata service, so it does not require etcd.
+
+Consumer HBM buffers are ordinary `cudaMalloc` local endpoints. In cross-node
+fabric mode they are not published through `register_buffer()`: the NVLink
+transport explicitly accepts such pointers for local copies, while registration
+is a no-op that has no matching metadata record to unregister. The Provider EGM
+ranges remain exact-range registered and are fully checked during teardown.
 
 ## Prerequisites
 
@@ -145,6 +153,10 @@ four iterations per size. Each result includes fields such as:
   "status": "PASS"
 }
 ```
+
+The reported Get duration is end-to-end Store API latency for the direct
+Provider EGM -> Consumer HBM transfer. Put uses the Consumer HBM pointer as the
+local NVLink source and writes the remote Provider EGM range.
 
 The benchmark writes pure JSONL to `bench.jsonl` and native Store/CUDA logs to
 `bench.stderr.log`. It emits:

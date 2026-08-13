@@ -30,9 +30,10 @@ with its embedded HTTP metadata service, so it does not require etcd.
 - The configured Master RPC, metadata HTTP, admin HTTP, Provider, and Consumer
   ports must be reachable between the two nodes.
 
-The default 600 MiB Provider pool is sufficient for four simultaneous 128 MiB
-objects. If `DEVICES` or the maximum payload grows, increase the pool so its
-effective capacity remains above `device_count * maximum_payload`.
+The default Provider pool is 10 GiB. The four simultaneous 128 MiB objects only
+require 512 MiB of live capacity; the larger default leaves room for expanded
+payload or concurrency experiments. Pool capacity by itself does not increase
+transfer bandwidth.
 
 ## 1. Check out the validation branch on both nodes
 
@@ -75,15 +76,16 @@ scripts/gb200/egm_store_gb200.sh \
   --config ./egm-store-gb200.conf preflight
 ```
 
-`build` compiles the Master, Python Store binding, Store EGM pool test, and the
-two #2966 focused tests, then runs `nvlink_vmm_unit`, `egm_store_pool_unit`, and
-the script-level tests. `preflight` records visible GPUs, topology, Fabric
-state, GPU NUMA locality, IMEX devices/daemon, and conflicting environment
-overrides.
+By default, `build` sets `BUILD_UNIT_TESTS=0`, compiles the Master and Python
+Store binding, and runs the script-level tests without downloading GoogleTest.
+Set `BUILD_UNIT_TESTS=1` in the config to also build the Store EGM pool test and
+the two #2966 focused tests, then run `nvlink_vmm_unit` and
+`egm_store_pool_unit`. `preflight` records visible GPUs, topology, Fabric state,
+GPU NUMA locality, IMEX devices/daemon, and conflicting environment overrides.
 
-When the IMEX daemon runs outside a test container, set
-`MC_IMEX_DAEMON_EXTERNAL=1` only after independently confirming that the host
-daemon is active.
+`MC_IMEX_DAEMON_EXTERNAL=1` is the default for a container using the host IMEX
+daemon. Set it to `0` when the daemon is expected to be visible inside the test
+environment so preflight can verify the process directly.
 
 ## 3. Start Master and Provider on Node A
 

@@ -256,6 +256,9 @@ class EgmStoreGb200Test(unittest.TestCase):
         self.assertIn("NODE_B_IP=192.0.2.11", result.stdout)
         self.assertIn("SOURCE_SHA=", result.stdout)
         self.assertIn("EGM_NUMA_NODES=auto", result.stdout)
+        self.assertIn("EGM_POOL_SIZE=10 GB", result.stdout)
+        self.assertIn("BUILD_UNIT_TESTS=0", result.stdout)
+        self.assertIn("MC_IMEX_DAEMON_EXTERNAL=1", result.stdout)
 
     def test_report_requires_matching_teardown_and_renders_performance(self):
         run_id = "report-run"

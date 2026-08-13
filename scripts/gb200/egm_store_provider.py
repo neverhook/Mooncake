@@ -161,7 +161,7 @@ def main() -> int:
     parser.add_argument("--metadata-server", required=True)
     parser.add_argument("--master-server", required=True)
     parser.add_argument("--master-admin-url", required=True)
-    parser.add_argument("--pool-size", default="600 MB")
+    parser.add_argument("--pool-size", default="10 GB")
     parser.add_argument("--numa-nodes", default="auto")
     parser.add_argument("--run-id", type=safe_identifier, required=True)
     parser.add_argument("--source-sha", type=safe_identifier, required=True)

@@ -80,6 +80,11 @@ class EgmStoreGb200Test(unittest.TestCase):
             script = f"set -u\n{function_source(name)}\n{invocation}\n"
             subprocess.run(["bash", "-c", script], check=True)
 
+    def test_consumer_actions_enable_nvlink_auto_discovery(self):
+        source = (SCRIPT_DIR / "egm_store_gb200.sh").read_text()
+        self.assertIn('"MC_MS_AUTO_DISC=0"', source)
+        self.assertEqual(source.count('run_env "$NODE_B_IP" env MC_MS_AUTO_DISC=1'), 2)
+
     def test_bandwidth_conversion(self):
         self.assertEqual(consumer.bandwidth_gib_s(1024**3, 1_000_000_000), 1.0)
 

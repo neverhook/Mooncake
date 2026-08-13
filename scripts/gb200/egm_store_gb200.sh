@@ -476,7 +476,8 @@ case "$action" in
     (( CONSUMER_PORT_BASE + device <= 65535 )) || fail 'Consumer port overflows'
     master_remote_status
     mkdir -p "$RESULT_DIR"
-    run_env "$NODE_B_IP" python3 "${script_dir}/egm_store_consumer.py" \
+    run_env "$NODE_B_IP" env MC_MS_AUTO_DISC=1 \
+      python3 "${script_dir}/egm_store_consumer.py" \
       --local-hostname "${NODE_B_IP}:$((CONSUMER_PORT_BASE + device))" \
       --metadata-server "$METADATA_SERVER" --master-server "$MASTER_SERVER" \
       --device "$device" --payload-size "$THRESHOLD_PAYLOAD_SIZE" \
@@ -488,7 +489,8 @@ case "$action" in
   bench)
     master_remote_status
     mkdir -p "$RESULT_DIR"
-    run_env "$NODE_B_IP" python3 "${script_dir}/egm_store_bench.py" \
+    run_env "$NODE_B_IP" env MC_MS_AUTO_DISC=1 \
+      python3 "${script_dir}/egm_store_bench.py" \
       --node-b-ip "$NODE_B_IP" --consumer-port-base "$CONSUMER_PORT_BASE" \
       --metadata-server "$METADATA_SERVER" --master-server "$MASTER_SERVER" \
       --devices "$DEVICES" --payload-sizes "$PAYLOAD_SIZES" \

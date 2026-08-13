@@ -3359,6 +3359,19 @@ RealClient::resolve_writable_buffer_region(void *buffer) const {
     return std::nullopt;
 }
 
+bool RealClient::can_use_direct_memory_read(void *buffer, size_t size) const {
+    // NVLink accepts ordinary CUDA allocations as local endpoints. RDMA
+    // requires the destination range to have a local memory registration.
+    if (protocol == "nvlink") {
+        return true;
+    }
+    if (protocol != "rdma") {
+        return false;
+    }
+    auto region = resolve_writable_buffer_region(buffer);
+    return region.has_value() && size <= region->size - region->offset;
+}
+
 tl::expected<RealClient::RangedReadMetadata, ErrorCode>
 RealClient::resolve_ranged_read_metadata(
     const std::string &key, const QueryResultCache *query_result_cache) {
@@ -3458,7 +3471,9 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
         auto runtime_accelerator =
             device::GetAcceleratorRegistry().RuntimeAccelerators();
         void *dst = static_cast<char *>(buffer) + dst_offset;
-        if (runtime_accelerator.FindDeviceForPointer(dst)) {
+        if (runtime_accelerator.FindDeviceForPointer(dst) &&
+            (!can_use_direct_memory_read(dst, total_size) ||
+             client_->IsHotCacheEnabled())) {
             if (!client_buffer_allocator_) {
                 LOG(ERROR) << "Client buffer allocator is not provided";
                 return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -3580,7 +3595,8 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
     auto runtime_accelerator =
         device::GetAcceleratorRegistry().RuntimeAccelerators();
     void *dst = static_cast<char *>(buffer) + dst_offset;
-    if (runtime_accelerator.FindDeviceForPointer(dst)) {
+    if (runtime_accelerator.FindDeviceForPointer(dst) &&
+        !can_use_direct_memory_read(dst, size)) {
         if (!client_buffer_allocator_) {
             LOG(ERROR) << "Client buffer allocator is not provided";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);

@@ -3,7 +3,8 @@
 This directory is validation-only. It lives on the dedicated
 `codex/egm-store-pool-gb200-validation` branch and is not part of the Store PR.
 The branch is based directly on the Store PR head, which in turn contains the
-full #2966 HOST_NUMA/NvlinkTransport prerequisite.
+full #2966 HOST_NUMA/NvlinkTransport prerequisite, and also carries the
+cross-node direct GPU-read change submitted separately as #3431.
 
 The harness proves these real Store paths on two GB200 nodes in one NVL72
 supernode:

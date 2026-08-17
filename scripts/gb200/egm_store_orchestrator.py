@@ -903,6 +903,7 @@ def provider_mode(args: argparse.Namespace) -> int:
     completion: dict[str, object] | None = None
     cleanup: list[dict[str, object]] = []
     local_memcpy: dict[str, object] = {"status": "NOT_RUN"}
+    provider_started = False
     stop_requested = False
 
     def request_stop(_signum, _frame):
@@ -923,6 +924,7 @@ def provider_mode(args: argparse.Namespace) -> int:
             [str(wrapper), "--config", str(config_path), "provider-start"],
             cwd=repo_root,
         )
+        provider_started = True
         rdma_binary = (
             build_dir / "mooncake-transfer-engine/example/transfer_engine_bench"
         )
@@ -1032,12 +1034,19 @@ def provider_mode(args: argparse.Namespace) -> int:
         except subprocess.CalledProcessError as exc:
             cleanup.append({"label": "master", "status": "FAIL", "error": str(exc)})
             status = "FAIL"
-    route_after = collect_route_snapshot()
-    route_evidence = build_route_evidence(
-        route_before,
-        route_after,
-        "Node A remote-EGM endpoint NVLink traffic with inferred C2C route",
-    )
+    if provider_started:
+        route_after = collect_route_snapshot()
+        route_evidence = build_route_evidence(
+            route_before,
+            route_after,
+            "Node A remote-EGM endpoint NVLink traffic with inferred C2C route",
+        )
+    else:
+        route_evidence = {
+            "status": "NOT_RUN",
+            "route_verification": "C2C_ROUTE_INFERRED",
+            "reason": "Store Provider did not start",
+        }
     if status == "PASS" and route_evidence["status"] != "PASS":
         status = "FAIL"
         error = "Node A C2C/NVLink route evidence is incomplete or contains errors"

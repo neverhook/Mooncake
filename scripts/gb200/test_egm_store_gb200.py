@@ -402,6 +402,10 @@ class EgmStoreGb200Test(unittest.TestCase):
         ]
         for script in scripts:
             subprocess.run(["bash", "-n", str(script)], check=True)
+        validation_cmake = (SCRIPT_DIR / "gb200_validation.cmake").read_text()
+        self.assertNotIn(
+            "MOONCAKE_GB200_VALIDATION_TARGETS_SCHEDULED", validation_cmake
+        )
         wrapper = SCRIPT_DIR / "egm_store_gb200.sh"
         help_result = subprocess.run(
             ["bash", str(wrapper), "--help"],

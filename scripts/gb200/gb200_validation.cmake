@@ -1,12 +1,8 @@
 # Validation-only targets injected through CMAKE_PROJECT_INCLUDE by
 # egm_store_build.sh. Keeping them here avoids modifying production CMake files.
 
-if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR
-   AND NOT DEFINED MOONCAKE_GB200_VALIDATION_TARGETS_SCHEDULED)
+if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
   enable_language(CUDA)
-  set(MOONCAKE_GB200_VALIDATION_TARGETS_SCHEDULED
-      TRUE
-      CACHE INTERNAL "")
 
   function(mooncake_add_gb200_validation_targets)
     set(validation_workspace

@@ -64,8 +64,8 @@ except ModuleNotFoundError:
 
 ACTIVE_SESSION_KEY = "mooncake/gb200-validation/active"
 DEFAULT_PAYLOADS = [128 * 1024**2, 512 * 1024**2, 1024**3, 2 * 1024**3]
-RAW_PAYLOADS = [128 * 1024**2, 512 * 1024**2, 1024**3, 2 * 1024**3, 4 * 1024**3]
-RAW_STREAMS = [1, 2, 4, 8]
+RAW_SCAN_PAYLOADS = [512 * 1024**2, 2 * 1024**3, 4 * 1024**3]
+RAW_SCAN_STREAMS = [1, 4, 8]
 RDMA_BLOCKS = [64 * 1024, 1024**2, 8 * 1024**2]
 RDMA_THREADS = [1, 4, 8]
 RDMA_TARGET_READY_MARKER = "MOONCAKE_TRANSFER_ENGINE_BENCH_TARGET_READY"
@@ -761,7 +761,7 @@ def raw_summaries(records: list[dict[str, object]]) -> dict[str, object]:
         and ceiling["path"] in {"EGM_H2D", "EGM_D2H"}
         and ceiling["engine"] == "CE"
     ]
-    gate_pass = len(gates) == 1 and gates[0].get("status") == "PASS"
+    gate_pass = bool(gates) and all(gate.get("status") == "PASS" for gate in gates)
     ceiling_pass = bool(required_ceilings) and all(
         ceiling["status"] == "QUALIFIED" for ceiling in required_ceilings
     )
@@ -770,6 +770,7 @@ def raw_summaries(records: list[dict[str, object]]) -> dict[str, object]:
         "correctness_status": "PASS" if gate_pass else "FAIL",
         "ceiling_status": "PASS" if ceiling_pass else "FAIL",
         "gate": gates[0] if len(gates) == 1 else None,
+        "gates": gates,
         "aggregate_cases": [case for case in cases if case["scope"] == "aggregate"],
         "ceilings": ceilings,
         "latency": latency,
@@ -811,67 +812,302 @@ def mandatory_validation_statuses(
     }
 
 
+def select_scan_coordinate(
+    records: list[dict[str, object]], path: str
+) -> dict[str, object]:
+    samples = [
+        record
+        for record in records
+        if record.get("event") == "raw_bandwidth_sample"
+        and record.get("phase") == "scan"
+        and record.get("path") == path
+        and record.get("engine") == "CE"
+        and str(record.get("group", "")).startswith("1GPU-device")
+    ]
+    coordinates = sorted(
+        {(int(record["bytes"]), int(record["streams"])) for record in samples}
+    )
+    candidates: list[dict[str, object]] = []
+    for byte_count, streams in coordinates:
+        devices = sorted(
+            {
+                int(record["device"])
+                for record in samples
+                if int(record["bytes"]) == byte_count
+                and int(record["streams"]) == streams
+            }
+        )
+        per_device = []
+        for device in devices:
+            values = [
+                float(record["bandwidth_gb_s"])
+                for record in samples
+                if int(record["bytes"]) == byte_count
+                and int(record["streams"]) == streams
+                and int(record["device"]) == device
+            ]
+            per_device.append({"device": device, "bandwidth_gb_s": summarize(values)})
+        candidates.append(
+            {
+                "bytes": byte_count,
+                "streams": streams,
+                "score_gb_s": summarize(
+                    float(item["bandwidth_gb_s"]["p50"]) for item in per_device
+                )["p50"],
+                "per_device": per_device,
+            }
+        )
+    if not candidates:
+        raise RuntimeError(f"scan emitted no CE samples for {path}")
+    best = max(candidates, key=lambda item: float(item["score_gb_s"]))
+    return {"path": path, "selected": best, "candidates": candidates}
+
+
 def run_raw_benchmark(
     binary: pathlib.Path,
     manifest: Mapping[str, object],
     devices: list[int],
     result_dir: pathlib.Path,
 ) -> tuple[dict[str, object], dict[str, object]]:
+    scan_log = result_dir / "raw-egm-scan.jsonl"
+    scan_stderr = result_dir / "raw-egm-scan.stderr.log"
     raw_log = result_dir / "raw-egm.jsonl"
     raw_stderr = result_dir / "raw-egm.stderr.log"
+    latency_log = result_dir / "raw-egm-latency.jsonl"
+    latency_stderr = result_dir / "raw-egm-latency.stderr.log"
     h2h_log = result_dir / "raw-egm-h2h.jsonl"
     h2h_stderr = result_dir / "raw-egm-h2h.stderr.log"
-    base_command = [
-        str(binary),
-        f"--metadata_server={manifest['metadata_server']}",
-        f"--segment_name={manifest['provider_hostname']}",
-        f"--devices={','.join(str(device) for device in devices)}",
-        f"--payload_sizes={','.join(str(value) for value in RAW_PAYLOADS)}",
-        f"--stream_counts={','.join(str(value) for value in RAW_STREAMS)}",
-        "--warmups=3",
-        "--samples=10",
-        "--min_window_seconds=1",
-        "--latency_accesses=262144",
-        "--latency_samples=30",
-        "--latency_working_sets=2097152,268435456,1073741824",
-        f"--run_id={manifest['run_id']}",
-        f"--source_sha={manifest['source_sha']}",
-    ]
-    mandatory_command = [*base_command, "--paths=H2D,D2H", "--run_latency=true"]
-    h2h_command = [
-        *base_command,
-        "--paths=H2H_LOCAL_TO_REMOTE,H2H_REMOTE_TO_LOCAL",
-        "--run_latency=false",
-    ]
+
+    def command(
+        selected_devices: list[int],
+        payloads: list[int],
+        streams: list[int],
+        paths: str,
+        engines: str,
+        group_sizes: str,
+        phase: str,
+        warmups: int,
+        samples: int,
+        window_seconds: float,
+        *,
+        run_bandwidth: bool = True,
+        run_latency: bool = False,
+    ) -> list[str]:
+        return [
+            str(binary),
+            f"--metadata_server={manifest['metadata_server']}",
+            f"--segment_name={manifest['provider_hostname']}",
+            f"--devices={','.join(str(device) for device in selected_devices)}",
+            f"--payload_sizes={','.join(str(value) for value in payloads)}",
+            f"--stream_counts={','.join(str(value) for value in streams)}",
+            f"--paths={paths}",
+            f"--engines={engines}",
+            f"--group_sizes={group_sizes}",
+            f"--phase={phase}",
+            f"--warmups={warmups}",
+            f"--samples={samples}",
+            f"--min_window_seconds={window_seconds}",
+            f"--run_bandwidth={'true' if run_bandwidth else 'false'}",
+            f"--run_latency={'true' if run_latency else 'false'}",
+            "--latency_accesses=262144",
+            "--latency_samples=30",
+            "--latency_working_sets=2097152,268435456,1073741824",
+            f"--run_id={manifest['run_id']}",
+            f"--source_sha={manifest['source_sha']}",
+        ]
+
     route_before = collect_route_snapshot()
-    with (
-        raw_log.open("w") as output,
-        raw_stderr.open("w") as errors,
-        h2h_log.open("w") as h2h_output,
-        h2h_stderr.open("w") as h2h_errors,
-    ):
-        mandatory_completed = run(
-            mandatory_command,
+    print(
+        "EGM MNNVL phase START: CE quick scan "
+        f"payloads={RAW_SCAN_PAYLOADS} streams={RAW_SCAN_STREAMS} log={scan_log}",
+        flush=True,
+    )
+    scan_command = command(
+        devices,
+        RAW_SCAN_PAYLOADS,
+        RAW_SCAN_STREAMS,
+        "H2D,D2H",
+        "CE",
+        "1",
+        "scan",
+        1,
+        3,
+        0.25,
+    )
+    with scan_log.open("w") as output, scan_stderr.open("w") as errors:
+        scan_completed = run(
+            scan_command,
             env=clean_transport_env(),
             check=False,
             stdout=output,
             stderr=errors,
         )
-        route_mandatory_after = collect_route_snapshot()
-        h2h_completed = run(
-            h2h_command,
-            env=clean_transport_env(),
-            check=False,
-            stdout=h2h_output,
-            stderr=h2h_errors,
-        )
+    scan_records = read_jsonl(scan_log)
+    scan_gates = [
+        record for record in scan_records if record.get("event") == "raw_benchmark_gate"
+    ]
+    scan_pass = (
+        scan_completed.returncode == 0
+        and bool(scan_gates)
+        and all(gate.get("status") == "PASS" for gate in scan_gates)
+    )
+    try:
+        selections = [
+            select_scan_coordinate(scan_records, path)
+            for path in ("EGM_H2D", "EGM_D2H")
+        ]
+    except RuntimeError as exc:
+        selections = []
+        scan_pass = False
+        scan_error = str(exc)
+    else:
+        scan_error = ""
+    print(
+        "EGM MNNVL phase END: CE quick scan "
+        f"status={'PASS' if scan_pass else 'FAIL'} selections={selections}",
+        flush=True,
+    )
+
+    sustained_returncodes: dict[str, int] = {}
+    with raw_log.open("w") as output, raw_stderr.open("w") as errors:
+        if scan_pass:
+            for selection in selections:
+                path = str(selection["path"])
+                selected = selection["selected"]
+                path_flag = "H2D" if path == "EGM_H2D" else "D2H"
+                print(
+                    "EGM MNNVL phase START: CE sustained "
+                    f"path={path} bytes={selected['bytes']} "
+                    f"streams={selected['streams']} log={raw_log}",
+                    flush=True,
+                )
+                completed = run(
+                    command(
+                        devices,
+                        [int(selected["bytes"])],
+                        [int(selected["streams"])],
+                        path_flag,
+                        "CE",
+                        "1,4",
+                        "sustained",
+                        1,
+                        3,
+                        3.4,
+                    ),
+                    env=clean_transport_env(),
+                    check=False,
+                    stdout=output,
+                    stderr=errors,
+                )
+                sustained_returncodes[path] = completed.returncode
+                print(
+                    "EGM MNNVL phase END: CE sustained "
+                    f"path={path} rc={completed.returncode}",
+                    flush=True,
+                )
+
+    representative_devices = sorted({devices[0], devices[len(devices) // 2]})
+    bandwidth_pass = (
+        scan_pass
+        and set(sustained_returncodes) == {"EGM_H2D", "EGM_D2H"}
+        and all(returncode == 0 for returncode in sustained_returncodes.values())
+    )
+    latency_returncode: int | None = None
+    with latency_log.open("w") as output, latency_stderr.open("w") as errors:
+        if bandwidth_pass:
+            print(
+                "EGM MNNVL phase START: SM load/store latency "
+                f"devices={representative_devices} log={latency_log}",
+                flush=True,
+            )
+            latency_completed = run(
+                command(
+                    representative_devices,
+                    [2 * 1024**2],
+                    [1],
+                    "H2D",
+                    "SM",
+                    "1",
+                    "latency",
+                    0,
+                    1,
+                    0.25,
+                    run_bandwidth=False,
+                    run_latency=True,
+                ),
+                env=clean_transport_env(),
+                check=False,
+                stdout=output,
+                stderr=errors,
+            )
+            latency_returncode = latency_completed.returncode
+            print(
+                "EGM MNNVL phase END: SM load/store latency "
+                f"rc={latency_returncode}",
+                flush=True,
+            )
+    route_mandatory_after = collect_route_snapshot()
+
+    mandatory_execution_pass = bandwidth_pass and latency_returncode == 0
+    h2h_returncode: int | None = None
+    with h2h_log.open("w") as output, h2h_stderr.open("w") as errors:
+        if mandatory_execution_pass:
+            print(
+                "Supplementary phase START: EGM H2H quick matrix " f"log={h2h_log}",
+                flush=True,
+            )
+            h2h_completed = run(
+                command(
+                    representative_devices,
+                    RAW_SCAN_PAYLOADS,
+                    RAW_SCAN_STREAMS,
+                    "H2H_LOCAL_TO_REMOTE,H2H_REMOTE_TO_LOCAL",
+                    "CE,SM",
+                    "1,2",
+                    "supplementary_h2h",
+                    1,
+                    3,
+                    0.25,
+                ),
+                env=clean_transport_env(),
+                check=False,
+                stdout=output,
+                stderr=errors,
+            )
+            h2h_returncode = h2h_completed.returncode
+            print(
+                "Supplementary phase END: EGM H2H quick matrix " f"rc={h2h_returncode}",
+                flush=True,
+            )
     route_after = collect_route_snapshot()
-    records = read_jsonl(raw_log)
+
+    records = [*read_jsonl(raw_log), *read_jsonl(latency_log)]
     summary = raw_summaries(records)
+    summary["mode"] = "ADAPTIVE_SCAN_THEN_SUSTAINED"
+    summary["scan"] = {
+        "status": "PASS" if scan_pass else "FAIL",
+        "returncode": scan_completed.returncode,
+        "error": scan_error,
+        "selections": selections,
+        "payloads": RAW_SCAN_PAYLOADS,
+        "streams": RAW_SCAN_STREAMS,
+        "samples": 3,
+        "window_seconds": 0.25,
+    }
+    summary["sustained"] = {
+        "returncodes": sustained_returncodes,
+        "samples": 3,
+        "window_seconds": 3.4,
+    }
+    summary["latency_returncode"] = latency_returncode
     summary["stderr_tail"] = log_tail(raw_stderr)
-    if mandatory_completed.returncode != 0:
+    summary["latency_stderr_tail"] = log_tail(latency_stderr)
+    if (
+        not scan_pass
+        or any(returncode != 0 for returncode in sustained_returncodes.values())
+        or latency_returncode != 0
+    ):
         summary["status"] = "FAIL"
-        summary["returncode"] = mandatory_completed.returncode
     h2h_records = read_jsonl(h2h_log)
     h2h_summary = raw_summaries(h2h_records)
     h2h_summary["stderr_tail"] = log_tail(h2h_stderr)
@@ -879,11 +1115,11 @@ def run_raw_benchmark(
         item for item in h2h_records if item.get("event") == "raw_benchmark_gate"
     ]
     h2h_execution_pass = (
-        h2h_completed.returncode == 0
+        h2h_returncode == 0
         and len(h2h_gates) == 1
         and h2h_gates[0].get("status") == "PASS"
     )
-    h2h_summary["returncode"] = h2h_completed.returncode
+    h2h_summary["returncode"] = h2h_returncode
     h2h_summary["acceptance_scope"] = "SUPPLEMENTARY_COMPARISON"
     h2h_summary["merge_gate"] = False
     summary["supplementary_h2h"] = h2h_summary
@@ -897,11 +1133,15 @@ def run_raw_benchmark(
         route_after,
         "host-submitted, GPU-CE/SM-executed EGM H2H route evidence",
     )
-    h2h_summary["status"] = (
-        "PASS"
-        if h2h_execution_pass and h2h_summary["route"]["status"] == "PASS"
-        else "UNSUPPORTED_OR_ROUTE_UNVERIFIED"
-    )
+    if h2h_returncode is None:
+        h2h_summary["status"] = "NOT_RUN"
+        h2h_summary["reason"] = "mandatory EGM execution did not pass"
+    else:
+        h2h_summary["status"] = (
+            "PASS"
+            if h2h_execution_pass and h2h_summary["route"]["status"] == "PASS"
+            else "UNSUPPORTED_OR_ROUTE_UNVERIFIED"
+        )
     return summary, route
 
 
@@ -1027,8 +1267,10 @@ def provider_mode(args: argparse.Namespace) -> int:
             "rdma_target": f"{args.listen_ip}:{ports['rdma_target']}",
             "config": {
                 "store_payloads": DEFAULT_PAYLOADS,
-                "raw_payloads": RAW_PAYLOADS,
-                "raw_streams": RAW_STREAMS,
+                "raw_scan_payloads": RAW_SCAN_PAYLOADS,
+                "raw_scan_streams": RAW_SCAN_STREAMS,
+                "raw_scan_samples": 3,
+                "raw_sustained_samples": 3,
                 "store_iterations": 13,
                 "store_warmups": 2,
             },
@@ -1247,7 +1489,16 @@ def consumer_mode(args: argparse.Namespace) -> int:
         rdma_binary = (
             build_dir / "mooncake-transfer-engine/example/transfer_engine_bench"
         )
-        rdma = run_supplementary_rdma(rdma_binary, manifest, local_ip)
+        if raw.get("status") == "PASS" and raw_route.get("status") == "PASS":
+            rdma = run_supplementary_rdma(rdma_binary, manifest, local_ip)
+        else:
+            rdma = {
+                "path": "KVPOOL_HOST_H2H_RDMA",
+                "acceptance_scope": "SUPPLEMENTARY_COMPARISON",
+                "merge_gate": False,
+                "status": "NOT_RUN",
+                "reason": "mandatory EGM raw validation did not pass",
+            }
         store_route_before = collect_route_snapshot()
         store_completed = run(
             [str(wrapper), "--config", str(config_path), "bench"],

@@ -134,6 +134,8 @@ class EgmStoreGb200Test(unittest.TestCase):
             REPO_ROOT / "mooncake-transfer-engine/example/egm_link_bench.cu"
         ).read_text()
         self.assertIn('parseUnsignedList(value, "devices", true)', source)
+        self.assertIn('DEFINE_string(engines, "CE,SM"', source)
+        self.assertIn("DEFINE_bool(run_bandwidth, true", source)
 
     def test_rdma_target_readiness_uses_registration_marker(self):
         process = mock.Mock()
@@ -310,6 +312,32 @@ class EgmStoreGb200Test(unittest.TestCase):
             "UNBOUNDED_BY_MATRIX",
             {ceiling["status"] for ceiling in summary["ceilings"]},
         )
+
+    def test_raw_scan_selects_best_ce_coordinate(self):
+        records = []
+        for device in (0, 1):
+            for byte_count, streams, bandwidth in (
+                (512 * 1024**2, 1, 100.0),
+                (2 * 1024**3, 4, 200.0),
+            ):
+                for sample in range(3):
+                    records.append(
+                        {
+                            "event": "raw_bandwidth_sample",
+                            "phase": "scan",
+                            "group": f"1GPU-device{device}",
+                            "path": "EGM_H2D",
+                            "engine": "CE",
+                            "device": device,
+                            "bytes": byte_count,
+                            "streams": streams,
+                            "sample": sample,
+                            "bandwidth_gb_s": bandwidth + device,
+                        }
+                    )
+        selection = orchestrator.select_scan_coordinate(records, "EGM_H2D")
+        self.assertEqual(selection["selected"]["bytes"], 2 * 1024**3)
+        self.assertEqual(selection["selected"]["streams"], 4)
 
     def test_raw_failure_and_store_logs_are_preserved_in_evidence(self):
         raw_gate = {

@@ -44,9 +44,14 @@ DEFINE_string(payload_sizes,
               "134217728,536870912,1073741824,2147483648,4294967296",
               "Comma-separated aggregate bytes per device");
 DEFINE_string(stream_counts, "1,2,4,8", "Comma-separated CUDA stream counts");
+DEFINE_string(engines, "CE,SM", "Comma-separated copy engines: CE,SM");
+DEFINE_string(group_sizes, "1,2,4",
+              "Comma-separated GPU group sizes to execute");
 DEFINE_string(paths, "H2D,D2H,H2H_LOCAL_TO_REMOTE,H2H_REMOTE_TO_LOCAL",
               "Comma-separated raw transfer paths");
+DEFINE_bool(run_bandwidth, true, "Run the bandwidth matrix");
 DEFINE_bool(run_latency, true, "Run SM load/store latency samples");
+DEFINE_string(phase, "", "Phase name included in JSON records");
 DEFINE_int32(warmups, 3, "Warmup operations excluded from results");
 DEFINE_int32(samples, 10, "Steady samples per case");
 DEFINE_double(min_window_seconds, 1.0,
@@ -123,6 +128,7 @@ std::vector<int> parseDevices(const std::string& value) {
 void emit(Json::Value value) {
     value["run_id"] = FLAGS_run_id;
     value["source_sha"] = FLAGS_source_sha;
+    if (!FLAGS_phase.empty()) value["phase"] = FLAGS_phase;
     Json::StreamWriterBuilder builder;
     builder["indentation"] = "";
     std::lock_guard<std::mutex> lock(output_mutex);
@@ -270,6 +276,23 @@ struct DeviceContext {
 enum class Path { H2D, D2H, H2H_LOCAL_TO_REMOTE, H2H_REMOTE_TO_LOCAL };
 enum class Engine { CE, SM };
 
+std::vector<Engine> parseEngines(const std::string& value) {
+    std::vector<Engine> engines;
+    std::stringstream stream(value);
+    std::string item;
+    while (std::getline(stream, item, ',')) {
+        if (item == "CE")
+            engines.push_back(Engine::CE);
+        else if (item == "SM")
+            engines.push_back(Engine::SM);
+        else
+            throw std::invalid_argument("unknown engine " + item);
+    }
+    if (engines.empty())
+        throw std::invalid_argument("engines must not be empty");
+    return engines;
+}
+
 std::vector<Path> parsePaths(const std::string& value) {
     std::vector<Path> paths;
     std::stringstream stream(value);
@@ -415,11 +438,12 @@ struct Sample {
 void runDeviceMatrix(DeviceContext& context, RemoteArena& remote,
                      const std::string& group, std::barrier<>& barrier,
                      const std::vector<Path>& paths,
+                     const std::vector<Engine>& engines,
                      const std::vector<uint64_t>& payloads,
                      const std::vector<uint64_t>& stream_counts,
                      std::vector<Sample>& output, std::mutex& output_lock) {
     for (Path path : paths) {
-        for (Engine engine : {Engine::CE, Engine::SM}) {
+        for (Engine engine : engines) {
             for (uint64_t payload : payloads) {
                 for (uint64_t stream_count : stream_counts) {
                     auto [source, destination] =
@@ -692,6 +716,9 @@ int run() {
     std::vector<uint64_t> working_sets =
         parseUnsignedList(FLAGS_latency_working_sets, "latency_working_sets");
     std::vector<Path> paths = parsePaths(FLAGS_paths);
+    std::vector<Engine> engines = parseEngines(FLAGS_engines);
+    std::vector<uint64_t> group_sizes =
+        parseUnsignedList(FLAGS_group_sizes, "group_sizes");
     size_t maximum_payload =
         *std::max_element(payloads.begin(), payloads.end());
     size_t maximum_working_set =
@@ -721,36 +748,45 @@ int run() {
     start["payload_sizes"] = FLAGS_payload_sizes;
     start["stream_counts"] = FLAGS_stream_counts;
     start["paths"] = FLAGS_paths;
+    start["engines"] = FLAGS_engines;
+    start["group_sizes"] = FLAGS_group_sizes;
     emit(start);
 
     std::vector<std::vector<size_t>> groups;
-    for (size_t index = 0; index < contexts.size(); ++index)
-        groups.push_back({index});
-    for (size_t group_size : {size_t{2}, size_t{4}}) {
-        if (group_size <= contexts.size()) {
+    for (uint64_t group_size : group_sizes) {
+        if (group_size > contexts.size()) continue;
+        if (group_size == 1) {
+            for (size_t index = 0; index < contexts.size(); ++index)
+                groups.push_back({index});
+        } else {
             std::vector<size_t> indices(group_size);
             std::iota(indices.begin(), indices.end(), 0);
             groups.push_back(std::move(indices));
         }
     }
-    for (const auto& indices : groups) {
-        std::vector<Sample> samples;
-        std::mutex samples_mutex;
-        std::barrier barrier(static_cast<std::ptrdiff_t>(indices.size()));
-        std::vector<std::thread> workers;
-        std::string group = std::to_string(indices.size()) + "GPU";
-        if (indices.size() == 1)
-            group +=
-                "-device" + std::to_string(contexts[indices.front()]->device);
-        for (size_t index : indices) {
-            workers.emplace_back(runDeviceMatrix, std::ref(*contexts[index]),
-                                 std::ref(remote), group, std::ref(barrier),
-                                 std::cref(paths), std::cref(payloads),
-                                 std::cref(stream_counts), std::ref(samples),
-                                 std::ref(samples_mutex));
+    if (groups.empty())
+        throw std::invalid_argument("group_sizes do not select any GPU group");
+    if (FLAGS_run_bandwidth) {
+        for (const auto& indices : groups) {
+            std::vector<Sample> samples;
+            std::mutex samples_mutex;
+            std::barrier barrier(static_cast<std::ptrdiff_t>(indices.size()));
+            std::vector<std::thread> workers;
+            std::string group = std::to_string(indices.size()) + "GPU";
+            if (indices.size() == 1)
+                group += "-device" +
+                         std::to_string(contexts[indices.front()]->device);
+            for (size_t index : indices) {
+                workers.emplace_back(
+                    runDeviceMatrix, std::ref(*contexts[index]),
+                    std::ref(remote), group, std::ref(barrier),
+                    std::cref(paths), std::cref(engines), std::cref(payloads),
+                    std::cref(stream_counts), std::ref(samples),
+                    std::ref(samples_mutex));
+            }
+            for (auto& worker : workers) worker.join();
+            emitAggregateSamples(samples);
         }
-        for (auto& worker : workers) worker.join();
-        emitAggregateSamples(samples);
     }
     if (FLAGS_run_latency) {
         for (auto& context : contexts)
@@ -763,6 +799,8 @@ int run() {
     gate["h2h_semantics"] = "host-submitted, GPU-CE/SM-executed EGM H2H";
     gate["route_verification"] = "PENDING_EXTERNAL_COUNTERS";
     gate["paths"] = FLAGS_paths;
+    gate["engines"] = FLAGS_engines;
+    gate["group_sizes"] = FLAGS_group_sizes;
     emit(gate);
     return 0;
 }

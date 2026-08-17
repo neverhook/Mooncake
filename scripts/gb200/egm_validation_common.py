@@ -9,10 +9,10 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import socket
 import statistics
 import subprocess
-import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -20,9 +20,8 @@ from collections.abc import Iterable, Mapping
 
 
 EVIDENCE_SCHEMA = "MOONCAKE_GB200_EVIDENCE_V1"
-DCGM_NVLINK_ERROR_FIELDS = list(range(1204, 1220))
-DCGM_NVLINK_COUNT_FIELDS = [1201, 1203, *DCGM_NVLINK_ERROR_FIELDS]
-DCGM_C2C_PROFILE_FIELDS = [1077, 1079]
+EXPECTED_GB200_NVLINKS = 18
+EXPECTED_GB200_C2C_LINKS = 5
 
 
 def percentile(values: Iterable[float], quantile: float) -> float:
@@ -246,36 +245,92 @@ def counter_delta(
     }
 
 
-def parse_dcgm_dmon(output: str, field_ids: Iterable[int]) -> dict[str, list[float]]:
-    """Parse the stable `dcgmi dmon` GPU row format without relying on headers."""
-    fields = list(field_ids)
-    values: dict[str, list[float]] = {}
+def parse_nvlink_data(output: str) -> dict[str, int]:
+    values: dict[str, int] = {}
+    gpu: int | None = None
     for line in output.splitlines():
-        match = re.match(r"^\s*GPU\s+(\d+)\s+(.+?)\s*$", line, re.IGNORECASE)
-        if match is None:
+        gpu_match = re.match(r"^GPU\s+(\d+):", line)
+        if gpu_match is not None:
+            gpu = int(gpu_match.group(1))
             continue
-        tokens = match.group(2).split()
-        if len(tokens) < len(fields):
+        data_match = re.match(
+            r"^\s*Link\s+(\d+):\s+Data\s+(Tx|Rx):\s+([0-9,]+)\s+KiB\s*$",
+            line,
+            re.IGNORECASE,
+        )
+        if gpu is None or data_match is None:
             continue
-        gpu = int(match.group(1))
-        for field, token in zip(fields, tokens, strict=False):
-            try:
-                number = float(token.replace(",", ""))
-            except ValueError:
-                continue
-            values.setdefault(f"gpu{gpu}/field{field}", []).append(number)
+        link = int(data_match.group(1))
+        direction = data_match.group(2).lower()
+        values[f"gpu{gpu}/link{link}/{direction}_bytes"] = (
+            int(data_match.group(3).replace(",", "")) * 1024
+        )
     return values
 
 
-def collect_dcgm_count_snapshot() -> dict[str, float]:
-    command = [
-        "dcgmi",
-        "dmon",
-        "-e",
-        ",".join(str(field) for field in DCGM_NVLINK_COUNT_FIELDS),
-        "-c",
-        "1",
-    ]
+def parse_c2c_status(output: str) -> dict[str, float]:
+    values: dict[str, float] = {}
+    gpu: int | None = None
+    for line in output.splitlines():
+        gpu_match = re.match(r"^GPU\s+(\d+):", line)
+        if gpu_match is not None:
+            gpu = int(gpu_match.group(1))
+            continue
+        link_match = re.match(r"^\s*C2C Link\s+(\d+):\s+([0-9.]+)\s+GB/s\s*$", line)
+        if gpu is not None and link_match is not None:
+            values[f"gpu{gpu}/link{int(link_match.group(1))}/capacity_gb_s"] = float(
+                link_match.group(2)
+            )
+    return values
+
+
+def parse_c2c_errors(output: str) -> dict[str, int]:
+    values: dict[str, int] = {}
+    gpu: int | None = None
+    for line in output.splitlines():
+        gpu_match = re.match(r"^GPU\s+(\d+):", line)
+        if gpu_match is not None:
+            gpu = int(gpu_match.group(1))
+            continue
+        error_match = re.match(
+            r"^\s*C2C Link\s+(\d+):\s+Error\s+(.+?)\s+Count:\s+([0-9,]+)\s*$",
+            line,
+        )
+        if gpu is None or error_match is None:
+            continue
+        error_name = re.sub(r"[^a-z0-9]+", "_", error_match.group(2).lower()).strip("_")
+        values[f"gpu{gpu}/link{int(error_match.group(1))}/{error_name}_errors"] = int(
+            error_match.group(3).replace(",", "")
+        )
+    return values
+
+
+def parse_fabric(output: str) -> dict[str, dict[str, str]]:
+    pattern = re.compile(
+        r"^\s+Fabric\s*$\n"
+        r"\s+State\s+:\s+([^\n]+)\n"
+        r"\s+Status\s+:\s+([^\n]+)\n"
+        r"(?:\s+CliqueId\s+:\s+[^\n]+\n)?"
+        r"(?:\s+ClusterUUID\s+:\s+[^\n]+\n)?"
+        r"\s+Health\s*$\n"
+        r"\s+Summary\s+:\s+([^\n]+)\n"
+        r"\s+Bandwidth\s+:\s+([^\n]+)\n"
+        r"\s+Route Recovery in progress\s+:\s+([^\n]+)",
+        re.MULTILINE,
+    )
+    return {
+        f"gpu{gpu}": {
+            "state": match.group(1).strip(),
+            "status": match.group(2).strip(),
+            "health": match.group(3).strip(),
+            "bandwidth": match.group(4).strip(),
+            "route_recovery": match.group(5).strip(),
+        }
+        for gpu, match in enumerate(pattern.finditer(output))
+    }
+
+
+def _capture(command: list[str]) -> tuple[str, str]:
     try:
         result = subprocess.run(
             command,
@@ -285,33 +340,196 @@ def collect_dcgm_count_snapshot() -> dict[str, float]:
             stderr=subprocess.STDOUT,
             timeout=30,
         )
-    except (OSError, subprocess.TimeoutExpired):
-        return {}
-    parsed = parse_dcgm_dmon(result.stdout, DCGM_NVLINK_COUNT_FIELDS)
-    return {name: samples[-1] for name, samples in parsed.items() if samples}
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return "UNAVAILABLE", str(exc)
+    return ("PASS" if result.returncode == 0 else "FAIL"), result.stdout
 
 
-def dcgm_count_delta(
-    before: Mapping[str, float], after: Mapping[str, float]
-) -> dict[str, float]:
+def collect_route_snapshot() -> dict[str, object]:
+    commands = {
+        "nvlink_data": ["nvidia-smi", "nvlink", "-gt", "d"],
+        "c2c_status": ["nvidia-smi", "c2c", "-s"],
+        "c2c_errors": ["nvidia-smi", "c2c", "-e"],
+        "fabric": ["nvidia-smi", "-q"],
+    }
+    outputs: dict[str, str] = {}
+    statuses: dict[str, str] = {}
+    for name, command in commands.items():
+        statuses[name], outputs[name] = _capture(command)
     return {
-        name: float(value) - float(before[name])
-        for name, value in after.items()
-        if name in before
+        "backend": "nvidia-smi",
+        "command_status": statuses,
+        "nvlink_bytes": parse_nvlink_data(outputs["nvlink_data"]),
+        "c2c_capacity_gb_s": parse_c2c_status(outputs["c2c_status"]),
+        "c2c_errors": parse_c2c_errors(outputs["c2c_errors"]),
+        "fabric": parse_fabric(outputs["fabric"]),
     }
 
 
-def dcgm_fields_present(
-    snapshot: Mapping[str, float], field_ids: Iterable[int]
-) -> bool:
-    names = tuple(snapshot)
-    return all(
-        any(name.endswith(f"field{field_id}") for name in names)
-        for field_id in field_ids
-    )
+def route_snapshot_errors(snapshot: Mapping[str, object]) -> list[str]:
+    errors: list[str] = []
+    command_status = snapshot.get("command_status", {})
+    if not isinstance(command_status, Mapping) or any(
+        value != "PASS" for value in command_status.values()
+    ):
+        errors.append(f"nvidia-smi command failure: {dict(command_status)}")
+
+    nvlink = snapshot.get("nvlink_bytes", {})
+    c2c_capacity = snapshot.get("c2c_capacity_gb_s", {})
+    c2c_errors = snapshot.get("c2c_errors", {})
+    fabric = snapshot.get("fabric", {})
+    if not all(
+        isinstance(value, Mapping)
+        for value in (nvlink, c2c_capacity, c2c_errors, fabric)
+    ):
+        return [*errors, "route snapshot has invalid field types"]
+
+    gpu_names = sorted({name.split("/", 1)[0] for name in nvlink})
+    if not gpu_names:
+        errors.append("no NVLink byte counters were parsed")
+    for gpu in gpu_names:
+        links = {
+            name.split("/")[1]
+            for name in nvlink
+            if name.startswith(f"{gpu}/") and name.endswith("_bytes")
+        }
+        tx = [
+            name
+            for name in nvlink
+            if name.startswith(f"{gpu}/") and name.endswith("/tx_bytes")
+        ]
+        rx = [
+            name
+            for name in nvlink
+            if name.startswith(f"{gpu}/") and name.endswith("/rx_bytes")
+        ]
+        if (
+            len(links) != EXPECTED_GB200_NVLINKS
+            or len(tx) != len(links)
+            or len(rx) != len(links)
+        ):
+            errors.append(f"{gpu} NVLink counters are incomplete")
+        c2c_links = {
+            name.split("/")[1] for name in c2c_capacity if name.startswith(f"{gpu}/")
+        }
+        if len(c2c_links) != EXPECTED_GB200_C2C_LINKS or any(
+            float(value) <= 0
+            for name, value in c2c_capacity.items()
+            if name.startswith(f"{gpu}/")
+        ):
+            errors.append(f"{gpu} C2C capability is incomplete")
+        expected_error_fields = EXPECTED_GB200_C2C_LINKS * 3
+        actual_error_fields = sum(name.startswith(f"{gpu}/") for name in c2c_errors)
+        if actual_error_fields != expected_error_fields:
+            errors.append(f"{gpu} C2C error counters are incomplete")
+        fabric_state = fabric.get(gpu)
+        if not isinstance(fabric_state, Mapping) or fabric_state != {
+            "state": "Completed",
+            "status": "Success",
+            "health": "Healthy",
+            "bandwidth": "Full",
+            "route_recovery": "False",
+        }:
+            errors.append(f"{gpu} Fabric is not completed, healthy, and full-bandwidth")
+    if set(fabric) != set(gpu_names):
+        errors.append("Fabric GPU set does not match NVLink counters")
+    return errors
+
+
+def build_route_evidence(
+    before: Mapping[str, object],
+    after: Mapping[str, object],
+    semantic: str,
+) -> dict[str, object]:
+    diagnostics = [
+        *(f"before: {error}" for error in route_snapshot_errors(before)),
+        *(f"after: {error}" for error in route_snapshot_errors(after)),
+    ]
+    before_nvlink = before.get("nvlink_bytes", {})
+    after_nvlink = after.get("nvlink_bytes", {})
+    before_errors = before.get("c2c_errors", {})
+    after_errors = after.get("c2c_errors", {})
+    nvlink_delta: dict[str, int] = {}
+    c2c_error_delta: dict[str, int] = {}
+    if isinstance(before_nvlink, Mapping) and isinstance(after_nvlink, Mapping):
+        nvlink_delta = {
+            str(name): int(value) - int(before_nvlink[name])
+            for name, value in after_nvlink.items()
+            if name in before_nvlink
+        }
+    if isinstance(before_errors, Mapping) and isinstance(after_errors, Mapping):
+        c2c_error_delta = {
+            str(name): int(value) - int(before_errors[name])
+            for name, value in after_errors.items()
+            if name in before_errors
+        }
+
+    gpu_names = sorted({name.split("/", 1)[0] for name in nvlink_delta})
+    byte_delta_by_gpu = {
+        gpu: {
+            direction: sum(
+                value
+                for name, value in nvlink_delta.items()
+                if name.startswith(f"{gpu}/") and name.endswith(f"/{direction}_bytes")
+            )
+            for direction in ("tx", "rx")
+        }
+        for gpu in gpu_names
+    }
+    byte_delta_by_direction = {
+        direction: sum(
+            value
+            for name, value in nvlink_delta.items()
+            if name.endswith(f"/{direction}_bytes")
+        )
+        for direction in ("tx", "rx")
+    }
+    error_delta_by_gpu = {
+        gpu: sum(
+            value
+            for name, value in c2c_error_delta.items()
+            if name.startswith(f"{gpu}/")
+        )
+        for gpu in gpu_names
+    }
+    if any(value < 0 for value in nvlink_delta.values()):
+        diagnostics.append("an NVLink byte counter decreased")
+    if not all(value > 0 for value in byte_delta_by_direction.values()):
+        diagnostics.append("both NVLink TX and RX byte deltas must be positive")
+    if any(value != 0 for value in c2c_error_delta.values()):
+        diagnostics.append("a C2C error counter changed")
+
+    c2c_capacity = after.get("c2c_capacity_gb_s", {})
+    c2c_capacity_by_gpu: dict[str, float] = {}
+    if isinstance(c2c_capacity, Mapping):
+        c2c_capacity_by_gpu = {
+            gpu: sum(
+                float(value)
+                for name, value in c2c_capacity.items()
+                if name.startswith(f"{gpu}/")
+            )
+            for gpu in gpu_names
+        }
+    return {
+        "status": "PASS" if not diagnostics else "FAIL",
+        "route_verification": "C2C_ROUTE_INFERRED",
+        "counter_backend": "nvidia-smi",
+        "direct_c2c_byte_counter": "UNAVAILABLE",
+        "nvlink_byte_delta_by_direction": byte_delta_by_direction,
+        "nvlink_byte_delta_by_gpu": byte_delta_by_gpu,
+        "c2c_reported_link_capacity_sum_gb_s_by_gpu": c2c_capacity_by_gpu,
+        "c2c_error_delta_by_gpu": error_delta_by_gpu,
+        "fabric": after.get("fabric", {}),
+        "diagnostics": diagnostics,
+        "semantic": semantic,
+    }
 
 
 def collect_system() -> dict[str, object]:
+    route = collect_route_snapshot()
+    capacity = route["c2c_capacity_gb_s"]
+    c2c_errors = route["c2c_errors"]
+    gpu_names = sorted({name.split("/", 1)[0] for name in capacity})
     return {
         "hostname": socket.gethostname(),
         "pid": os.getpid(),
@@ -323,18 +541,30 @@ def collect_system() -> dict[str, object]:
             ]
         ),
         "topology": command_output(["nvidia-smi", "topo", "-m"]),
-        "fabric": command_output(["nvidia-smi", "-q", "-d", "FABRIC"]),
-        "nvlink": command_output(["nvidia-smi", "nvlink", "--status"]),
-        "dcgm": command_output(
-            [
-                "dcgmi",
-                "dmon",
-                "-e",
-                ",".join(str(field) for field in DCGM_NVLINK_COUNT_FIELDS),
-                "-c",
-                "1",
-            ]
-        ),
+        "nvlink_status": command_output(["nvidia-smi", "nvlink", "--status"]),
+        "route_observation": {
+            "backend": route["backend"],
+            "command_status": route["command_status"],
+            "diagnostics": route_snapshot_errors(route),
+            "nvlink_byte_counter_count": len(route["nvlink_bytes"]),
+            "c2c_reported_link_capacity_sum_gb_s_by_gpu": {
+                gpu: sum(
+                    float(value)
+                    for name, value in capacity.items()
+                    if name.startswith(f"{gpu}/")
+                )
+                for gpu in gpu_names
+            },
+            "c2c_error_count_by_gpu": {
+                gpu: sum(
+                    int(value)
+                    for name, value in c2c_errors.items()
+                    if name.startswith(f"{gpu}/")
+                )
+                for gpu in gpu_names
+            },
+            "fabric": route["fabric"],
+        },
         "rdma_counters": collect_rdma_counters(),
     }
 

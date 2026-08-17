@@ -90,13 +90,40 @@ class EgmStoreGb200Test(unittest.TestCase):
     def test_bandwidth_conversion(self):
         self.assertEqual(consumer.bandwidth_gib_s(1024**3, 1_000_000_000), 1.0)
 
-    def test_dcgm_rows_and_rdma_latency_samples_are_parsed(self):
-        dcgm = validation_common.parse_dcgm_dmon(
-            "# Entity field headers\nGPU 0  123 456\nGPU 1  N/A 789\n",
-            [1201, 1203],
+    def test_nvidia_route_evidence_and_rdma_latency_are_parsed(self):
+        nvlink = validation_common.parse_nvlink_data(
+            "GPU 0: NVIDIA GB200 (UUID: GPU-test)\n"
+            "         Link 0: Data Tx: 1,234 KiB\n"
+            "         Link 0: Data Rx: 5,678 KiB\n"
         )
-        self.assertEqual(dcgm["gpu0/field1201"], [123.0])
-        self.assertEqual(dcgm["gpu1/field1203"], [789.0])
+        self.assertEqual(nvlink["gpu0/link0/tx_bytes"], 1234 * 1024)
+        self.assertEqual(nvlink["gpu0/link0/rx_bytes"], 5678 * 1024)
+        self.assertEqual(
+            validation_common.parse_c2c_status(
+                "GPU 0: NVIDIA GB200 (UUID: GPU-test)\n"
+                "         C2C Link 0: 44.712 GB/s\n"
+            )["gpu0/link0/capacity_gb_s"],
+            44.712,
+        )
+        self.assertEqual(
+            validation_common.parse_c2c_errors(
+                "GPU 0: NVIDIA GB200 (UUID: GPU-test)\n"
+                " C2C Link 0: Error Back-to-Back Replay Count: 7\n"
+            )["gpu0/link0/back_to_back_replay_errors"],
+            7,
+        )
+        fabric = validation_common.parse_fabric(
+            "    Fabric\n"
+            "        State : Completed\n"
+            "        Status : Success\n"
+            "        CliqueId : 32766\n"
+            "        ClusterUUID : test\n"
+            "        Health\n"
+            "            Summary : Healthy\n"
+            "            Bandwidth : Full\n"
+            "            Route Recovery in progress : False\n"
+        )
+        self.assertEqual(fabric["gpu0"]["bandwidth"], "Full")
         self.assertEqual(
             orchestrator.parse_te_latency_samples(
                 "I0000 Latency sample: duration 91 ns\n"
@@ -104,6 +131,53 @@ class EgmStoreGb200Test(unittest.TestCase):
             ),
             [91.0, 103.0],
         )
+
+    def test_inferred_c2c_route_requires_nvlink_traffic_and_no_new_errors(self):
+        nvlink = {
+            f"gpu0/link{link}/{direction}_bytes": 1000
+            for link in range(18)
+            for direction in ("tx", "rx")
+        }
+        capacity = {f"gpu0/link{link}/capacity_gb_s": 44.712 for link in range(5)}
+        errors = {
+            f"gpu0/link{link}/{name}_errors": 0
+            for link in range(5)
+            for name in ("interrupt", "replay", "back_to_back_replay")
+        }
+        fabric = {
+            "gpu0": {
+                "state": "Completed",
+                "status": "Success",
+                "health": "Healthy",
+                "bandwidth": "Full",
+                "route_recovery": "False",
+            }
+        }
+        before = {
+            "backend": "nvidia-smi",
+            "command_status": {
+                "nvlink_data": "PASS",
+                "c2c_status": "PASS",
+                "c2c_errors": "PASS",
+                "fabric": "PASS",
+            },
+            "nvlink_bytes": nvlink,
+            "c2c_capacity_gb_s": capacity,
+            "c2c_errors": errors,
+            "fabric": fabric,
+        }
+        after = {
+            **before,
+            "nvlink_bytes": {name: value + 4096 for name, value in nvlink.items()},
+            "c2c_errors": dict(errors),
+        }
+        evidence = validation_common.build_route_evidence(before, after, "test")
+        self.assertEqual(evidence["status"], "PASS")
+        self.assertEqual(evidence["route_verification"], "C2C_ROUTE_INFERRED")
+
+        after["c2c_errors"]["gpu0/link0/replay_errors"] = 1
+        evidence = validation_common.build_route_evidence(before, after, "test")
+        self.assertEqual(evidence["status"], "FAIL")
 
     def test_raw_ce_ceiling_requires_stable_bounded_matrix(self):
         records: list[dict[str, object]] = []
@@ -356,7 +430,13 @@ class EgmStoreGb200Test(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as directory:
             config = pathlib.Path(directory) / "config"
-            config.write_text(source)
+            result_root = pathlib.Path(directory) / "results"
+            config.write_text(
+                source.replace(
+                    'RESULT_ROOT="/tmp/mooncake-egm-gb200"',
+                    f'RESULT_ROOT="{result_root}"',
+                )
+            )
             result = subprocess.run(
                 ["bash", str(wrapper), "--config", str(config), "print-config"],
                 check=True,
@@ -365,6 +445,13 @@ class EgmStoreGb200Test(unittest.TestCase):
                 cwd=REPO_ROOT,
                 env={"PATH": str(pathlib.Path("/usr/bin")) + ":/bin"},
             )
+            stop_result = subprocess.run(
+                ["bash", str(wrapper), "--config", str(config), "provider-stop"],
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+                cwd=REPO_ROOT,
+            )
         self.assertIn("NODE_A_IP=192.0.2.10", result.stdout)
         self.assertIn("NODE_B_IP=192.0.2.11", result.stdout)
         self.assertIn("SOURCE_SHA=", result.stdout)
@@ -372,6 +459,7 @@ class EgmStoreGb200Test(unittest.TestCase):
         self.assertIn("EGM_POOL_SIZE=20 GB", result.stdout)
         self.assertIn("BUILD_UNIT_TESTS=0", result.stdout)
         self.assertIn("MC_IMEX_DAEMON_EXTERNAL=1", result.stdout)
+        self.assertIn("Provider cleanup skipped", stop_result.stdout)
 
     def test_report_requires_matching_teardown_and_renders_performance(self):
         run_id = "report-run"

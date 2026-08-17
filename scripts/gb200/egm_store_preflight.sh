@@ -2,6 +2,7 @@
 
 set -uo pipefail
 
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 failures=0
 
 pass() { printf 'PASS  %s\n' "$*"; }
@@ -24,7 +25,6 @@ printf 'kernel=%s arch=%s user=%s\n' "$(uname -r)" "$(uname -m)" "$(id -un)"
 check_command python3
 check_command nvidia-smi
 check_command nvcc
-check_command dcgmi
 
 if [[ "$(uname -m)" == "aarch64" ]]; then
   pass 'GB200 Grace ARM64 architecture detected'
@@ -68,29 +68,37 @@ if command -v nvidia-smi >/dev/null 2>&1; then
   else
     fail 'nvidia-smi topo -m failed'
   fi
-  if nvidia-smi -q -d FABRIC; then
-    pass 'NVIDIA Fabric state queried'
-  else
-    fail 'nvidia-smi Fabric query failed'
-  fi
 fi
 
 if command -v nvcc >/dev/null 2>&1; then
   nvcc --version || fail 'nvcc cannot report its version'
 fi
 
-if command -v dcgmi >/dev/null 2>&1; then
-  dcgm_count_fields="1201,1203,1204,1205,1206,1207,1208,1209,1210,1211"
-  dcgm_count_fields+=",1212,1213,1214,1215,1216,1217,1218,1219"
-  if dcgmi dmon -e "$dcgm_count_fields" -c 1; then
-    pass 'NVLink 5 byte/error count fields are readable'
+if command -v python3 >/dev/null 2>&1 && command -v nvidia-smi >/dev/null 2>&1; then
+  if PYTHONPATH="$script_dir" python3 - <<'PY'
+import json
+
+from egm_validation_common import collect_route_snapshot, route_snapshot_errors
+
+snapshot = collect_route_snapshot()
+errors = route_snapshot_errors(snapshot)
+print(json.dumps({
+    "backend": snapshot["backend"],
+    "command_status": snapshot["command_status"],
+    "nvlink_byte_counters": len(snapshot["nvlink_bytes"]),
+    "c2c_capacity_counters": len(snapshot["c2c_capacity_gb_s"]),
+    "c2c_error_counters": len(snapshot["c2c_errors"]),
+    "fabric_gpus": len(snapshot["fabric"]),
+}, sort_keys=True))
+for error in errors:
+    print(f"route observation error: {error}")
+raise SystemExit(bool(errors))
+PY
+  then
+    pass 'NVLink bytes, C2C capability/errors, and Fabric health are readable'
+    pass 'C2C traffic qualification will use explicit C2C_ROUTE_INFERRED evidence'
   else
-    fail 'DCGM NVLink 5 byte/error count fields are unavailable'
-  fi
-  if dcgmi dmon -e 1077,1079 -c 1; then
-    pass 'C2C TX/RX data profile fields are readable'
-  else
-    fail 'DCGM C2C TX/RX data profile fields are unavailable'
+    fail 'nvidia-smi route observation is incomplete'
   fi
 fi
 

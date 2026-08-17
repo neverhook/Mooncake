@@ -25,22 +25,17 @@ from collections.abc import Mapping
 try:
     from scripts.gb200.egm_validation_common import (
         artifact_manifest,
-        collect_dcgm_count_snapshot,
         collect_rdma_counters,
+        collect_route_snapshot,
         collect_system,
+        build_route_evidence,
         config_digest,
         counter_delta,
-        dcgm_count_delta,
-        DCGM_C2C_PROFILE_FIELDS,
-        DCGM_NVLINK_COUNT_FIELDS,
-        DCGM_NVLINK_ERROR_FIELDS,
-        dcgm_fields_present,
         emit_evidence,
         free_port,
         metadata_delete,
         metadata_get,
         metadata_put,
-        parse_dcgm_dmon,
         read_jsonl,
         route_address,
         summarize,
@@ -49,22 +44,17 @@ try:
 except ModuleNotFoundError:
     from egm_validation_common import (  # type: ignore[no-redef]
         artifact_manifest,
-        collect_dcgm_count_snapshot,
         collect_rdma_counters,
+        collect_route_snapshot,
         collect_system,
+        build_route_evidence,
         config_digest,
         counter_delta,
-        dcgm_count_delta,
-        DCGM_C2C_PROFILE_FIELDS,
-        DCGM_NVLINK_COUNT_FIELDS,
-        DCGM_NVLINK_ERROR_FIELDS,
-        dcgm_fields_present,
         emit_evidence,
         free_port,
         metadata_delete,
         metadata_get,
         metadata_put,
-        parse_dcgm_dmon,
         read_jsonl,
         route_address,
         summarize,
@@ -778,8 +768,6 @@ def run_raw_benchmark(
     raw_stderr = result_dir / "raw-egm.stderr.log"
     h2h_log = result_dir / "raw-egm-h2h.jsonl"
     h2h_stderr = result_dir / "raw-egm-h2h.stderr.log"
-    c2c_log = result_dir / "raw-egm.dcgm-c2c.log"
-    h2h_c2c_log = result_dir / "raw-egm-h2h.dcgm-c2c.log"
     base_command = [
         str(binary),
         f"--metadata_server={manifest['metadata_server']}",
@@ -802,18 +790,13 @@ def run_raw_benchmark(
         "--paths=H2H_LOCAL_TO_REMOTE,H2H_REMOTE_TO_LOCAL",
         "--run_latency=false",
     ]
-    dcgm_before = collect_dcgm_count_snapshot()
+    route_before = collect_route_snapshot()
     with (
         raw_log.open("w") as output,
         raw_stderr.open("w") as errors,
         h2h_log.open("w") as h2h_output,
         h2h_stderr.open("w") as h2h_errors,
-        c2c_log.open("w") as c2c_output,
-        h2h_c2c_log.open("w") as h2h_c2c_output,
     ):
-        c2c_monitor = start_dcgm_c2c_monitor(c2c_output)
-        if c2c_monitor is not None:
-            time.sleep(2)
         mandatory_completed = run(
             mandatory_command,
             env=clean_transport_env(),
@@ -821,11 +804,7 @@ def run_raw_benchmark(
             stdout=output,
             stderr=errors,
         )
-        stop_process(c2c_monitor, "dcgm_c2c_monitor")
-        dcgm_mandatory_after = collect_dcgm_count_snapshot()
-        h2h_c2c_monitor = start_dcgm_c2c_monitor(h2h_c2c_output)
-        if h2h_c2c_monitor is not None:
-            time.sleep(2)
+        route_mandatory_after = collect_route_snapshot()
         h2h_completed = run(
             h2h_command,
             env=clean_transport_env(),
@@ -833,8 +812,7 @@ def run_raw_benchmark(
             stdout=h2h_output,
             stderr=h2h_errors,
         )
-        stop_process(h2h_c2c_monitor, "dcgm_h2h_c2c_monitor")
-    dcgm_after = collect_dcgm_count_snapshot()
+    route_after = collect_route_snapshot()
     records = read_jsonl(raw_log)
     summary = raw_summaries(records)
     if mandatory_completed.returncode != 0:
@@ -852,142 +830,22 @@ def run_raw_benchmark(
     )
     h2h_summary["returncode"] = h2h_completed.returncode
     summary["supplementary_h2h"] = h2h_summary
-    count_delta = dcgm_count_delta(dcgm_before, dcgm_mandatory_after)
-    c2c_samples = parse_dcgm_dmon(
-        c2c_log.read_text(errors="replace"), DCGM_C2C_PROFILE_FIELDS
+    route = build_route_evidence(
+        route_before,
+        route_mandatory_after,
+        "Node B HBM-to/from-remote-EGM NVLink traffic with inferred C2C route",
     )
-    nvlink_bytes = sum(
-        max(0.0, value)
-        for name, value in count_delta.items()
-        if name.endswith(("field1201", "field1203"))
+    h2h_summary["route"] = build_route_evidence(
+        route_mandatory_after,
+        route_after,
+        "host-submitted, GPU-CE/SM-executed EGM H2H route evidence",
     )
-    nvlink_positive_by_field = {
-        str(field): sum(
-            max(0.0, value)
-            for name, value in count_delta.items()
-            if name.endswith(f"field{field}")
-        )
-        for field in (1201, 1203)
-    }
-    error_delta = sum(
-        max(0.0, value)
-        for name, value in count_delta.items()
-        if any(name.endswith(f"field{field}") for field in DCGM_NVLINK_ERROR_FIELDS)
-    )
-    c2c_bytes_observed = sum(
-        value for samples in c2c_samples.values() for value in samples if value > 0
-    )
-    c2c_positive_by_field = {
-        str(field): sum(
-            value
-            for name, samples in c2c_samples.items()
-            if name.endswith(f"field{field}")
-            for value in samples
-            if value > 0
-        )
-        for field in DCGM_C2C_PROFILE_FIELDS
-    }
-    route_status = (
-        "PASS"
-        if dcgm_before
-        and dcgm_after
-        and dcgm_fields_present(dcgm_before, DCGM_NVLINK_COUNT_FIELDS)
-        and dcgm_fields_present(dcgm_after, DCGM_NVLINK_COUNT_FIELDS)
-        and all(value > 0 for value in nvlink_positive_by_field.values())
-        and error_delta == 0
-        else "FAIL"
-    )
-    route = {
-        "status": route_status,
-        "dcgm_count_before": dcgm_before,
-        "dcgm_count_after": dcgm_after,
-        "dcgm_count_delta": count_delta,
-        "c2c_profile_samples": c2c_samples,
-        "positive_nvlink_byte_delta": nvlink_bytes,
-        "positive_nvlink_byte_delta_by_field": nvlink_positive_by_field,
-        "positive_c2c_profile_sum": c2c_bytes_observed,
-        "positive_c2c_profile_by_field": c2c_positive_by_field,
-        "positive_error_delta": error_delta,
-        "semantic": (
-            "Node B NVLink byte-count gate plus informational local C2C profile; "
-            "remote EGM C2C qualification is completed by Node A evidence"
-        ),
-    }
-    h2h_count_delta = dcgm_count_delta(dcgm_mandatory_after, dcgm_after)
-    h2h_c2c_samples = parse_dcgm_dmon(
-        h2h_c2c_log.read_text(errors="replace"), DCGM_C2C_PROFILE_FIELDS
-    )
-    h2h_nvlink_by_field = {
-        str(field): sum(
-            max(0.0, value)
-            for name, value in h2h_count_delta.items()
-            if name.endswith(f"field{field}")
-        )
-        for field in (1201, 1203)
-    }
-    h2h_c2c_by_field = {
-        str(field): sum(
-            value
-            for name, samples in h2h_c2c_samples.items()
-            if name.endswith(f"field{field}")
-            for value in samples
-            if value > 0
-        )
-        for field in DCGM_C2C_PROFILE_FIELDS
-    }
-    h2h_error_delta = sum(
-        max(0.0, value)
-        for name, value in h2h_count_delta.items()
-        if any(name.endswith(f"field{field}") for field in DCGM_NVLINK_ERROR_FIELDS)
-    )
-    h2h_route_pass = (
-        dcgm_fields_present(dcgm_mandatory_after, DCGM_NVLINK_COUNT_FIELDS)
-        and dcgm_fields_present(dcgm_after, DCGM_NVLINK_COUNT_FIELDS)
-        and all(value > 0 for value in h2h_nvlink_by_field.values())
-        and all(value > 0 for value in h2h_c2c_by_field.values())
-        and h2h_error_delta == 0
-    )
-    h2h_summary["route"] = {
-        "status": "PASS" if h2h_route_pass else "FAIL",
-        "dcgm_count_delta": h2h_count_delta,
-        "c2c_profile_samples": h2h_c2c_samples,
-        "positive_nvlink_byte_delta_by_field": h2h_nvlink_by_field,
-        "positive_c2c_profile_by_field": h2h_c2c_by_field,
-        "positive_error_delta": h2h_error_delta,
-        "semantic": "host-submitted, GPU-CE/SM-executed EGM H2H route evidence",
-    }
     h2h_summary["status"] = (
         "PASS"
-        if h2h_execution_pass and h2h_route_pass
+        if h2h_execution_pass and h2h_summary["route"]["status"] == "PASS"
         else "UNSUPPORTED_OR_ROUTE_UNVERIFIED"
     )
     return summary, route
-
-
-def shutil_which(command: str) -> str | None:
-    for directory in os.environ.get("PATH", "").split(os.pathsep):
-        path = pathlib.Path(directory) / command
-        if path.is_file() and os.access(path, os.X_OK):
-            return str(path)
-    return None
-
-
-def start_dcgm_c2c_monitor(output) -> subprocess.Popen[str] | None:
-    if not shutil_which("dcgmi"):
-        return None
-    return subprocess.Popen(
-        [
-            "dcgmi",
-            "dmon",
-            "-e",
-            ",".join(str(field) for field in DCGM_C2C_PROFILE_FIELDS),
-            "-d",
-            "1000",
-        ],
-        text=True,
-        stdout=output,
-        stderr=subprocess.STDOUT,
-    )
 
 
 def provider_mode(args: argparse.Namespace) -> int:
@@ -1040,8 +898,6 @@ def provider_mode(args: argparse.Namespace) -> int:
     token = secrets.token_hex(24)
     rdma_process: subprocess.Popen[str] | None = None
     rdma_log = None
-    c2c_monitor: subprocess.Popen[str] | None = None
-    c2c_output = None
     status = "FAIL"
     error = "provider orchestration did not complete"
     completion: dict[str, object] | None = None
@@ -1056,7 +912,7 @@ def provider_mode(args: argparse.Namespace) -> int:
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
     system_before = collect_system()
-    dcgm_before = collect_dcgm_count_snapshot()
+    route_before = collect_route_snapshot()
     try:
         if not args.skip_build:
             run([str(wrapper), "--config", str(config_path), "build"], cwd=repo_root)
@@ -1067,21 +923,6 @@ def provider_mode(args: argparse.Namespace) -> int:
             [str(wrapper), "--config", str(config_path), "provider-start"],
             cwd=repo_root,
         )
-        if shutil_which("dcgmi"):
-            c2c_output = (result_dir / "node-a.dcgm-c2c.log").open("w")
-            c2c_monitor = subprocess.Popen(
-                [
-                    "dcgmi",
-                    "dmon",
-                    "-e",
-                    ",".join(str(field) for field in DCGM_C2C_PROFILE_FIELDS),
-                    "-d",
-                    "1000",
-                ],
-                text=True,
-                stdout=c2c_output,
-                stderr=subprocess.STDOUT,
-            )
         rdma_binary = (
             build_dir / "mooncake-transfer-engine/example/transfer_engine_bench"
         )
@@ -1168,9 +1009,6 @@ def provider_mode(args: argparse.Namespace) -> int:
     except (Exception, KeyboardInterrupt) as exc:
         error = str(exc)
     finally:
-        cleanup.append(stop_process(c2c_monitor, "dcgm_c2c_monitor"))
-        if c2c_output is not None:
-            c2c_output.close()
         cleanup.append(stop_process(rdma_process, "rdma_target"))
         if rdma_log is not None:
             rdma_log.close()
@@ -1194,71 +1032,15 @@ def provider_mode(args: argparse.Namespace) -> int:
         except subprocess.CalledProcessError as exc:
             cleanup.append({"label": "master", "status": "FAIL", "error": str(exc)})
             status = "FAIL"
-    dcgm_after = collect_dcgm_count_snapshot()
-    count_delta = dcgm_count_delta(dcgm_before, dcgm_after)
-    c2c_log_path = result_dir / "node-a.dcgm-c2c.log"
-    c2c_samples = parse_dcgm_dmon(
-        c2c_log_path.read_text(errors="replace") if c2c_log_path.exists() else "",
-        DCGM_C2C_PROFILE_FIELDS,
+    route_after = collect_route_snapshot()
+    route_evidence = build_route_evidence(
+        route_before,
+        route_after,
+        "Node A remote-EGM endpoint NVLink traffic with inferred C2C route",
     )
-    nvlink_bytes = sum(
-        max(0.0, value)
-        for name, value in count_delta.items()
-        if name.endswith(("field1201", "field1203"))
-    )
-    nvlink_positive_by_field = {
-        str(field): sum(
-            max(0.0, value)
-            for name, value in count_delta.items()
-            if name.endswith(f"field{field}")
-        )
-        for field in (1201, 1203)
-    }
-    error_delta = sum(
-        max(0.0, value)
-        for name, value in count_delta.items()
-        if any(name.endswith(f"field{field}") for field in DCGM_NVLINK_ERROR_FIELDS)
-    )
-    c2c_bytes = sum(
-        value for samples in c2c_samples.values() for value in samples if value > 0
-    )
-    c2c_positive_by_field = {
-        str(field): sum(
-            value
-            for name, samples in c2c_samples.items()
-            if name.endswith(f"field{field}")
-            for value in samples
-            if value > 0
-        )
-        for field in DCGM_C2C_PROFILE_FIELDS
-    }
-    route_status = (
-        "PASS"
-        if dcgm_before
-        and dcgm_after
-        and dcgm_fields_present(dcgm_before, DCGM_NVLINK_COUNT_FIELDS)
-        and dcgm_fields_present(dcgm_after, DCGM_NVLINK_COUNT_FIELDS)
-        and all(value > 0 for value in nvlink_positive_by_field.values())
-        and all(value > 0 for value in c2c_positive_by_field.values())
-        and error_delta == 0
-        else "FAIL"
-    )
-    if status == "PASS" and route_status != "PASS":
+    if status == "PASS" and route_evidence["status"] != "PASS":
         status = "FAIL"
         error = "Node A C2C/NVLink route evidence is incomplete or contains errors"
-    route_evidence = {
-        "status": route_status,
-        "dcgm_count_before": dcgm_before,
-        "dcgm_count_after": dcgm_after,
-        "dcgm_count_delta": count_delta,
-        "c2c_profile_samples": c2c_samples,
-        "positive_nvlink_byte_delta": nvlink_bytes,
-        "positive_nvlink_byte_delta_by_field": nvlink_positive_by_field,
-        "positive_c2c_profile_sum": c2c_bytes,
-        "positive_c2c_profile_by_field": c2c_positive_by_field,
-        "positive_error_delta": error_delta,
-        "semantic": "Node A remote-EGM endpoint C2C and NVLink route qualification",
-    }
     evidence = {
         "schema": "MOONCAKE_GB200_EVIDENCE_V1",
         "role": "A",
@@ -1390,46 +1172,16 @@ def consumer_mode(args: argparse.Namespace) -> int:
             build_dir / "mooncake-transfer-engine/example/transfer_engine_bench"
         )
         rdma = run_rdma_matrix(rdma_binary, manifest, local_ip)
-        store_dcgm_before = collect_dcgm_count_snapshot()
+        store_route_before = collect_route_snapshot()
         run([str(wrapper), "--config", str(config_path), "bench"], cwd=repo_root)
-        store_dcgm_after = collect_dcgm_count_snapshot()
+        store_route_after = collect_route_snapshot()
         store = store_summary(result_dir / "bench.jsonl")
-        store_count_delta = dcgm_count_delta(store_dcgm_before, store_dcgm_after)
-        store_nvlink_bytes = sum(
-            max(0.0, value)
-            for name, value in store_count_delta.items()
-            if name.endswith(("field1201", "field1203"))
+        store["route"] = build_route_evidence(
+            store_route_before,
+            store_route_after,
+            "Node B Store HBM-to/from-remote-EGM NVLink traffic with inferred C2C route",
         )
-        store_nvlink_by_field = {
-            str(field): sum(
-                max(0.0, value)
-                for name, value in store_count_delta.items()
-                if name.endswith(f"field{field}")
-            )
-            for field in (1201, 1203)
-        }
-        store_error_delta = sum(
-            max(0.0, value)
-            for name, value in store_count_delta.items()
-            if any(name.endswith(f"field{field}") for field in DCGM_NVLINK_ERROR_FIELDS)
-        )
-        store_route_status = (
-            "PASS"
-            if dcgm_fields_present(store_dcgm_before, DCGM_NVLINK_COUNT_FIELDS)
-            and dcgm_fields_present(store_dcgm_after, DCGM_NVLINK_COUNT_FIELDS)
-            and all(value > 0 for value in store_nvlink_by_field.values())
-            and store_error_delta == 0
-            else "FAIL"
-        )
-        store["route"] = {
-            "status": store_route_status,
-            "dcgm_count_delta": store_count_delta,
-            "positive_nvlink_byte_delta": store_nvlink_bytes,
-            "positive_nvlink_byte_delta_by_field": store_nvlink_by_field,
-            "positive_error_delta": store_error_delta,
-            "semantic": "Node B Store HBM-to/from-remote-EGM NVLink route evidence",
-        }
-        if store_route_status != "PASS":
+        if store["route"]["status"] != "PASS":
             store["status"] = "FAIL"
         mandatory = [
             raw.get("status"),

@@ -16,8 +16,8 @@ scripts/gb200/egm_store_gb200.sh full-provider \
 ```
 
 Node A builds the focused targets, runs preflight, selects free ports, starts
-Master, Store Provider, the ordinary-DRAM RDMA target, and route monitoring,
-then prints the exact Node B command. Run that command on Node B, for example:
+Master, Store Provider, and the ordinary-DRAM RDMA target, then prints the exact
+Node B command. Run that command on Node B, for example:
 
 ```bash
 scripts/gb200/egm_store_gb200.sh full-consumer \
@@ -106,14 +106,22 @@ The final gate requires:
 - exact source SHA and manifest digest;
 - H2D/D2H raw and Store correctness;
 - stable, bounded H2D/D2H CE ceilings;
-- Node B NVLink and RDMA byte deltas with no new counted errors;
-- Node A remote-EGM C2C and NVLink evidence with no new counted errors; and
+- Node B NVLink and RDMA byte deltas with no new C2C errors;
+- Node A remote-EGM NVLink byte deltas, healthy full-bandwidth C2C/Fabric
+  capability, and no new C2C errors; and
 - successful Provider, RDMA target, and Master cleanup.
 
-Preflight requires CUDA/IMEX, an active RDMA port, and DCGM support for NVLink 5
-byte fields 1201/1203, error fields 1204-1219, and C2C data profile fields
-1077/1079. Missing counters invalidate the peak-route conclusion rather than
-silently downgrading it.
+Preflight requires CUDA/IMEX, an active RDMA port, and driver support for
+`nvidia-smi nvlink -gt d`, `nvidia-smi c2c -s`, `nvidia-smi c2c -e`, and the
+Fabric section of full `nvidia-smi -q`. Container-local `dcgmi`, a reachable
+DCGM hostengine, and exporter reconfiguration are not required.
+
+The deployed tools expose cumulative NVLink bytes and C2C capability/error
+counters, but not direct C2C traffic bytes. Successful evidence is therefore
+explicitly labeled `C2C_ROUTE_INFERRED`: it combines positive NVLink TX/RX
+deltas, healthy full-bandwidth C2C/Fabric state, zero C2C error deltas, remote
+HOST_NUMA mapping, and end-to-end byte correctness. It must not be described as
+direct C2C PMU byte-count verification.
 
 ## Advanced and diagnostic actions
 

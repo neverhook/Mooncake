@@ -482,9 +482,19 @@ case "$action" in
     diagnose
     ;;
   provider-stop)
+    provider_recorded=0
+    if [[ -e "$PROVIDER_PID_FILE" || -e "$PROVIDER_LOG" || \
+          -e "$PROVIDER_READY_FILE" ]]; then
+      provider_recorded=1
+    fi
     stop_pid Provider "$PROVIDER_PID_FILE" egm_store_provider.py
-    verify_provider_cleanup
-    verify_provider_unpublished
+    if (( provider_recorded == 1 )); then
+      [[ -s "$PROVIDER_LOG" ]] || fail "Provider log is empty: $PROVIDER_LOG"
+      verify_provider_cleanup
+      verify_provider_unpublished
+    else
+      printf 'Provider cleanup skipped: process was not started\n'
+    fi
     ;;
   diagnose) diagnose ;;
   consumer)

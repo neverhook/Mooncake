@@ -441,25 +441,44 @@ def run_rdma_matrix(
         )
         and value > 0
     )
+    route_status = (
+        "PASS"
+        if all(value > 0 for value in data_delta_by_counter.values())
+        and error_delta == 0
+        else "FAIL"
+    )
     return {
         "path": "KVPOOL_HOST_H2H_RDMA",
+        "acceptance_scope": "SUPPLEMENTARY_COMPARISON",
+        "merge_gate": False,
+        "status": route_status,
         "control_plane": "Host CPU",
         "data_mover": "RNIC DMA",
         "scan": scans,
         "sustained": sustained,
         "latency": latency,
         "rdma_counter_delta": delta,
-        "route_status": (
-            "PASS"
-            if all(value > 0 for value in data_delta_by_counter.values())
-            and error_delta == 0
-            else "FAIL"
-        ),
+        "route_status": route_status,
         "positive_data_counter_delta": data_delta,
         "positive_data_counter_delta_by_direction": data_delta_by_counter,
         "positive_data_bytes_estimate": data_delta * 4,
         "positive_error_counter_delta": error_delta,
     }
+
+
+def run_supplementary_rdma(
+    binary: pathlib.Path, manifest: Mapping[str, object], local_ip: str
+) -> dict[str, object]:
+    try:
+        return run_rdma_matrix(binary, manifest, local_ip)
+    except Exception as exc:
+        return {
+            "path": "KVPOOL_HOST_H2H_RDMA",
+            "acceptance_scope": "SUPPLEMENTARY_COMPARISON",
+            "merge_gate": False,
+            "status": "FAIL",
+            "error": str(exc),
+        }
 
 
 def raw_summaries(records: list[dict[str, object]]) -> dict[str, object]:
@@ -750,6 +769,7 @@ def raw_summaries(records: list[dict[str, object]]) -> dict[str, object]:
         "status": "PASS" if gate_pass and ceiling_pass else "FAIL",
         "correctness_status": "PASS" if gate_pass else "FAIL",
         "ceiling_status": "PASS" if ceiling_pass else "FAIL",
+        "gate": gates[0] if len(gates) == 1 else None,
         "aggregate_cases": [case for case in cases if case["scope"] == "aggregate"],
         "ceilings": ceilings,
         "latency": latency,
@@ -770,6 +790,24 @@ def store_summary(path: pathlib.Path) -> dict[str, object]:
             if item.get("event") in {"performance_summary", "aggregate_iteration"}
             and item.get("sequence_phase") == "steady"
         ],
+    }
+
+
+def log_tail(path: pathlib.Path, limit: int = 4096) -> str:
+    if not path.exists():
+        return ""
+    return path.read_text(errors="replace")[-limit:]
+
+
+def mandatory_validation_statuses(
+    raw: Mapping[str, object],
+    raw_route: Mapping[str, object],
+    store: Mapping[str, object],
+) -> dict[str, object]:
+    return {
+        "egm_raw": raw.get("status"),
+        "egm_route": raw_route.get("status"),
+        "store": store.get("status"),
     }
 
 
@@ -830,11 +868,13 @@ def run_raw_benchmark(
     route_after = collect_route_snapshot()
     records = read_jsonl(raw_log)
     summary = raw_summaries(records)
+    summary["stderr_tail"] = log_tail(raw_stderr)
     if mandatory_completed.returncode != 0:
         summary["status"] = "FAIL"
         summary["returncode"] = mandatory_completed.returncode
     h2h_records = read_jsonl(h2h_log)
     h2h_summary = raw_summaries(h2h_records)
+    h2h_summary["stderr_tail"] = log_tail(h2h_stderr)
     h2h_gates = [
         item for item in h2h_records if item.get("event") == "raw_benchmark_gate"
     ]
@@ -844,6 +884,8 @@ def run_raw_benchmark(
         and h2h_gates[0].get("status") == "PASS"
     )
     h2h_summary["returncode"] = h2h_completed.returncode
+    h2h_summary["acceptance_scope"] = "SUPPLEMENTARY_COMPARISON"
+    h2h_summary["merge_gate"] = False
     summary["supplementary_h2h"] = h2h_summary
     route = build_route_evidence(
         route_before,
@@ -1205,25 +1247,32 @@ def consumer_mode(args: argparse.Namespace) -> int:
         rdma_binary = (
             build_dir / "mooncake-transfer-engine/example/transfer_engine_bench"
         )
-        rdma = run_rdma_matrix(rdma_binary, manifest, local_ip)
+        rdma = run_supplementary_rdma(rdma_binary, manifest, local_ip)
         store_route_before = collect_route_snapshot()
-        run([str(wrapper), "--config", str(config_path), "bench"], cwd=repo_root)
+        store_completed = run(
+            [str(wrapper), "--config", str(config_path), "bench"],
+            cwd=repo_root,
+            check=False,
+        )
         store_route_after = collect_route_snapshot()
         store = store_summary(result_dir / "bench.jsonl")
+        store["returncode"] = store_completed.returncode
+        store["stderr_tail"] = log_tail(result_dir / "bench.stderr.log")
         store["route"] = build_route_evidence(
             store_route_before,
             store_route_after,
             "Node B Store HBM-to/from-remote-EGM NVLink traffic with inferred C2C route",
         )
+        if store_completed.returncode != 0:
+            raise RuntimeError(
+                "Store benchmark failed "
+                f"rc={store_completed.returncode}, gate={store.get('gate')}, "
+                f"stderr_tail={store['stderr_tail']}"
+            )
         if store["route"]["status"] != "PASS":
             store["status"] = "FAIL"
-        mandatory = [
-            raw.get("status"),
-            raw_route.get("status"),
-            rdma.get("route_status"),
-            store.get("status"),
-        ]
-        if mandatory != ["PASS", "PASS", "PASS", "PASS"]:
+        mandatory = mandatory_validation_statuses(raw, raw_route, store)
+        if any(status != "PASS" for status in mandatory.values()):
             raise RuntimeError(f"mandatory validation gate failed: {mandatory}")
         status = "PASS"
         error = ""

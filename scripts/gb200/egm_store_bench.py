@@ -83,6 +83,19 @@ def parse_child_records(stdout: str, device: int) -> list[dict[str, object]]:
     return records
 
 
+def consumer_failure_detail(records: list[dict[str, object]]) -> str:
+    details: list[str] = []
+    gates = [record for record in records if record.get("event") == "consumer_gate"]
+    if len(gates) == 1 and gates[0].get("status") != "PASS":
+        details.append(str(gates[0].get("error", "consumer gate failed")))
+    cleanup = [
+        record for record in records if record.get("event") == "consumer_cleanup"
+    ]
+    if len(cleanup) == 1 and cleanup[0].get("status") != "PASS":
+        details.append(f"cleanup failed: {cleanup[0].get('errors', [])}")
+    return "; ".join(details)
+
+
 def require_positive_number(record: dict[str, object], field: str) -> float:
     try:
         value = float(record[field])
@@ -298,8 +311,10 @@ def main() -> int:
                         print(completed.stderr, end="", file=sys.stderr)
                     records = parse_child_records(completed.stdout, device)
                     if completed.returncode != 0:
+                        detail = consumer_failure_detail(records)
                         failures.append(
                             f"GPU {device} consumer exited rc={completed.returncode}"
+                            + (f": {detail}" if detail else "")
                         )
                         continue
                     try:

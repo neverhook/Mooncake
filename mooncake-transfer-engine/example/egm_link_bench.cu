@@ -86,7 +86,8 @@ void checkDriver(CUresult result, const char* operation) {
 }
 
 std::vector<uint64_t> parseUnsignedList(const std::string& value,
-                                        const char* name) {
+                                        const char* name,
+                                        bool allow_zero = false) {
     std::vector<uint64_t> values;
     std::stringstream stream(value);
     std::string item;
@@ -94,7 +95,7 @@ std::vector<uint64_t> parseUnsignedList(const std::string& value,
         if (item.empty()) continue;
         size_t parsed = 0;
         uint64_t number = std::stoull(item, &parsed);
-        if (parsed != item.size() || number == 0)
+        if (parsed != item.size() || (!allow_zero && number == 0))
             throw std::invalid_argument(std::string(name) + " contains " +
                                         item);
         values.push_back(number);
@@ -105,7 +106,7 @@ std::vector<uint64_t> parseUnsignedList(const std::string& value,
 }
 
 std::vector<int> parseDevices(const std::string& value) {
-    std::vector<uint64_t> parsed = parseUnsignedList(value, "devices");
+    std::vector<uint64_t> parsed = parseUnsignedList(value, "devices", true);
     std::vector<int> devices;
     std::set<int> seen;
     for (uint64_t number : parsed) {

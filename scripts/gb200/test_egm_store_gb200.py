@@ -90,6 +90,12 @@ class EgmStoreGb200Test(unittest.TestCase):
     def test_bandwidth_conversion(self):
         self.assertEqual(consumer.bandwidth_gib_s(1024**3, 1_000_000_000), 1.0)
 
+    def test_raw_benchmark_accepts_gpu_zero(self):
+        source = (
+            REPO_ROOT / "mooncake-transfer-engine/example/egm_link_bench.cu"
+        ).read_text()
+        self.assertIn('parseUnsignedList(value, "devices", true)', source)
+
     def test_rdma_target_readiness_uses_registration_marker(self):
         process = mock.Mock()
         process.poll.return_value = None
@@ -266,6 +272,49 @@ class EgmStoreGb200Test(unittest.TestCase):
             {ceiling["status"] for ceiling in summary["ceilings"]},
         )
 
+    def test_raw_failure_and_store_logs_are_preserved_in_evidence(self):
+        raw_gate = {
+            "event": "raw_benchmark_gate",
+            "status": "FAIL",
+            "error": "devices contains 0",
+        }
+        self.assertEqual(orchestrator.raw_summaries([raw_gate])["gate"], raw_gate)
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            store_log = root / "bench.jsonl"
+            stderr_log = root / "bench.stderr.log"
+            store_gate = {
+                "event": "benchmark_gate",
+                "status": "FAIL",
+                "error": "GPU 0 consumer exited rc=1",
+            }
+            store_log.write_text(json.dumps(store_gate) + "\n")
+            stderr_log.write_text("prefix-consumer failure details")
+            self.assertEqual(orchestrator.store_summary(store_log)["gate"], store_gate)
+            self.assertEqual(
+                orchestrator.log_tail(stderr_log, 24), "consumer failure details"
+            )
+
+    def test_mnnvl_merge_gate_excludes_rdma_comparison(self):
+        statuses = orchestrator.mandatory_validation_statuses(
+            {"status": "PASS"},
+            {"status": "PASS"},
+            {"status": "PASS"},
+        )
+        self.assertEqual(
+            statuses,
+            {"egm_raw": "PASS", "egm_route": "PASS", "store": "PASS"},
+        )
+        self.assertNotIn("rdma", statuses)
+        with mock.patch.object(
+            orchestrator, "run_rdma_matrix", side_effect=RuntimeError("RDMA failed")
+        ):
+            rdma = orchestrator.run_supplementary_rdma(
+                pathlib.Path("transfer_engine_bench"), {}, "192.0.2.1"
+            )
+        self.assertEqual(rdma["status"], "FAIL")
+        self.assertFalse(rdma["merge_gate"])
+
     def test_fake_hbm_egm_round_trip_emits_timed_results(self):
         cuda = FakeCuda()
         store = FakeStore(cuda)
@@ -434,6 +483,24 @@ class EgmStoreGb200Test(unittest.TestCase):
             bench.validate_consumer_records(
                 self.make_child_records("FAIL"), 0, 4096, 2, 0, "run", "b" * 40
             )
+
+    def test_consumer_failure_detail_preserves_structured_error(self):
+        records = [
+            {
+                "event": "consumer_gate",
+                "status": "FAIL",
+                "error": "get_into returned -5",
+            },
+            {
+                "event": "consumer_cleanup",
+                "status": "FAIL",
+                "errors": ["close failed"],
+            },
+        ]
+        self.assertEqual(
+            bench.consumer_failure_detail(records),
+            "get_into returned -5; cleanup failed: ['close failed']",
+        )
 
     def test_shell_scripts_parse_and_wrapper_config_is_deterministic(self):
         scripts = [

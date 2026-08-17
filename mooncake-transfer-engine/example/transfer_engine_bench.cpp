@@ -632,6 +632,11 @@ int target() {
         LOG_ASSERT(!rc);
     }
 
+    LOG(INFO) << "MOONCAKE_TRANSFER_ENGINE_BENCH_TARGET_READY"
+              << " segment=" << FLAGS_local_server_name
+              << " buffers=" << buffer_num
+              << " buffer_size=" << FLAGS_buffer_size;
+
     while (target_running) sleep(1);
 
     for (int i = 0; i < buffer_num; ++i) {

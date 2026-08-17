@@ -68,6 +68,7 @@ RAW_PAYLOADS = [128 * 1024**2, 512 * 1024**2, 1024**3, 2 * 1024**3, 4 * 1024**3]
 RAW_STREAMS = [1, 2, 4, 8]
 RDMA_BLOCKS = [64 * 1024, 1024**2, 8 * 1024**2]
 RDMA_THREADS = [1, 4, 8]
+RDMA_TARGET_READY_MARKER = "MOONCAKE_TRANSFER_ENGINE_BENCH_TARGET_READY"
 
 
 def run(
@@ -107,17 +108,31 @@ def write_config(path: pathlib.Path, values: Mapping[str, object]) -> None:
     path.write_text("\n".join(lines) + "\n")
 
 
-def wait_tcp(host: str, port: int, timeout: float = 60) -> None:
+def wait_process_log_marker(
+    process: subprocess.Popen[str],
+    log_path: pathlib.Path,
+    marker: str,
+    label: str,
+    timeout: float = 60,
+) -> None:
     deadline = time.monotonic() + timeout
-    last_error: OSError | None = None
+    log_text = ""
     while time.monotonic() < deadline:
-        try:
-            with socket.create_connection((host, port), timeout=1):
+        if log_path.exists():
+            log_text = log_path.read_text(errors="replace")
+            if marker in log_text:
                 return
-        except OSError as exc:
-            last_error = exc
-            time.sleep(0.5)
-    raise RuntimeError(f"TCP endpoint {host}:{port} not ready: {last_error}")
+        returncode = process.poll()
+        if returncode is not None:
+            raise RuntimeError(
+                f"{label} exited rc={returncode} before readiness marker; "
+                f"log tail:\n{log_text[-4096:]}"
+            )
+        time.sleep(0.5)
+    raise RuntimeError(
+        f"{label} did not emit readiness marker within {timeout:g}s; "
+        f"log tail:\n{log_text[-4096:]}"
+    )
 
 
 def stop_process(
@@ -948,7 +963,13 @@ def provider_mode(args: argparse.Namespace) -> int:
             stdout=rdma_log,
             stderr=subprocess.STDOUT,
         )
-        wait_tcp(args.listen_ip, ports["rdma_target"], 120)
+        wait_process_log_marker(
+            rdma_process,
+            rdma_log_path,
+            RDMA_TARGET_READY_MARKER,
+            "RDMA target",
+            120,
+        )
         manifest: dict[str, object] = {
             "schema": "MOONCAKE_GB200_SESSION_V1",
             "run_id": run_id,
@@ -1034,7 +1055,7 @@ def provider_mode(args: argparse.Namespace) -> int:
         except subprocess.CalledProcessError as exc:
             cleanup.append({"label": "master", "status": "FAIL", "error": str(exc)})
             status = "FAIL"
-    if provider_started:
+    if provider_started and completion is not None:
         route_after = collect_route_snapshot()
         route_evidence = build_route_evidence(
             route_before,
@@ -1045,7 +1066,11 @@ def provider_mode(args: argparse.Namespace) -> int:
         route_evidence = {
             "status": "NOT_RUN",
             "route_verification": "C2C_ROUTE_INFERRED",
-            "reason": "Store Provider did not start",
+            "reason": (
+                "Store Provider did not start"
+                if not provider_started
+                else "No validated Consumer completion was received"
+            ),
         }
     if status == "PASS" and route_evidence["status"] != "PASS":
         status = "FAIL"

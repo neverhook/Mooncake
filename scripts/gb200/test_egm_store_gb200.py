@@ -90,6 +90,42 @@ class EgmStoreGb200Test(unittest.TestCase):
     def test_bandwidth_conversion(self):
         self.assertEqual(consumer.bandwidth_gib_s(1024**3, 1_000_000_000), 1.0)
 
+    def test_rdma_target_readiness_uses_registration_marker(self):
+        process = mock.Mock()
+        process.poll.return_value = None
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = pathlib.Path(directory) / "rdma-target.log"
+            log_path.write_text(
+                "Transfer Engine RPC using new RPC mapping, listening on "
+                "192.0.2.10:15515\n"
+                f"{orchestrator.RDMA_TARGET_READY_MARKER} "
+                "segment=192.0.2.10:12500 buffers=1 buffer_size=4294967296\n"
+            )
+            orchestrator.wait_process_log_marker(
+                process,
+                log_path,
+                orchestrator.RDMA_TARGET_READY_MARKER,
+                "RDMA target",
+                timeout=0.1,
+            )
+
+    def test_rdma_target_early_exit_includes_log_tail(self):
+        process = mock.Mock()
+        process.poll.return_value = 2
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = pathlib.Path(directory) / "rdma-target.log"
+            log_path.write_text("target initialization failed\n")
+            with self.assertRaisesRegex(
+                RuntimeError, r"exited rc=2[\s\S]*target initialization failed"
+            ):
+                orchestrator.wait_process_log_marker(
+                    process,
+                    log_path,
+                    orchestrator.RDMA_TARGET_READY_MARKER,
+                    "RDMA target",
+                    timeout=0.1,
+                )
+
     def test_nvidia_route_evidence_and_rdma_latency_are_parsed(self):
         nvlink = validation_common.parse_nvlink_data(
             "GPU 0: NVIDIA GB200 (UUID: GPU-test)\n"

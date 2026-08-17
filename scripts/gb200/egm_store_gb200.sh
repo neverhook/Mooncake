@@ -9,6 +9,12 @@ usage() {
   cat <<'EOF'
 Usage: scripts/gb200/egm_store_gb200.sh [--config PATH] ACTION [ARGS]
 
+Minimal two-node workflow (no config file required):
+  full-provider --listen-ip IP
+                     Build and start Node A, then print the Node B command
+  full-consumer --provider http://IP:PORT
+                     Discover the session and run the complete Node B matrix
+
 Run on both nodes:
   print-config       Print deterministic endpoints, paths, branch, and SHA
   build              Build Store/TE focused targets and run focused tests
@@ -44,6 +50,12 @@ action="${1:-}"
 shift
 case "$action" in
   -h|--help|help) usage; exit 0 ;;
+  full-provider)
+    exec python3 "${script_dir}/egm_store_orchestrator.py" provider "$@"
+    ;;
+  full-consumer)
+    exec python3 "${script_dir}/egm_store_orchestrator.py" consumer "$@"
+    ;;
 esac
 
 if [[ ! -r "$config_path" ]]; then
@@ -66,15 +78,17 @@ MASTER_ADMIN_PORT=9003
 METADATA_PORT=8079
 PROVIDER_PORT=12345
 CONSUMER_PORT_BASE=12400
-EGM_POOL_SIZE="10 GB"
+EGM_POOL_SIZE="20 GB"
 EGM_NUMA_NODES="auto"
 MC_MAX_MR_SIZE_BYTES=157286400
 MC_IMEX_DAEMON_EXTERNAL=1
 MC_CUDART_LIBRARY=""
+MC_EGM_VALIDATION_CUDA_LIBRARY=""
 DEVICES="0,1,2,3"
-PAYLOAD_SIZES="4096,1048576,16777216,134217728"
-ITERATIONS=4
-THRESHOLD_PAYLOAD_SIZE=134217728
+PAYLOAD_SIZES="134217728,536870912,1073741824,2147483648"
+ITERATIONS=13
+STORE_WARMUPS=2
+THRESHOLD_PAYLOAD_SIZE=2147483648
 MIN_PUT_GIB_S=0
 MIN_GET_GIB_S=0
 BUILD_JOBS=""
@@ -124,7 +138,9 @@ for name in MC_MAX_MR_SIZE_BYTES ITERATIONS THRESHOLD_PAYLOAD_SIZE \
     MASTER_START_TIMEOUT_SEC PROVIDER_READINESS_TIMEOUT_SEC; do
   require_positive_uint "$name"
 done
-(( ITERATIONS >= 2 )) || fail 'ITERATIONS must be at least two'
+require_uint STORE_WARMUPS
+(( ITERATIONS > STORE_WARMUPS + 1 )) || \
+  fail 'ITERATIONS must include one lazy-init probe, warmups, and steady samples'
 [[ "$MC_IMEX_DAEMON_EXTERNAL" == 0 || "$MC_IMEX_DAEMON_EXTERNAL" == 1 ]] || \
   fail 'MC_IMEX_DAEMON_EXTERNAL must be 0 or 1'
 require_nonnegative_number MIN_PUT_GIB_S
@@ -142,7 +158,7 @@ for device in "${device_list[@]}"; do
 done
 IFS=, read -r -a payload_list <<<"$PAYLOAD_SIZES"
 for size in "${payload_list[@]}"; do
-  (( size <= 128 * 1024 * 1024 )) || fail "payload exceeds 128 MiB: $size"
+  (( size <= 2 * 1024 * 1024 * 1024 )) || fail "payload exceeds 2 GiB: $size"
 done
 [[ -z "$BUILD_JOBS" || "$BUILD_JOBS" =~ ^[1-9][0-9]*$ ]] || \
   fail 'BUILD_JOBS must be empty or positive'
@@ -191,6 +207,8 @@ common_env=(
   "MOONCAKE_TE_META_DATA_SERVER=${METADATA_SERVER}"
 )
 [[ -z "$MC_CUDART_LIBRARY" ]] || common_env+=("MC_CUDART_LIBRARY=${MC_CUDART_LIBRARY}")
+[[ -z "$MC_EGM_VALIDATION_CUDA_LIBRARY" ]] || \
+  common_env+=("MC_EGM_VALIDATION_CUDA_LIBRARY=${MC_EGM_VALIDATION_CUDA_LIBRARY}")
 
 run_env() {
   local bind_address="$1"; shift
@@ -365,8 +383,8 @@ case "$action" in
       "$METADATA_SERVER" "$MASTER_ADMIN_URL" "$PROVIDER_HOSTNAME"
     printf 'EGM_POOL_SIZE=%s\nEGM_NUMA_NODES=%s\nDEVICES=%s\nPAYLOAD_SIZES=%s\n' \
       "$EGM_POOL_SIZE" "$EGM_NUMA_NODES" "$DEVICES" "$PAYLOAD_SIZES"
-    printf 'ITERATIONS=%s\nMIN_PUT_GIB_S=%s\nMIN_GET_GIB_S=%s\n' \
-      "$ITERATIONS" "$MIN_PUT_GIB_S" "$MIN_GET_GIB_S"
+    printf 'ITERATIONS=%s\nSTORE_WARMUPS=%s\nMIN_PUT_GIB_S=%s\nMIN_GET_GIB_S=%s\n' \
+      "$ITERATIONS" "$STORE_WARMUPS" "$MIN_PUT_GIB_S" "$MIN_GET_GIB_S"
     printf 'BUILD_UNIT_TESTS=%s\nMC_IMEX_DAEMON_EXTERNAL=%s\n' \
       "$BUILD_UNIT_TESTS" "$MC_IMEX_DAEMON_EXTERNAL"
     ;;
@@ -481,7 +499,8 @@ case "$action" in
       --local-hostname "${NODE_B_IP}:$((CONSUMER_PORT_BASE + device))" \
       --metadata-server "$METADATA_SERVER" --master-server "$MASTER_SERVER" \
       --device "$device" --payload-size "$THRESHOLD_PAYLOAD_SIZE" \
-      --iterations "$ITERATIONS" --run-id "$RUN_ID" --source-sha "$SOURCE_SHA" \
+      --iterations "$ITERATIONS" --warmups "$STORE_WARMUPS" \
+      --run-id "$RUN_ID" --source-sha "$SOURCE_SHA" \
       "$@" >"${RESULT_DIR}/consumer-gpu-${device}.jsonl" \
       2>"${RESULT_DIR}/consumer-gpu-${device}.stderr.log"
     cat "${RESULT_DIR}/consumer-gpu-${device}.jsonl"
@@ -494,7 +513,8 @@ case "$action" in
       --node-b-ip "$NODE_B_IP" --consumer-port-base "$CONSUMER_PORT_BASE" \
       --metadata-server "$METADATA_SERVER" --master-server "$MASTER_SERVER" \
       --devices "$DEVICES" --payload-sizes "$PAYLOAD_SIZES" \
-      --iterations "$ITERATIONS" --run-id "$RUN_ID" --source-sha "$SOURCE_SHA" \
+      --iterations "$ITERATIONS" --warmups "$STORE_WARMUPS" \
+      --run-id "$RUN_ID" --source-sha "$SOURCE_SHA" \
       --threshold-payload-size "$THRESHOLD_PAYLOAD_SIZE" \
       --min-put-gib-s "$MIN_PUT_GIB_S" --min-get-gib-s "$MIN_GET_GIB_S" \
       "$@" >"$BENCH_LOG" 2>"$BENCH_STDERR_LOG"

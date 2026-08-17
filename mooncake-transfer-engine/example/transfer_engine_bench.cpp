@@ -17,6 +17,7 @@
 #include <signal.h>
 #include <sys/time.h>
 
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
@@ -106,6 +107,8 @@ DEFINE_int32(threads, 12, "Task submission threads");
 DEFINE_bool(auto_discovery, false, "Enable auto discovery");
 DEFINE_string(report_unit, "GB", "Report unit: GB|GiB|Gb|MB|MiB|Mb|KB|KiB|Kb");
 DEFINE_uint32(report_precision, 2, "Report precision");
+DEFINE_uint64(latency_iterations, 0,
+              "Run a fixed number of QD=1 submit-to-completion samples");
 DEFINE_string(backend, "classic", "Backend to use: classic|tent");
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
@@ -395,7 +398,8 @@ Status initiatorWorker(TransferEngine* engine, SegmentID segment_id,
         (uint64_t)segment_desc->buffers[thread_id % buffer_num].addr;
 
     size_t batch_count = 0;
-    while (running) {
+    while (FLAGS_latency_iterations > 0 ? batch_count < FLAGS_latency_iterations
+                                        : running) {
         auto batch_id = engine->allocateBatchID(FLAGS_batch_size);
         Status s;
         std::vector<TransferRequest> requests;
@@ -412,6 +416,7 @@ Status initiatorWorker(TransferEngine* engine, SegmentID segment_id,
             requests.emplace_back(entry);
         }
 
+        auto latency_started = std::chrono::steady_clock::now();
         s = engine->submitTransfer(batch_id, requests);
         if (!s.ok()) LOG(ERROR) << s.ToString();
         LOG_ASSERT(s.ok());
@@ -429,6 +434,14 @@ Status initiatorWorker(TransferEngine* engine, SegmentID segment_id,
                     exit(EXIT_FAILURE);
                 }
             }
+        }
+        auto latency_ended = std::chrono::steady_clock::now();
+        if (FLAGS_latency_iterations > 0) {
+            uint64_t duration_ns =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    latency_ended - latency_started)
+                    .count();
+            LOG(INFO) << "Latency sample: duration " << duration_ns << " ns";
         }
 
         s = engine->freeBatchID(batch_id);
@@ -523,6 +536,11 @@ static Transport* installTransportFromFlags(TransferEngine* engine) {
 }
 
 int initiator() {
+    if (FLAGS_latency_iterations > 0 &&
+        (FLAGS_threads != 1 || FLAGS_batch_size != 1)) {
+        LOG(ERROR) << "latency_iterations requires --threads=1 --batch_size=1";
+        return EXIT_FAILURE;
+    }
     // disable topology auto discovery for testing.
     auto engine = std::make_unique<TransferEngine>(FLAGS_auto_discovery);
 
@@ -553,8 +571,10 @@ int initiator() {
         workers[i] = std::thread(initiatorWorker, engine.get(), segment_id, i,
                                  addr[i % buffer_num]);
 
-    sleep(FLAGS_duration);
-    running = false;
+    if (FLAGS_latency_iterations == 0) {
+        sleep(FLAGS_duration);
+        running = false;
+    }
 
     for (int i = 0; i < FLAGS_threads; ++i) workers[i].join();
 

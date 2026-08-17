@@ -34,16 +34,18 @@ printf 'build_dir=%s\n' "$build_dir"
 
 cmake -S "$repo_root" -B "$build_dir" -G Ninja \
   -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}" \
+  -DCMAKE_PROJECT_INCLUDE="${repo_root}/scripts/gb200/gb200_validation.cmake" \
   "${extra_args[@]}" \
   -DBUILD_UNIT_TESTS="$cmake_build_unit_tests" \
-  -DBUILD_EXAMPLES=OFF \
+  -DBUILD_EXAMPLES=ON \
   -DBUILD_BENCHMARK=OFF \
   -DWITH_STORE_RUST=OFF \
   -DWITH_EP=OFF \
   -DUSE_CUDA=ON \
   -DUSE_MNNVL=ON
 
-build_targets=(mooncake_master store)
+build_targets=(mooncake_master store transfer_engine_bench egm_link_bench
+  egm_validation_cuda)
 if [[ "$build_unit_tests" == "1" ]]; then
   build_targets+=(egm_store_pool_test nvlink_host_numa_allocation_test
     nvlink_transport_test)
@@ -58,7 +60,8 @@ fi
 (
   cd "$repo_root"
   export PYTHONPYCACHEPREFIX="${build_dir}/python-cache"
-  python3 -m py_compile scripts/gb200/egm_store_*.py
+  python3 -m py_compile scripts/gb200/egm_store_*.py \
+    scripts/gb200/egm_validation_common.py
   python3 -m unittest scripts.gb200.test_egm_store_gb200 -v
 )
 

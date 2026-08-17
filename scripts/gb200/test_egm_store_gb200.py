@@ -12,7 +12,9 @@ from unittest import mock
 
 from scripts.gb200 import egm_store_bench as bench
 from scripts.gb200 import egm_store_consumer as consumer
+from scripts.gb200 import egm_store_orchestrator as orchestrator
 from scripts.gb200 import egm_store_provider as provider
+from scripts.gb200 import egm_validation_common as validation_common
 
 
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
@@ -88,11 +90,78 @@ class EgmStoreGb200Test(unittest.TestCase):
     def test_bandwidth_conversion(self):
         self.assertEqual(consumer.bandwidth_gib_s(1024**3, 1_000_000_000), 1.0)
 
+    def test_dcgm_rows_and_rdma_latency_samples_are_parsed(self):
+        dcgm = validation_common.parse_dcgm_dmon(
+            "# Entity field headers\nGPU 0  123 456\nGPU 1  N/A 789\n",
+            [1201, 1203],
+        )
+        self.assertEqual(dcgm["gpu0/field1201"], [123.0])
+        self.assertEqual(dcgm["gpu1/field1203"], [789.0])
+        self.assertEqual(
+            orchestrator.parse_te_latency_samples(
+                "I0000 Latency sample: duration 91 ns\n"
+                "I0000 Latency sample: duration 103 ns\n"
+            ),
+            [91.0, 103.0],
+        )
+
+    def test_raw_ce_ceiling_requires_stable_bounded_matrix(self):
+        records: list[dict[str, object]] = []
+        payloads = [2 * 1024**3, 4 * 1024**3]
+        streams = [4, 8]
+        for path in ("EGM_H2D", "EGM_D2H"):
+            for payload in payloads:
+                for stream_count in streams:
+                    for sample in range(10):
+                        records.append(
+                            {
+                                "event": "raw_bandwidth_sample",
+                                "group": "1GPU",
+                                "path": path,
+                                "engine": "CE",
+                                "device": 0,
+                                "bytes": payload,
+                                "streams": stream_count,
+                                "sample": sample,
+                                "duration_seconds": 1.1,
+                                "bandwidth_gb_s": 100.0,
+                            }
+                        )
+                        records.append(
+                            {
+                                "event": "raw_aggregate_sample",
+                                "group": "1GPU",
+                                "path": path,
+                                "engine": "CE",
+                                "bytes_per_device": payload,
+                                "streams": stream_count,
+                                "sample": sample,
+                                "duration_seconds": 1.1,
+                                "aggregate_bandwidth_gb_s": 100.0,
+                            }
+                        )
+        records.append({"event": "raw_benchmark_gate", "status": "PASS"})
+        self.assertEqual(orchestrator.raw_summaries(records)["status"], "PASS")
+        for record in records:
+            if (
+                record.get("event") == "raw_aggregate_sample"
+                and record.get("bytes_per_device") == 4 * 1024**3
+                and record.get("streams") == 8
+            ):
+                record["aggregate_bandwidth_gb_s"] = 110.0
+        summary = orchestrator.raw_summaries(records)
+        self.assertEqual(summary["status"], "FAIL")
+        self.assertIn(
+            "UNBOUNDED_BY_MATRIX",
+            {ceiling["status"] for ceiling in summary["ceilings"]},
+        )
+
     def test_fake_hbm_egm_round_trip_emits_timed_results(self):
         cuda = FakeCuda()
         store = FakeStore(cuda)
         args = argparse.Namespace(
             iterations=2,
+            warmups=0,
             payload_size=4096,
             device=1,
             key_prefix="test",
@@ -103,7 +172,7 @@ class EgmStoreGb200Test(unittest.TestCase):
         with contextlib.redirect_stdout(output):
             records = consumer.run_transfers(store, cuda, args, 100, 200)
         self.assertEqual(len(records), 2)
-        self.assertEqual(records[0]["sequence_phase"], "first")
+        self.assertEqual(records[0]["sequence_phase"], "lazy_init_probe")
         self.assertEqual(records[1]["sequence_phase"], "steady")
         self.assertGreater(records[0]["put_duration_ns"], 0)
         self.assertGreater(records[0]["get_bandwidth_gib_s"], 0)
@@ -213,7 +282,9 @@ class EgmStoreGb200Test(unittest.TestCase):
                     "source_sha": sha,
                     "device": 0,
                     "iteration": iteration,
-                    "sequence_phase": "first" if iteration == 0 else "steady",
+                    "sequence_phase": (
+                        "lazy_init_probe" if iteration == 0 else "steady"
+                    ),
                     "bytes": 4096,
                     "sha256": "c" * 64,
                     "put_path": "consumer_hbm_to_provider_egm",
@@ -238,13 +309,15 @@ class EgmStoreGb200Test(unittest.TestCase):
 
     def test_benchmark_validation_requires_cleanup(self):
         records = self.make_child_records()
-        results = bench.validate_consumer_records(records, 0, 4096, 2, "run", "b" * 40)
+        results = bench.validate_consumer_records(
+            records, 0, 4096, 2, 0, "run", "b" * 40
+        )
         aggregate = bench.aggregate_iteration([results[0]], "put")
         self.assertEqual(aggregate["window_duration_ns"], 1000)
         self.assertGreater(aggregate["aggregate_window_gib_s"], 0)
         with self.assertRaisesRegex(RuntimeError, "clean up"):
             bench.validate_consumer_records(
-                self.make_child_records("FAIL"), 0, 4096, 2, "run", "b" * 40
+                self.make_child_records("FAIL"), 0, 4096, 2, 0, "run", "b" * 40
             )
 
     def test_shell_scripts_parse_and_wrapper_config_is_deterministic(self):
@@ -263,6 +336,17 @@ class EgmStoreGb200Test(unittest.TestCase):
             stdout=subprocess.PIPE,
         )
         self.assertIn("provider-start", help_result.stdout)
+        for action, required_flag in (
+            ("full-provider", "--listen-ip"),
+            ("full-consumer", "--provider"),
+        ):
+            result = subprocess.run(
+                ["bash", str(wrapper), action, "--help"],
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+            )
+            self.assertIn(required_flag, result.stdout)
 
         source = (SCRIPT_DIR / "egm_store_gb200.conf.example").read_text()
         source = source.replace('NODE_A_IP="CHANGE_ME"', 'NODE_A_IP="192.0.2.10"')
@@ -285,7 +369,7 @@ class EgmStoreGb200Test(unittest.TestCase):
         self.assertIn("NODE_B_IP=192.0.2.11", result.stdout)
         self.assertIn("SOURCE_SHA=", result.stdout)
         self.assertIn("EGM_NUMA_NODES=auto", result.stdout)
-        self.assertIn("EGM_POOL_SIZE=10 GB", result.stdout)
+        self.assertIn("EGM_POOL_SIZE=20 GB", result.stdout)
         self.assertIn("BUILD_UNIT_TESTS=0", result.stdout)
         self.assertIn("MC_IMEX_DAEMON_EXTERNAL=1", result.stdout)
 

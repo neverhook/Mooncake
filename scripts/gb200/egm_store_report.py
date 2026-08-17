@@ -178,8 +178,9 @@ def main() -> int:
     print(
         "All samples performed SHA-256 and byte-for-byte verification. Put measures "
         "Consumer HBM to Provider EGM; Get measures Provider EGM to Consumer HBM "
-        "including destination CUDA synchronization. `first`/`steady` describe "
-        "sequence position, not an inferred transport-cache state. Concurrent-window "
+        "including destination CUDA synchronization. `lazy_init_probe`, `warmup`, "
+        "and `steady` explicitly separate transport initialization from reported "
+        "performance samples. Concurrent-window "
         "bandwidth is total bytes divided by the earliest-start/latest-end operation "
         "window across Consumer processes on the same node."
     )

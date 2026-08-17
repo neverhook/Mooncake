@@ -14,7 +14,7 @@ import sys
 from collections.abc import Iterable
 
 
-MAX_PAYLOAD_SIZE = 128 * 1024 * 1024
+MAX_PAYLOAD_SIZE = 2 * 1024**3
 
 
 def emit(event: str, **fields: object) -> None:
@@ -98,6 +98,7 @@ def validate_consumer_records(
     device: int,
     payload_size: int,
     iterations: int,
+    warmups: int,
     run_id: str,
     source_sha: str,
 ) -> list[dict[str, object]]:
@@ -129,7 +130,13 @@ def validate_consumer_records(
             raise RuntimeError(
                 f"consumer GPU {device} emitted mismatched result: {record!r}"
             )
-        expected_phase = "first" if record["iteration"] == 0 else "steady"
+        expected_phase = (
+            "lazy_init_probe"
+            if record["iteration"] == 0
+            else "warmup"
+            if int(record["iteration"]) <= warmups
+            else "steady"
+        )
         if record.get("sequence_phase") != expected_phase:
             raise RuntimeError(f"invalid sequence phase: {record!r}")
         if not re.fullmatch(r"[0-9a-f]{64}", str(record.get("sha256", ""))):
@@ -203,8 +210,12 @@ def main() -> int:
     parser.add_argument("--metadata-server", required=True)
     parser.add_argument("--master-server", required=True)
     parser.add_argument("--devices", default="0,1,2,3")
-    parser.add_argument("--payload-sizes", default="4096,1048576,16777216,134217728")
-    parser.add_argument("--iterations", type=int, default=4)
+    parser.add_argument(
+        "--payload-sizes",
+        default="134217728,536870912,1073741824,2147483648",
+    )
+    parser.add_argument("--iterations", type=int, default=13)
+    parser.add_argument("--warmups", type=int, default=2)
     parser.add_argument("--key-prefix", type=safe_identifier, default="egm-gb200")
     parser.add_argument("--run-id", type=safe_identifier, required=True)
     parser.add_argument("--source-sha", type=safe_identifier, required=True)
@@ -218,9 +229,9 @@ def main() -> int:
     if any(device < 0 for device in devices) or len(set(devices)) != len(devices):
         parser.error("--devices must contain unique nonnegative IDs")
     if any(size <= 0 or size > MAX_PAYLOAD_SIZE for size in payload_sizes):
-        parser.error("payload sizes must be in 1..128 MiB")
-    if args.iterations < 2:
-        parser.error("--iterations must be at least two (first and steady samples)")
+        parser.error("payload sizes must be in 1..2 GiB")
+    if args.warmups < 0 or args.iterations <= args.warmups + 1:
+        parser.error("iterations must include one probe, warmups, and steady samples")
     if not 1 <= args.consumer_port_base <= 65535:
         parser.error("--consumer-port-base is outside 1..65535")
     if any(args.consumer_port_base + device > 65535 for device in devices):
@@ -253,6 +264,8 @@ def main() -> int:
                     str(size),
                     "--iterations",
                     str(args.iterations),
+                    "--warmups",
+                    str(args.warmups),
                     "--key-prefix",
                     args.key_prefix,
                     "--run-id",
@@ -296,6 +309,7 @@ def main() -> int:
                                 device,
                                 size,
                                 args.iterations,
+                                args.warmups,
                                 args.run_id,
                                 args.source_sha,
                             )
@@ -307,7 +321,7 @@ def main() -> int:
             all_results.extend(size_results)
 
             for operation in ("put", "get"):
-                for phase in ("first", "steady"):
+                for phase in ("lazy_init_probe", "warmup", "steady"):
                     phase_records = [
                         record
                         for record in size_results
@@ -358,6 +372,7 @@ def main() -> int:
             devices=devices,
             payload_sizes=payload_sizes,
             iterations=args.iterations,
+            warmups=args.warmups,
             transfer_samples=len(all_results),
             threshold_payload_size=args.threshold_payload_size,
             min_put_gib_s=args.min_put_gib_s,

@@ -13,8 +13,13 @@ import pathlib
 import re
 import time
 
+try:
+    from scripts.gb200.egm_validation_common import ValidationCuda
+except ModuleNotFoundError:
+    from egm_validation_common import ValidationCuda
 
-MAX_PAYLOAD_SIZE = 128 * 1024 * 1024
+
+MAX_PAYLOAD_SIZE = 2 * 1024**3
 
 
 def emit(event: str, **fields: object) -> None:
@@ -40,7 +45,7 @@ def positive_int(value: str) -> int:
 def payload_size(value: str) -> int:
     number = positive_int(value)
     if number > MAX_PAYLOAD_SIZE:
-        raise argparse.ArgumentTypeError("payload must not exceed 128 MiB")
+        raise argparse.ArgumentTypeError("payload must not exceed 2 GiB")
     return number
 
 
@@ -228,12 +233,25 @@ def run_transfers(
     args: argparse.Namespace,
     source_ptr: int,
     destination_ptr: int,
+    validation_cuda: ValidationCuda | None = None,
 ) -> list[dict[str, object]]:
     records: list[dict[str, object]] = []
     for iteration in range(args.iterations):
-        expected = deterministic_payload(args.payload_size, args.device, iteration)
-        expected_hash = hashlib.sha256(expected).hexdigest()
-        cuda.copy_from_host(source_ptr, expected)
+        seed = (
+            (args.device + 1) << 56 ^ args.payload_size ^ iteration ^ 0x45474D53544F5245
+        )
+        if validation_cuda is None:
+            expected = deterministic_payload(args.payload_size, args.device, iteration)
+            expected_hash = hashlib.sha256(expected).hexdigest()
+            cuda.copy_from_host(source_ptr, expected)
+            verification = "host_sha256_and_byte_compare"
+        else:
+            expected = None
+            expected_hash = hashlib.sha256(
+                f"egm-validation-pattern-v1:{seed}:{args.payload_size}".encode()
+            ).hexdigest()
+            validation_cuda.fill(source_ptr, args.payload_size, seed, args.device)
+            verification = "device_full_pattern_compare"
         cuda.memset(destination_ptr, 0, args.payload_size)
         cuda.synchronize()
         key = f"{args.key_prefix}-{args.run_id}-gpu{args.device}-{args.payload_size}-{iteration}"
@@ -253,10 +271,21 @@ def run_transfers(
                 f"get_into returned {get_result}, expected {args.payload_size}"
             )
 
-        actual = cuda.copy_to_host(destination_ptr, args.payload_size)
-        actual_hash = hashlib.sha256(actual).hexdigest()
-        if actual_hash != expected_hash or actual != expected:
-            raise RuntimeError(f"HBM payload mismatch for {key}")
+        if validation_cuda is None:
+            actual = cuda.copy_to_host(destination_ptr, args.payload_size)
+            actual_hash = hashlib.sha256(actual).hexdigest()
+            if actual_hash != expected_hash or actual != expected:
+                raise RuntimeError(f"HBM payload mismatch for {key}")
+            mismatches = 0
+        else:
+            mismatches = validation_cuda.verify(
+                destination_ptr, args.payload_size, seed, args.device
+            )
+            if mismatches != 0:
+                raise RuntimeError(
+                    f"HBM payload mismatch for {key}: {mismatches} words"
+                )
+            actual_hash = expected_hash
         remove_result = store.remove(key, True)
         if remove_result != 0:
             raise RuntimeError(f"remove failed for {key}: {remove_result}")
@@ -270,9 +299,17 @@ def run_transfers(
             "source_sha": args.source_sha,
             "device": args.device,
             "iteration": iteration,
-            "sequence_phase": "first" if iteration == 0 else "steady",
+            "sequence_phase": (
+                "lazy_init_probe"
+                if iteration == 0
+                else "warmup"
+                if iteration <= args.warmups
+                else "steady"
+            ),
             "bytes": args.payload_size,
             "sha256": actual_hash,
+            "verification": verification,
+            "mismatches": mismatches,
             "put_path": "consumer_hbm_to_provider_egm",
             "put_started_ns": put_started_ns,
             "put_ended_ns": put_ended_ns,
@@ -300,18 +337,32 @@ def main() -> int:
     parser.add_argument("--master-server", required=True)
     parser.add_argument("--device", type=int, required=True)
     parser.add_argument("--payload-size", type=payload_size, default=MAX_PAYLOAD_SIZE)
-    parser.add_argument("--iterations", type=positive_int, default=4)
+    parser.add_argument("--iterations", type=positive_int, default=13)
+    parser.add_argument("--warmups", type=int, default=2)
     parser.add_argument("--key-prefix", type=safe_identifier, default="egm-gb200")
     parser.add_argument("--run-id", type=safe_identifier, required=True)
     parser.add_argument("--source-sha", type=safe_identifier, required=True)
     parser.add_argument("--cuda-runtime-library")
+    parser.add_argument(
+        "--validation-cuda-library",
+        default=os.environ.get("MC_EGM_VALIDATION_CUDA_LIBRARY", ""),
+    )
     args = parser.parse_args()
     if args.device < 0:
         parser.error("--device must be nonnegative")
+    if args.warmups < 0 or args.iterations <= args.warmups + 1:
+        parser.error("--iterations must include one probe, warmups, and steady samples")
 
     cuda = CudaRuntime(args.cuda_runtime_library)
     cuda.set_device(args.device)
     module = import_store_module()
+    validation_cuda = (
+        ValidationCuda(args.validation_cuda_library)
+        if args.validation_cuda_library
+        else None
+    )
+    if args.payload_size > 128 * 1024**2 and validation_cuda is None:
+        parser.error("payloads above 128 MiB require --validation-cuda-library")
     store = module.MooncakeDistributedStore()
     config = {
         "local_hostname": args.local_hostname,
@@ -347,7 +398,9 @@ def main() -> int:
             **process_context(cuda, args.device, module),
         )
         pointers = [cuda.malloc(args.payload_size), cuda.malloc(args.payload_size)]
-        records = run_transfers(store, cuda, args, pointers[0], pointers[1])
+        records = run_transfers(
+            store, cuda, args, pointers[0], pointers[1], validation_cuda
+        )
         emit(
             "consumer_gate",
             status="PASS",

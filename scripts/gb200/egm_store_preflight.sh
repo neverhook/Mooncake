@@ -24,6 +24,7 @@ printf 'kernel=%s arch=%s user=%s\n' "$(uname -r)" "$(uname -m)" "$(id -un)"
 check_command python3
 check_command nvidia-smi
 check_command nvcc
+check_command dcgmi
 
 if [[ "$(uname -m)" == "aarch64" ]]; then
   pass 'GB200 Grace ARM64 architecture detected'
@@ -77,6 +78,31 @@ fi
 if command -v nvcc >/dev/null 2>&1; then
   nvcc --version || fail 'nvcc cannot report its version'
 fi
+
+if command -v dcgmi >/dev/null 2>&1; then
+  dcgm_count_fields="1201,1203,1204,1205,1206,1207,1208,1209,1210,1211"
+  dcgm_count_fields+=",1212,1213,1214,1215,1216,1217,1218,1219"
+  if dcgmi dmon -e "$dcgm_count_fields" -c 1; then
+    pass 'NVLink 5 byte/error count fields are readable'
+  else
+    fail 'DCGM NVLink 5 byte/error count fields are unavailable'
+  fi
+  if dcgmi dmon -e 1077,1079 -c 1; then
+    pass 'C2C TX/RX data profile fields are readable'
+  else
+    fail 'DCGM C2C TX/RX data profile fields are unavailable'
+  fi
+fi
+
+active_rdma_ports=0
+for state_file in /sys/class/infiniband/*/ports/*/state; do
+  [[ -r "$state_file" ]] || continue
+  if grep -qE '(^|[[:space:]])ACTIVE([[:space:]]|$)' "$state_file"; then
+    pass "RDMA port active: ${state_file%/state}"
+    active_rdma_ports=$((active_rdma_ports + 1))
+  fi
+done
+(( active_rdma_ports > 0 )) || fail 'no active RDMA HCA port was found'
 
 if [[ -r /proc/devices ]] &&
    grep -qE '(^|[[:space:]])nvidia-caps-imex-channels$' /proc/devices; then

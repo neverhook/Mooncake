@@ -366,9 +366,13 @@ class EgmStoreGb200Test(unittest.TestCase):
             "run",
             "--source-sha",
             "a" * 40,
+            "--validation-cuda-library",
+            "/missing/libegm_validation_cuda.so",
         ]
+        validation_cuda = mock.Mock()
         with (
             mock.patch.object(consumer, "CudaRuntime", return_value=fake_runtime),
+            mock.patch.object(consumer, "ValidationCuda", validation_cuda),
             mock.patch.object(
                 consumer, "import_store_module", return_value=Module(consumer_store)
             ),
@@ -376,6 +380,7 @@ class EgmStoreGb200Test(unittest.TestCase):
             contextlib.redirect_stdout(io.StringIO()),
         ):
             self.assertEqual(consumer.main(), 1)
+        validation_cuda.assert_called_once_with("/missing/libegm_validation_cuda.so")
         self.assertEqual(consumer_store.closed, 1)
 
     def make_child_records(self, cleanup_status: str = "PASS"):

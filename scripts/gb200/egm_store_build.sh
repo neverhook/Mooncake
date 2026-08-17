@@ -52,6 +52,18 @@ if [[ "$build_unit_tests" == "1" ]]; then
 fi
 cmake --build "$build_dir" --parallel "$jobs" --target "${build_targets[@]}"
 
+validation_output_dir="${build_dir}/mooncake-transfer-engine/example"
+required_validation_artifacts=(
+  "${validation_output_dir}/egm_link_bench"
+  "${validation_output_dir}/libegm_validation_cuda.so"
+)
+for artifact in "${required_validation_artifacts[@]}"; do
+  [[ -e "$artifact" ]] || {
+    printf 'required GB200 validation artifact is missing: %s\n' "$artifact" >&2
+    exit 1
+  }
+done
+
 if [[ "$build_unit_tests" == "1" ]]; then
   ctest --test-dir "$build_dir" -L nvlink_vmm_unit --output-on-failure
   ctest --test-dir "$build_dir" -L egm_store_pool_unit --output-on-failure

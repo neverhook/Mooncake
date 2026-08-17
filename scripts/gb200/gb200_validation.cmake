@@ -7,6 +7,8 @@ if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
   function(mooncake_add_gb200_validation_targets)
     set(validation_workspace
         "${CMAKE_SOURCE_DIR}/mooncake-transfer-engine/example")
+    set(validation_output_directory
+        "${CMAKE_BINARY_DIR}/mooncake-transfer-engine/example")
 
     add_library(egm_validation_cuda SHARED
                 "${validation_workspace}/egm_validation_cuda.cu")
@@ -17,7 +19,8 @@ if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
       egm_validation_cuda
       PROPERTIES CUDA_STANDARD 20
                  CUDA_STANDARD_REQUIRED ON
-                 CUDA_EXTENSIONS OFF)
+                 CUDA_EXTENSIONS OFF
+                 LIBRARY_OUTPUT_DIRECTORY "${validation_output_directory}")
 
     add_executable(egm_link_bench "${validation_workspace}/egm_link_bench.cu")
     target_include_directories(egm_link_bench PRIVATE "${validation_workspace}")
@@ -34,7 +37,8 @@ if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
       egm_link_bench
       PROPERTIES CUDA_STANDARD 20
                  CUDA_STANDARD_REQUIRED ON
-                 CUDA_EXTENSIONS OFF)
+                 CUDA_EXTENSIONS OFF
+                 RUNTIME_OUTPUT_DIRECTORY "${validation_output_directory}")
 
     if(TORCH_CUDA_ARCH_LIST)
       set(validation_cuda_architectures "")

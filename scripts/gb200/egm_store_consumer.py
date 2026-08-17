@@ -20,6 +20,7 @@ except ModuleNotFoundError:
 
 
 MAX_PAYLOAD_SIZE = 2 * 1024**3
+DEFAULT_OBJECT_SIZE = 128 * 1024**2
 
 
 def emit(event: str, **fields: object) -> None:
@@ -61,6 +62,20 @@ def bandwidth_gib_s(byte_count: int, duration_ns: int) -> float:
     if byte_count <= 0 or duration_ns <= 0:
         raise ValueError("byte count and duration must be positive")
     return byte_count * 1e9 / duration_ns / 1024**3
+
+
+def partition_buffer(
+    pointer: int, size: int, object_size: int
+) -> tuple[list[int], list[int]]:
+    pointers: list[int] = []
+    sizes: list[int] = []
+    offset = 0
+    while offset < size:
+        part_size = min(object_size, size - offset)
+        pointers.append(pointer + offset)
+        sizes.append(part_size)
+        offset += part_size
+    return pointers, sizes
 
 
 def deterministic_payload(size: int, device: int, iteration: int) -> bytes:
@@ -237,6 +252,12 @@ def run_transfers(
 ) -> list[dict[str, object]]:
     records: list[dict[str, object]] = []
     for iteration in range(args.iterations):
+        source_parts, part_sizes = partition_buffer(
+            source_ptr, args.payload_size, args.object_size
+        )
+        destination_parts, _ = partition_buffer(
+            destination_ptr, args.payload_size, args.object_size
+        )
         seed = (
             (args.device + 1) << 56 ^ args.payload_size ^ iteration ^ 0x45474D53544F5245
         )
@@ -254,28 +275,32 @@ def run_transfers(
             verification = "device_full_pattern_compare"
         cuda.memset(destination_ptr, 0, args.payload_size)
         cuda.synchronize()
-        key = f"{args.key_prefix}-{args.run_id}-gpu{args.device}-{args.payload_size}-{iteration}"
+        key_prefix = (
+            f"{args.key_prefix}-{args.run_id}-gpu{args.device}-"
+            f"{args.payload_size}-{iteration}"
+        )
+        keys = [f"{key_prefix}-part{index}" for index in range(len(part_sizes))]
 
         put_started_ns = time.perf_counter_ns()
-        put_result = store.put_from(key, source_ptr, args.payload_size)
+        put_results = store.batch_put_from(keys, source_parts, part_sizes)
         put_ended_ns = time.perf_counter_ns()
-        if put_result != 0:
-            raise RuntimeError(f"put_from failed for {key}: {put_result}")
+        if put_results != [0] * len(keys):
+            raise RuntimeError(f"batch_put_from failed for {key_prefix}: {put_results}")
 
         get_started_ns = time.perf_counter_ns()
-        get_result = store.get_into(key, destination_ptr, args.payload_size)
+        get_results = store.batch_get_into(keys, destination_parts, part_sizes)
         cuda.synchronize()
         get_ended_ns = time.perf_counter_ns()
-        if get_result != args.payload_size:
+        if get_results != part_sizes:
             raise RuntimeError(
-                f"get_into returned {get_result}, expected {args.payload_size}"
+                f"batch_get_into returned {get_results}, expected {part_sizes}"
             )
 
         if validation_cuda is None:
             actual = cuda.copy_to_host(destination_ptr, args.payload_size)
             actual_hash = hashlib.sha256(actual).hexdigest()
             if actual_hash != expected_hash or actual != expected:
-                raise RuntimeError(f"HBM payload mismatch for {key}")
+                raise RuntimeError(f"HBM payload mismatch for {key_prefix}")
             mismatches = 0
         else:
             mismatches = validation_cuda.verify(
@@ -283,12 +308,12 @@ def run_transfers(
             )
             if mismatches != 0:
                 raise RuntimeError(
-                    f"HBM payload mismatch for {key}: {mismatches} words"
+                    f"HBM payload mismatch for {key_prefix}: {mismatches} words"
                 )
             actual_hash = expected_hash
-        remove_result = store.remove(key, True)
-        if remove_result != 0:
-            raise RuntimeError(f"remove failed for {key}: {remove_result}")
+        remove_results = [store.remove(key, True) for key in keys]
+        if remove_results != [0] * len(keys):
+            raise RuntimeError(f"remove failed for {key_prefix}: {remove_results}")
 
         put_duration_ns = put_ended_ns - put_started_ns
         get_duration_ns = get_ended_ns - get_started_ns
@@ -307,6 +332,9 @@ def run_transfers(
                 else "steady"
             ),
             "bytes": args.payload_size,
+            "payload_semantics": "aggregate_store_object_batch",
+            "object_count": len(keys),
+            "object_size": args.object_size,
             "sha256": actual_hash,
             "verification": verification,
             "mismatches": mismatches,
@@ -337,6 +365,7 @@ def main() -> int:
     parser.add_argument("--master-server", required=True)
     parser.add_argument("--device", type=int, required=True)
     parser.add_argument("--payload-size", type=payload_size, default=MAX_PAYLOAD_SIZE)
+    parser.add_argument("--object-size", type=positive_int, default=DEFAULT_OBJECT_SIZE)
     parser.add_argument("--iterations", type=positive_int, default=13)
     parser.add_argument("--warmups", type=int, default=2)
     parser.add_argument("--key-prefix", type=safe_identifier, default="egm-gb200")
@@ -352,6 +381,8 @@ def main() -> int:
         parser.error("--device must be nonnegative")
     if args.warmups < 0 or args.iterations <= args.warmups + 1:
         parser.error("--iterations must include one probe, warmups, and steady samples")
+    if args.object_size > DEFAULT_OBJECT_SIZE:
+        parser.error("--object-size must not exceed 128 MiB")
 
     cuda = CudaRuntime(args.cuda_runtime_library)
     cuda.set_device(args.device)
@@ -378,6 +409,8 @@ def main() -> int:
         source_sha=args.source_sha,
         device=args.device,
         payload_size=args.payload_size,
+        payload_semantics="aggregate_store_object_batch",
+        object_size=args.object_size,
         iterations=args.iterations,
         hbm_allocation="cudaMalloc local endpoint (not published)",
         config=config,

@@ -47,10 +47,22 @@ class FakeStore:
         self.objects[key] = self.cuda.memory[pointer][:size]
         return 0
 
+    def batch_put_from(self, keys, pointers, sizes):
+        return [
+            self.put_from(key, pointer, size)
+            for key, pointer, size in zip(keys, pointers, sizes)
+        ]
+
     def get_into(self, key: str, pointer: int, size: int) -> int:
         payload = self.objects[key]
         self.cuda.memory[pointer] = payload
         return len(payload)
+
+    def batch_get_into(self, keys, pointers, sizes):
+        return [
+            self.get_into(key, pointer, size)
+            for key, pointer, size in zip(keys, pointers, sizes)
+        ]
 
     def remove(self, key: str, force: bool) -> int:
         self.objects.pop(key)
@@ -89,6 +101,33 @@ class EgmStoreGb200Test(unittest.TestCase):
 
     def test_bandwidth_conversion(self):
         self.assertEqual(consumer.bandwidth_gib_s(1024**3, 1_000_000_000), 1.0)
+
+    def test_store_payload_is_partitioned_into_segment_sized_objects(self):
+        pointers, sizes = consumer.partition_buffer(1000, 512, 128)
+        self.assertEqual(pointers, [1000, 1128, 1256, 1384])
+        self.assertEqual(sizes, [128, 128, 128, 128])
+
+        store = mock.Mock()
+        store.batch_put_from.return_value = [0, 0, 0, 0]
+        store.batch_get_into.return_value = sizes
+        store.remove.return_value = 0
+        validation_cuda = mock.Mock()
+        validation_cuda.verify.return_value = 0
+        args = argparse.Namespace(
+            iterations=1,
+            payload_size=512,
+            object_size=128,
+            device=0,
+            key_prefix="test",
+            run_id="run",
+            source_sha="a" * 40,
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            records = consumer.run_transfers(
+                store, FakeCuda(), args, 1000, 2000, validation_cuda
+            )
+        self.assertEqual(store.batch_put_from.call_args.args[1], pointers)
+        self.assertEqual(records[0]["object_count"], 4)
 
     def test_raw_benchmark_accepts_gpu_zero(self):
         source = (
@@ -322,6 +361,7 @@ class EgmStoreGb200Test(unittest.TestCase):
             iterations=2,
             warmups=0,
             payload_size=4096,
+            object_size=4096,
             device=1,
             key_prefix="test",
             run_id="run",
